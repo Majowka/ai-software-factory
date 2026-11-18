@@ -1,0 +1,89 @@
+apiVersion: triggers.tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  annotations: {}
+  name: new-issue
+  namespace: agents
+spec:
+  namespaceSelector: {}
+  resources: {}
+  serviceAccountName: issue-agent-listener
+  triggers:
+    - bindings:
+        - kind: TriggerBinding
+          ref: new-issue
+      interceptors:
+        - params:
+            - name: secretRef
+              value:
+                secretKey: secret
+                secretName: github-webhook-secret
+            - name: eventTypes
+              value:
+                - issues
+          ref:
+            kind: ClusterInterceptor
+            name: github
+        - params:
+            - name: filter
+              value: body.action == 'opened' && body.issue.author_association in ['OWNER',
+                'MEMBER']
+          ref:
+            kind: ClusterInterceptor
+            name: cel
+      name: new-issue
+      template:
+        ref: new-issue
+    - bindings:
+        - kind: TriggerBinding
+          ref: pr-review-comment
+      interceptors:
+        - params:
+            - name: secretRef
+              value:
+                secretKey: secret
+                secretName: github-webhook-secret
+            - name: eventTypes
+              value:
+                - pull_request_review_comment
+          ref:
+            kind: ClusterInterceptor
+            name: github
+        - params:
+            - name: filter
+              value: body.action == 'created' && body.pull_request.state == 'open'
+                && body.sender.type != 'Bot' && body.comment.author_association in
+                ['OWNER', 'MEMBER']
+          ref:
+            kind: ClusterInterceptor
+            name: cel
+      name: pr-review-comment
+      template:
+        ref: pr-comment
+    - bindings:
+        - kind: TriggerBinding
+          ref: pr-review
+      interceptors:
+        - params:
+            - name: secretRef
+              value:
+                secretKey: secret
+                secretName: github-webhook-secret
+            - name: eventTypes
+              value:
+                - pull_request_review
+          ref:
+            kind: ClusterInterceptor
+            name: github
+        - params:
+            - name: filter
+              value: body.action == 'submitted' && body.pull_request.state == 'open'
+                && body.sender.type != 'Bot' && body.review.author_association in
+                ['OWNER', 'MEMBER'] && body.review.body != null && body.review.body
+                != ''
+          ref:
+            kind: ClusterInterceptor
+            name: cel
+      name: pr-review
+      template:
+        ref: pr-comment

@@ -1,0 +1,427 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  annotations: {}
+  name: issue-agent
+  namespace: agents
+spec:
+  params:
+    - name: repo-url
+      type: string
+    - name: repo-full-name
+      type: string
+    - name: issue
+      type: string
+    - name: issue-title
+      type: string
+    - default: ''
+      name: issue-body
+      type: string
+    - default: master
+      name: base-branch
+      type: string
+    - default: ''
+      name: issue-id
+      type: string
+    - default: ''
+      name: issue-author
+      type: string
+    - default: quay.io/pminkows/claude-ai-spring-boot:1.3.0
+      name: skills-artifact
+      type: string
+  tasks:
+    - name: print-event
+      params:
+        - name: repo-full-name
+          value: $(params.repo-full-name)
+        - name: issue
+          value: $(params.issue)
+        - name: issue-id
+          value: $(params.issue-id)
+        - name: issue-title
+          value: $(params.issue-title)
+        - name: issue-author
+          value: $(params.issue-author)
+        - name: issue-body
+          value: $(params.issue-body)
+      taskSpec:
+        metadata: {}
+        params:
+          - name: repo-full-name
+            type: string
+          - name: issue
+            type: string
+          - name: issue-id
+            type: string
+          - name: issue-title
+            type: string
+          - name: issue-author
+            type: string
+          - name: issue-body
+            type: string
+        spec: null
+        steps:
+          - computeResources: {}
+            env:
+              - name: REPO_FULL_NAME
+                value: $(params.repo-full-name)
+              - name: ISSUE_NUMBER
+                value: $(params.issue)
+              - name: ISSUE_ID
+                value: $(params.issue-id)
+              - name: ISSUE_TITLE
+                value: $(params.issue-title)
+              - name: ISSUE_AUTHOR
+                value: $(params.issue-author)
+              - name: ISSUE_BODY
+                value: $(params.issue-body)
+            image: quay.io/pminkows/opencode:latest
+            name: print
+            script: '#!/usr/bin/env bash
+
+              set -euo pipefail
+
+
+              echo "=============== New issue event ==============="
+
+              echo "Repository  : ${REPO_FULL_NAME}"
+
+              echo "Issue number: ${ISSUE_NUMBER}"
+
+              echo "Issue id    : ${ISSUE_ID}"
+
+              echo "Title       : ${ISSUE_TITLE}"
+
+              echo "Author      : ${ISSUE_AUTHOR}"
+
+              echo "Body        :"
+
+              printf ''%s\n'' "$ISSUE_BODY"
+
+              echo "==============================================="
+
+              '
+    - name: fetch-skills
+      params:
+        - name: skills-artifact
+          value: $(params.skills-artifact)
+      runAfter:
+        - print-event
+      taskSpec:
+        metadata: {}
+        params:
+          - name: skills-artifact
+            type: string
+        spec: null
+        steps:
+          - args:
+              - pull
+              - $(params.skills-artifact)
+              - --output
+              - /skills/artifact
+            command:
+              - oras
+            computeResources: {}
+            image: ghcr.io/oras-project/oras:v1.3.0
+            name: pull
+            workingDir: /skills
+          - computeResources: {}
+            image: quay.io/pminkows/opencode:latest
+            name: unpack
+            script: '#!/usr/bin/env bash
+
+              set -euo pipefail
+
+              # artifact: one tar.gz holding skills/ and agents/ in OpenCode format
+
+              mkdir -p /skills/opencode
+
+              for f in /skills/artifact/*.tar.gz; do tar -xzf "$f" -C /skills/opencode;
+              done
+
+              echo "Installed skills: $(ls /skills/opencode/skills | tr ''\n'' ''
+              '')"
+
+              echo "Installed agents: $(ls /skills/opencode/agents | tr ''\n'' ''
+              '')"
+
+              '
+            workingDir: /skills
+        workspaces:
+          - mountPath: /skills
+            name: skills
+      workspaces:
+        - name: skills
+          workspace: skills
+    - name: implement-and-create-pr
+      params:
+        - name: repo-url
+          value: $(params.repo-url)
+        - name: repo-full-name
+          value: $(params.repo-full-name)
+        - name: issue
+          value: $(params.issue)
+        - name: issue-title
+          value: $(params.issue-title)
+        - name: issue-body
+          value: $(params.issue-body)
+        - name: base-branch
+          value: $(params.base-branch)
+      runAfter:
+        - fetch-skills
+      taskSpec:
+        metadata: {}
+        params:
+          - name: repo-url
+            type: string
+          - name: repo-full-name
+            type: string
+          - name: issue
+            type: string
+          - name: issue-title
+            type: string
+          - name: issue-body
+            type: string
+          - name: base-branch
+            type: string
+        spec: null
+        steps:
+          - computeResources:
+              limits:
+                cpu: '2'
+                memory: 2Gi
+              requests:
+                cpu: 500m
+                memory: 1Gi
+            env:
+              - name: GITHUB_APP_ID
+                valueFrom:
+                  secretKeyRef:
+                    key: app-id
+                    name: github-app
+              - name: GITHUB_APP_INSTALLATION_ID
+                valueFrom:
+                  secretKeyRef:
+                    key: installation-id
+                    name: github-app
+              - name: GITHUB_APP_PRIVATE_KEY
+                valueFrom:
+                  secretKeyRef:
+                    key: private-key.pem
+                    name: github-app
+              - name: REPO_URL
+                value: $(params.repo-url)
+              - name: REPO_FULL_NAME
+                value: $(params.repo-full-name)
+              - name: ISSUE_NUMBER
+                value: $(params.issue)
+              - name: ISSUE_TITLE
+                value: $(params.issue-title)
+              - name: ISSUE_BODY
+                value: $(params.issue-body)
+              - name: BASE_BRANCH
+                value: $(params.base-branch)
+              - name: HOME
+                value: /workspace/home
+              - name: GIT_AUTHOR_NAME
+                value: ai-software-factory-agent[bot]
+              - name: GIT_AUTHOR_EMAIL
+                value: 5642464+ai-software-factory-agent[bot]@users.noreply.github.com
+              - name: GIT_COMMITTER_NAME
+                value: ai-software-factory-agent[bot]
+              - name: GIT_COMMITTER_EMAIL
+                value: 5642464+ai-software-factory-agent[bot]@users.noreply.github.com
+              - name: OPENCODE_CONFIG_CONTENT
+                value: "{\n  \"$schema\": \"https://opencode.ai/config.json\",\n \
+                  \ \"model\": \"qwen38-flash/qwen38_flash\",\n  \"permission\": {\
+                  \ \"edit\": \"allow\", \"bash\": \"allow\", \"skill\": \"allow\"\
+                  , \"task\": \"allow\", \"webfetch\": \"deny\", \"external_directory\"\
+                  : { \"/tmp/*\": \"allow\", \"/workspace/tmp/*\": \"allow\", \"/workspace/home/.config/opencode/*\"\
+                  : \"allow\", \"/opt/maven/*\": \"allow\", \"/workspace/home/.m2/*\"\
+                  : \"allow\" } },\n  \"tools\": { \"todowrite\": false },\n  \"provider\"\
+                  : {\n    \"qwen38-flash\": {\n      \"npm\": \"@ai-sdk/openai-compatible\"\
+                  ,\n      \"name\": \"Qwen3.8 Flash\",\n      \"options\": { \"baseURL\"\
+                  : \"http://qwen38-flash.ai.svc.cluster.local:8000/v1\", \"apiKey\"\
+                  : \"none\" },\n      \"models\": { \"qwen38_flash\": { \"name\"\
+                  : \"Qwen3.8 Flash\", \"limit\": { \"context\": 32768, \"output\"\
+                  : 8192 } } }\n    }\n  }\n}\n"
+            image: quay.io/pminkows/opencode:latest
+            name: implement
+            script: "#!/usr/bin/env bash\nset -euo pipefail\n\nmkdir -p \"$HOME/.config/opencode\"\
+              \n# Skills and agents fetched by the fetch-skills task (global OpenCode\
+              \ config dir)\ncp -R /skills/opencode/. \"$HOME/.config/opencode/\"\n\
+              \n# GitHub App installation token (valid 1h), signed with the app's\
+              \ private key\nb64url() { openssl base64 -A | tr '+/' '-_' | tr -d '=';\
+              \ }\n# Kept in a non-exported variable so the agent (a child process)\
+              \ cannot read the key\nAPP_KEY=\"$GITHUB_APP_PRIVATE_KEY\"\nunset GITHUB_APP_PRIVATE_KEY\n\
+              \n# Installation tokens expire after 1h and the agent run can take longer,\
+              \ so mint a fresh one before pushing\nrefresh_gh_token() {\n  local\
+              \ now jwt_header jwt_payload jwt_signature\n  now=\"$(date +%s)\"\n\
+              \  jwt_header=\"$(printf '{\"alg\":\"RS256\",\"typ\":\"JWT\"}' | b64url)\"\
+              \n  jwt_payload=\"$(printf '{\"iat\":%s,\"exp\":%s,\"iss\":\"%s\"}'\
+              \ \"$((now - 60))\" \"$((now + 540))\" \"$GITHUB_APP_ID\" | b64url)\"\
+              \n  jwt_signature=\"$(printf '%s.%s' \"$jwt_header\" \"$jwt_payload\"\
+              \ | openssl dgst -sha256 -sign <(printf '%s\\n' \"$APP_KEY\") | b64url)\"\
+              \n  GH_TOKEN=\"$(curl -fsS -X POST \\\n    -H \"Authorization: Bearer\
+              \ ${jwt_header}.${jwt_payload}.${jwt_signature}\" \\\n    -H \"Accept:\
+              \ application/vnd.github+json\" \\\n    \"https://api.github.com/app/installations/${GITHUB_APP_INSTALLATION_ID}/access_tokens\"\
+              \ | jq -er .token)\"\n  export GH_TOKEN\n}\nrefresh_gh_token\n\ngh auth\
+              \ setup-git\n\nprintf '# Issue #%s: %s\\n\\n%s\\n' \"$ISSUE_NUMBER\"\
+              \ \"$ISSUE_TITLE\" \"$ISSUE_BODY\" > /workspace/issue.txt\ncat /workspace/issue.txt\n\
+              \necho \"=== Cloning repository ===\"\ngit clone --branch \"$BASE_BRANCH\"\
+              \ -- \"$REPO_URL\" /workspace/repo\ncd /workspace/repo\n\n# Branch name\
+              \ per AGENTS.md: issue-<number>-<short-kebab-case-description>\nSLUG=\"\
+              $(printf '%s' \"$ISSUE_TITLE\" | tr '[:upper:]' '[:lower:]' | sed -E\
+              \ 's/[^a-z0-9]+/-/g; s/^-+|-+$//g' | cut -c1-40 | sed -E 's/-+$//')\"\
+              \nBRANCH=\"issue-${ISSUE_NUMBER}-${SLUG}\"\ngit switch -c \"$BRANCH\"\
+              \n\n{\n  echo \"Implement the GitHub issue below in this repository.\"\
+              \n  echo\n  cat /workspace/issue.txt\n  echo\n  echo \"Rules:\"\n  echo\
+              \ \"- Analyze the existing code, implement the requested changes, add\
+              \ or update tests where appropriate.\"\n  echo \"- Run the relevant\
+              \ module's tests before finishing.\"\n  echo \"- Verify that the code\
+              \ compiles (mvn -q test-compile in the affected module) after EACH subtask\
+              \ or group of file changes, not only at the end; fix compilation errors\
+              \ before moving on.\"\n  echo \"- Do NOT use Lombok in any new or modified\
+              \ code (no @Data, @Getter, @Setter, @Builder, @RequiredArgsConstructor,\
+              \ @Slf4j, etc.). Write getters, setters and constructors by hand, use\
+              \ Java records for DTOs, constructor injection, and an explicit SLF4J\
+              \ LoggerFactory logger. Do not add new Lombok dependencies.\"\n  echo\
+              \ \"- Never create or modify build output (target/ directories); only\
+              \ source, test and documentation files belong in the change.\"\n  echo\
+              \ \"- Write logs and temporary files (e.g. test output) only to /tmp\
+              \ or /workspace/tmp, never inside the repository.\"\n  echo \"- Available\
+              \ tools are: bash, read, edit, write, glob, grep, skill and task. Use\
+              \ exactly these names; there is no 'run' or 'todo' tool. Use the skill\
+              \ tool to load the relevant skills (e.g. conventions, testing-patterns)\
+              \ and the task tool to delegate to the subagents where useful.\"\n \
+              \ echo \"- There is no tool named 'step'. Do not write 'Step 1', 'Step\
+              \ 2', ... headings or try to call them; describe progress in plain sentences\
+              \ and call only the tools listed above.\"\n  echo \"- Use only paths\
+              \ inside the repository, /tmp and /workspace/tmp. Do not read or list\
+              \ other directories (e.g. /opt, /etc, ~/.m2) and do not inspect the\
+              \ Maven or Java installation; they are already configured, just run\
+              \ mvn.\"\n  echo \"- When calling bash, never pass the 'timeout' parameter;\
+              \ just run the command.\"\n  echo \"- Do not run git commit or git push,\
+              \ do not create a pull request, do not comment on the issue, do not\
+              \ access secrets.\"\n  echo \"- The pipeline handles git, the pull request\
+              \ and the issue comment; ignore those sections of AGENTS.md.\"\n  echo\
+              \ \"- When done, write a 2-4 bullet summary to .agent-summary.md in\
+              \ the repository root (the pipeline reads it and removes it from the\
+              \ commit): what was changed in plain language, the test result, and\
+              \ anything left undone or worth a reviewer's attention. No diffs, no\
+              \ long explanations.\"\n} > /workspace/prompt.txt\n\n# Runs opencode\
+              \ with a watchdog. Qwen models sometimes keep calling a nonexistent\
+              \ tool (e.g. \"step\"), which would\n# otherwise burn the whole timeout,\
+              \ and a rejected permission (a path outside the allowed directories)\
+              \ aborts the\n# whole non-interactive run. In both cases the run is\
+              \ restarted (max 2 times) with a hint; edits already made\n# stay in\
+              \ the working tree.\nrun_opencode() {\n  local limit=\"$1\" prompt_file=\"\
+              $2\" log=/workspace/opencode.log\n  local max_loops=15 max_retries=2\
+              \ retry=0 prompt opid tpid rc loops rejected note\n  prompt=\"$(cat\
+              \ \"$prompt_file\")\"\n  while true; do\n    : > \"$log\"\n    timeout\
+              \ \"$limit\" opencode run \"$prompt\" > \"$log\" 2>&1 &\n    opid=$!\n\
+              \    tail -n +1 -f \"$log\" &\n    tpid=$!\n    while kill -0 \"$opid\"\
+              \ 2>/dev/null; do\n      sleep 5\n      if [ \"$(grep -c 'unavailable\
+              \ tool' \"$log\" || true)\" -ge \"$max_loops\" ]; then\n        echo\
+              \ \"=== Watchdog: opencode is looping on unavailable tools, stopping\
+              \ it ===\"\n        kill \"$opid\" 2>/dev/null || true\n        break\n\
+              \      fi\n    done\n    rc=0\n    wait \"$opid\" || rc=$?\n    sleep\
+              \ 1\n    kill \"$tpid\" 2>/dev/null || true\n    wait \"$tpid\" 2>/dev/null\
+              \ || true\n    loops=\"$(grep -c 'unavailable tool' \"$log\" || true)\"\
+              \n    rejected=\"$(grep -c 'rejected permission' \"$log\" || true)\"\
+              \n    if [ \"$loops\" -ge \"$max_loops\" ]; then\n      note='The previous\
+              \ attempt got stuck calling a nonexistent tool. There is no tool named\
+              \ \"step\" (or \"run\", \"todo\"). Do not write \"Step N\" headings\
+              \ and never try to call them; call only bash, read, edit, write, glob,\
+              \ grep, skill and task.'\n    elif [ \"$rc\" -ne 0 ] && [ \"$rejected\"\
+              \ -gt 0 ]; then\n      echo \"=== Watchdog: opencode aborted on a rejected\
+              \ permission ===\"\n      note='The previous attempt was aborted because\
+              \ a tool call tried to access a path outside the allowed directories.\
+              \ Use only the repository, /tmp and /workspace/tmp; do not read or list\
+              \ other directories (e.g. /opt, /etc, the Maven installation). Java\
+              \ and Maven are already configured, just run mvn.'\n    else\n     \
+              \ return \"$rc\"\n    fi\n    if [ \"$retry\" -ge \"$max_retries\" ];\
+              \ then\n      echo \"=== Watchdog: giving up after $retry restarts ===\"\
+              \n      return 1\n    fi\n    retry=$((retry + 1))\n    echo \"=== Watchdog:\
+              \ restart $retry/$max_retries ===\"\n    prompt=\"$(cat \"$prompt_file\"\
+              ; printf '\\n\\nNOTE: %s Changes already made are still in the working\
+              \ tree (check git status and git diff); continue from there instead\
+              \ of starting over.' \"$note\")\"\n  done\n}\n\necho \"=== Running opencode\
+              \ ===\"\nrun_opencode 75m /workspace/prompt.txt || echo \"opencode exited\
+              \ with $? (timeout or error); continuing to build verification\"\n\n\
+              if [ -z \"$(git status --porcelain -uall -- . ':(exclude)**/target/**')\"\
+              \ ]; then\n  echo \"No changes generated\"\n  exit 1\nfi\n\n# Build\
+              \ gate: compile main and test sources of every Maven module touched\
+              \ by the agent.\n# On failure the agent is re-run with the compiler\
+              \ output (max $MAX_FIX_ATTEMPTS times).\nMAX_FIX_ATTEMPTS=2\n\nbuild_modules()\
+              \ {\n  : > /workspace/build.log\n  local rc=0 f d root rel\n  # unique\
+              \ \"root|module\" pairs for changed files: module = nearest pom dir,\
+              \ root = topmost pom dir\n  git status --porcelain -uall -- . ':(exclude)**/target/**'\
+              \ | cut -c4- | while read -r f; do\n    d=\"$(dirname \"$f\")\"\n  \
+              \  while [ \"$d\" != \".\" ] && [ ! -f \"$d/pom.xml\" ]; do d=\"$(dirname\
+              \ \"$d\")\"; done\n    [ -f \"$d/pom.xml\" ] || continue\n    root=\"\
+              $d\"\n    while [ \"$(dirname \"$root\")\" != \".\" ] && [ -f \"$(dirname\
+              \ \"$root\")/pom.xml\" ]; do root=\"$(dirname \"$root\")\"; done\n \
+              \   echo \"$root|$d\"\n  done | sort -u > /workspace/modules.txt\n \
+              \ while IFS='|' read -r root d; do\n    if [ \"$root\" = \"$d\" ]; then\n\
+              \      echo \"=== mvn test-compile in $root ===\" | tee -a /workspace/build.log\n\
+              \      (cd \"$root\" && timeout 10m mvn -B -q -DskipTests test-compile)\
+              \ >> /workspace/build.log 2>&1 || rc=1\n    else\n      rel=\"${d#\"\
+              $root\"/}\"\n      echo \"=== mvn test-compile in $root (module $rel)\
+              \ ===\" | tee -a /workspace/build.log\n      (cd \"$root\" && timeout\
+              \ 10m mvn -B -q -DskipTests test-compile -pl \"$rel\" -am) >> /workspace/build.log\
+              \ 2>&1 || rc=1\n    fi\n  done < /workspace/modules.txt\n  return $rc\n\
+              }\n\nBUILD_STATUS=\"not verified\"\nATTEMPT=0\nwhile true; do\n  echo\
+              \ \"=== Build verification (attempt $((ATTEMPT + 1))) ===\"\n  if build_modules;\
+              \ then\n    if [ -s /workspace/modules.txt ]; then\n      BUILD_STATUS=\"\
+              compiles\"\n    else\n      BUILD_STATUS=\"not verified (no Maven module\
+              \ changed)\"\n    fi\n    break\n  fi\n  tail -n 100 /workspace/build.log\n\
+              \  if [ \"$ATTEMPT\" -ge \"$MAX_FIX_ATTEMPTS\" ]; then\n    BUILD_STATUS=\"\
+              FAILED to compile after ${MAX_FIX_ATTEMPTS} fix attempts\"\n    break\n\
+              \  fi\n  ATTEMPT=$((ATTEMPT + 1))\n  {\n    cat /workspace/prompt.txt\n\
+              \    echo\n    echo \"The build of your changes FAILED. Fix the compilation\
+              \ errors below (fix attempt ${ATTEMPT}/${MAX_FIX_ATTEMPTS}).\"\n   \
+              \ echo \"Do not rewrite unrelated code. Compile again with mvn test-compile\
+              \ before finishing.\"\n    echo\n    echo \"Compiler output (last 100\
+              \ lines):\"\n    tail -n 100 /workspace/build.log\n  } > /workspace/fix-prompt.txt\n\
+              \  run_opencode 25m /workspace/fix-prompt.txt || echo \"opencode fix\
+              \ run exited with $?\"\ndone\necho \"Build status: $BUILD_STATUS\"\n\
+              \n# Only sources: never commit build output (target/ is tracked in this\
+              \ repo) or the agent summary\nmkdir -p /workspace/out\n[ -f .agent-summary.md\
+              \ ] && mv .agent-summary.md /workspace/out/summary.md\nrefresh_gh_token\n\
+              git add -A -- . ':(exclude)**/target/**'\ngit commit -m \"feat: implement\
+              \ issue #${ISSUE_NUMBER}\" -m \"Refs #${ISSUE_NUMBER}\"\ngit push origin\
+              \ \"$BRANCH\"\n\nPR_URL=\"$(gh pr create \\\n  --repo \"$REPO_FULL_NAME\"\
+              \ \\\n  --base \"$BASE_BRANCH\" \\\n  --head \"$BRANCH\" \\\n  --title\
+              \ \"AI: implement issue #${ISSUE_NUMBER}\" \\\n  --body \"Closes #${ISSUE_NUMBER}\n\
+              \nChanges generated by opencode. Review required before merging.\n\n\
+              Build verification (mvn test-compile): ${BUILD_STATUS}\")\"\necho \"\
+              Created PR: $PR_URL\"\n\n# Merge automatically once branch protection\
+              \ is satisfied (required review and checks); never fails the pipeline\n\
+              if gh pr merge \"$PR_URL\" --auto --merge; then\n  AUTO_MERGE=\"auto-merge\
+              \ enabled (merges once the required review and checks pass)\"\nelse\n\
+              \  AUTO_MERGE=\"auto-merge could not be enabled; merge manually\"\n\
+              fi\necho \"$AUTO_MERGE\"\n\necho \"=== Commenting on the issue ===\"\
+              \nif [ -s /workspace/out/summary.md ]; then\n  SUMMARY=\"$(cat /workspace/out/summary.md)\"\
+              \nelse\n  SUMMARY=\"- The agent did not produce a summary; see the PR\
+              \ diff. Tests: unknown.\"\nfi\ngh issue comment \"$ISSUE_NUMBER\" \\\
+              \n  --repo \"$REPO_FULL_NAME\" \\\n  --body \"${SUMMARY}\n\n- Build\
+              \ verification (pipeline, mvn test-compile): ${BUILD_STATUS}\n- Branch:\
+              \ \\`${BRANCH}\\`\n- PR: ${PR_URL}\n- Merge: ${AUTO_MERGE}\"\n"
+            volumeMounts:
+              - mountPath: /workspace
+                name: work
+            workingDir: /workspace
+        volumes:
+          - emptyDir: {}
+            name: work
+        workspaces:
+          - mountPath: /skills
+            name: skills
+            readOnly: true
+      timeout: 3h0m0s
+      workspaces:
+        - name: skills
+          workspace: skills
+  workspaces:
+    - name: skills

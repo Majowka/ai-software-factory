@@ -1,0 +1,26 @@
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  annotations: {}
+  name: pr-review-comment
+  namespace: agents
+spec:
+  params:
+    - name: event-type
+      value: $(header.X-Github-Event)
+    - name: repo-url
+      value: $(body.repository.clone_url)
+    - name: repo-full-name
+      value: $(body.repository.full_name)
+    - name: pr-number
+      value: $(body.pull_request.number)
+    - name: pr-title
+      value: $(body.pull_request.title)
+    - name: branch
+      value: $(body.pull_request.head.ref)
+    - name: comment-author
+      value: $(body.comment.user.login)
+    - name: comment-body
+      value: $(body.comment.body)
+    - name: base-branch
+      value: $(body.repository.default_branch)
