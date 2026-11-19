@@ -164,7 +164,7 @@ spec:
             emptyDir: {}
           - name: config
             configMap:
-              name: issue-agent-config
+              name: agent-config
         steps:
           # Clone and branch. Holds the GitHub App key, the agent step does not.
           - name: prepare
