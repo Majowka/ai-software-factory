@@ -6,7 +6,7 @@ coding agent ([OpenCode](https://opencode.ai)) that talks to an open model serve
 [vLLM](https://docs.vllm.ai) on GPU nodes in the same cluster. Nothing leaves the cluster except
 the calls to GitHub.
 
-![AI Software Factory overview](docs/images/factory-overview.png)
+![AI Software Factory overview](docs/images/factory-overview.svg)
 *The factory at a glance: GitHub, Tekton on OpenShift, the coding agent and the model on vLLM.*
 
 ```
@@ -169,8 +169,8 @@ installation tokens, so no personal access token is needed.
      `https://github.com/settings/installations/<ID>` after you open the installation.
    - **Private key**: generate one on the app's settings page and keep the `.pem` file.
 
-![GitHub App installation page](docs/images/github-app-installation.png)
-*The installation page: the Installation ID is the number at the end of the URL.*
+![GitHub App settings page](docs/images/github-app-installation.png)
+*The app's settings page: the App ID is shown under About.*
 
 ### 2.3 Repository settings
 
@@ -341,8 +341,8 @@ oc apply -n agents -f tekton/triggerbinding-new-issue.yaml \
                    -f tekton/route-new-issue.yaml
 ```
 
-![Pipelines in the OpenShift console](docs/images/pipelines-in-console.png)
-*The three pipelines in the `agents` namespace, as seen in the OpenShift Pipelines console.*
+![PipelineRuns in the OpenShift console](docs/images/pipelines-in-console.png)
+*PipelineRuns of the three pipelines in the `agents` namespace, in the OpenShift Pipelines console.*
 
 ### 6.1 How events become pipeline runs
 
@@ -376,7 +376,7 @@ a 3 hour timeout.
    summary is then posted as a comment.
 
 ![A PipelineRun in the OpenShift console](docs/images/pipelinerun-graph.png)
-*A finished `issue-agent` run: the tasks and the steps of the agent task, with timings.*
+*A finished `issue-agent` run: `print-event`, `fetch-skills` and `implement-and-create-pr`.*
 
 ### 6.3 Security model
 
@@ -411,7 +411,7 @@ Check *Recent deliveries* on GitHub. A `202` means the listener accepted the eve
 usually means a wrong secret.
 
 ![Recent webhook deliveries on GitHub](docs/images/webhook-deliveries.png)
-*Recent deliveries of the webhook: green ticks and `202` responses from the EventListener.*
+*Recent deliveries of the app webhook: a green tick means GitHub got a successful response.*
 
 ## 8. Try it
 
@@ -429,7 +429,7 @@ usually means a wrong secret.
    *The bot posts the plan as a checklist before it starts the implementation.*
 
    ![Pull request opened by the bot](docs/images/pull-request-result.png)
-   *The resulting pull request, opened by the GitHub App with auto-merge enabled.*
+   *The resulting pull request: opened by the GitHub App, approved by a human reviewer and then merged.*
 
 4. Comment `@ai please also add a unit test` on the issue, or review the pull request with a
    comment, to trigger the follow-up pipelines.
