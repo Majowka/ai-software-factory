@@ -183,20 +183,20 @@ spec:
         volumes:
           - name: work
             emptyDir: {}
+          - name: config
+            configMap:
+              name: agent-config
         steps:
-          - name: implement
+          # Resolves the PR, fetches its conversation and clones the head branch. Holds the GitHub App key, the agent step does not.
+          - name: prepare
             image: quay.io/pminkows/opencode:latest
             workingDir: /workspace
             volumeMounts:
               - name: work
                 mountPath: /workspace
-            computeResources:
-              requests:
-                memory: 1Gi
-                cpu: 500m
-              limits:
-                memory: 2Gi
-                cpu: "2"
+              - name: config
+                mountPath: /config
+                readOnly: true
             env:
               - name: GITHUB_APP_ID
                 valueFrom:
@@ -213,8 +213,6 @@ spec:
                   secretKeyRef:
                     name: github-app
                     key: private-key.pem
-              - name: EVENT_TYPE
-                value: $(params.event-type)
               - name: REPO_URL
                 value: $(params.repo-url)
               - name: REPO_FULL_NAME
@@ -223,70 +221,22 @@ spec:
                 value: $(params.pr-number)
               - name: PR_TITLE
                 value: $(params.pr-title)
-              - name: COMMENT_AUTHOR
-                value: $(params.comment-author)
-              - name: COMMENT_BODY
-                value: $(params.comment-body)
-              - name: BASE_BRANCH
-                value: $(params.base-branch)
               - name: HOME
                 value: /workspace/home
-              - name: GIT_AUTHOR_NAME
-                value: ai-software-factory-agent[bot]
-              - name: GIT_AUTHOR_EMAIL
-                value: 5642464+ai-software-factory-agent[bot]@users.noreply.github.com
-              - name: GIT_COMMITTER_NAME
-                value: ai-software-factory-agent[bot]
-              - name: GIT_COMMITTER_EMAIL
-                value: 5642464+ai-software-factory-agent[bot]@users.noreply.github.com
-              - name: OPENCODE_CONFIG_CONTENT
-                value: |
-                  {
-                    "$schema": "https://opencode.ai/config.json",
-                    "model": "qwen38-flash/qwen38_flash",
-                    "permission": { "edit": "allow", "bash": "allow", "skill": "allow", "task": "allow", "webfetch": "deny", "external_directory": { "/tmp/*": "allow", "/workspace/tmp/*": "allow", "/workspace/home/.config/opencode/*": "allow", "/opt/maven/*": "allow", "/workspace/home/.m2/*": "allow" } },
-                    "tools": { "todowrite": false },
-                    "provider": {
-                      "qwen38-flash": {
-                        "npm": "@ai-sdk/openai-compatible",
-                        "name": "Qwen3.8 Flash",
-                        "options": { "baseURL": "http://qwen38-flash.ai.svc.cluster.local:8000/v1", "apiKey": "none" },
-                        "models": { "qwen38_flash": { "name": "Qwen3.8 Flash", "limit": { "context": 32768, "output": 8192 } } }
-                      }
-                    }
-                  }
             script: |
               #!/usr/bin/env bash
               set -euo pipefail
 
-              mkdir -p "$HOME/.config/opencode"
-              # Skills and agents fetched by the fetch-skills task (global OpenCode config dir)
+              mkdir -p "$HOME/.config/opencode" /workspace/out
+              # Skills and agents fetched by the fetch-skills task
               cp -R /skills/opencode/. "$HOME/.config/opencode/"
 
-              # GitHub App installation token (valid 1h), signed with the app's private key
-              b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
-              # Kept in a non-exported variable so the agent (a child process) cannot read the key
-              APP_KEY="$GITHUB_APP_PRIVATE_KEY"
-              unset GITHUB_APP_PRIVATE_KEY
-
-              # Installation tokens expire after 1h and the agent run can take longer, so mint a fresh one before pushing
-              refresh_gh_token() {
-                local now jwt_header jwt_payload jwt_signature
-                now="$(date +%s)"
-                jwt_header="$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)"
-                jwt_payload="$(printf '{"iat":%s,"exp":%s,"iss":"%s"}' "$((now - 60))" "$((now + 540))" "$GITHUB_APP_ID" | b64url)"
-                jwt_signature="$(printf '%s.%s' "$jwt_header" "$jwt_payload" | openssl dgst -sha256 -sign <(printf '%s\n' "$APP_KEY") | b64url)"
-                GH_TOKEN="$(curl -fsS -X POST \
-                  -H "Authorization: Bearer ${jwt_header}.${jwt_payload}.${jwt_signature}" \
-                  -H "Accept: application/vnd.github+json" \
-                  "https://api.github.com/app/installations/${GITHUB_APP_INSTALLATION_ID}/access_tokens" | jq -er .token)"
-                export GH_TOKEN
-              }
-              refresh_gh_token
-
+              GH_TOKEN="$(bash /config/gh-app-token.sh)"
+              export GH_TOKEN
               gh auth setup-git
 
-              # Resolve the head branch from the PR itself (authoritative, also checks that the PR is open and not from a fork)
+              # Resolve the head branch from the PR itself (authoritative, also checks that the PR is open and not from a fork).
+              # /workspace/skip tells the following steps there is nothing to do.
               PR_INFO="$(gh pr view "$PR_NUMBER" --repo "$REPO_FULL_NAME" --json state,headRefName,isCrossRepository)"
               PR_STATE="$(printf '%s' "$PR_INFO" | jq -r .state)"
               BRANCH="$(printf '%s' "$PR_INFO" | jq -r .headRefName)"
@@ -294,11 +244,13 @@ spec:
               echo "PR #${PR_NUMBER} state=${PR_STATE} branch=${BRANCH} fork=${CROSS_REPO}"
               if [ "$PR_STATE" != "OPEN" ]; then
                 echo "Pull request is not open; nothing to do"
+                touch /workspace/skip
                 exit 0
               fi
               if [ "$CROSS_REPO" = "true" ]; then
                 gh pr comment "$PR_NUMBER" --repo "$REPO_FULL_NAME" \
                   --body "Pull requests from forks are not supported by the agent; no changes were made."
+                touch /workspace/skip
                 exit 0
               fi
 
@@ -320,171 +272,134 @@ spec:
 
               echo "=== Cloning repository, branch ${BRANCH} ==="
               git clone --branch "$BRANCH" -- "$REPO_URL" /workspace/repo
-              cd /workspace/repo
+              echo "$BRANCH" > /workspace/branch
 
-              {
-                echo "You are working on the pull request below, on its head branch '${BRANCH}' (base branch '${BASE_BRANCH}')."
-                echo "A new ${EVENT_TYPE} event was triggered by a comment from ${COMMENT_AUTHOR}. Act on THIS comment, using the rest of the conversation as context:"
-                echo
-                echo "----- NEW COMMENT -----"
-                printf '%s\n' "$COMMENT_BODY"
-                echo "-----------------------"
-                echo
-                echo "The full pull request conversation (description, comments, reviews, inline comments) is below."
-                echo
-                cat /workspace/pr-conversation.md
-                echo
-                echo "Rules:"
-                echo "- If the comment requests a change, implement it on the current branch, add or update tests where appropriate, and keep the change minimal. Inspect what the PR already changes with 'git diff origin/${BASE_BRANCH}...HEAD'."
-                echo "- If the comment is only a question or needs no code change, do not modify any file; answer it in the summary."
-                echo "- Run the relevant module's tests before finishing."
-                echo "- Verify that the code compiles (mvn -q test-compile in the affected module) after EACH subtask or group of file changes, not only at the end; fix compilation errors before moving on."
-                echo "- Do NOT use Lombok in any new or modified code (no @Data, @Getter, @Setter, @Builder, @RequiredArgsConstructor, @Slf4j, etc.). Write getters, setters and constructors by hand, use Java records for DTOs, constructor injection, and an explicit SLF4J LoggerFactory logger. Do not add new Lombok dependencies."
-                echo "- Never create or modify build output (target/ directories); only source, test and documentation files belong in the change."
-                echo "- Write logs and temporary files (e.g. test output) only to /tmp or /workspace/tmp, never inside the repository."
-                echo "- Available tools are: bash, read, edit, write, glob, grep, skill and task. Use exactly these names; there is no 'run' or 'todo' tool. Use the skill tool to load the relevant skills (e.g. conventions, testing-patterns) and the task tool to delegate to the subagents where useful."
-                echo "- There is no tool named 'step'. Do not write 'Step 1', 'Step 2', ... headings or try to call them; describe progress in plain sentences and call only the tools listed above."
-                echo "- Use only paths inside the repository, /tmp and /workspace/tmp. Do not read or list other directories (e.g. /opt, /etc, ~/.m2) and do not inspect the Maven or Java installation; they are already configured, just run mvn."
-                echo "- When calling bash, never pass the 'timeout' parameter; just run the command."
-                echo "- Do not run git commit or git push, do not comment on the pull request, do not access secrets."
-                echo "- The pipeline handles git and the pull request comment; ignore those sections of AGENTS.md."
-                echo "- When done, write a 2-4 bullet summary to .agent-summary.md in the repository root (the pipeline posts it as the reply and removes it from the commit): what was changed in plain language (or the answer to the question), the test result, and anything left undone or worth a reviewer's attention. No diffs, no long explanations."
-              } > /workspace/prompt.txt
+          # Agent run. No GitHub credentials in this step; committing, pushing and gh are denied in opencode.json.
+          - name: agent
+            image: quay.io/pminkows/opencode:latest
+            workingDir: /workspace/repo
+            volumeMounts:
+              - name: work
+                mountPath: /workspace
+              - name: config
+                mountPath: /config
+                readOnly: true
+            computeResources:
+              requests:
+                memory: 1Gi
+                cpu: 500m
+              limits:
+                memory: 2Gi
+                cpu: "2"
+            env:
+              - name: EVENT_TYPE
+                value: $(params.event-type)
+              - name: COMMENT_AUTHOR
+                value: $(params.comment-author)
+              - name: COMMENT_BODY
+                value: $(params.comment-body)
+              - name: BASE_BRANCH
+                value: $(params.base-branch)
+              - name: HOME
+                value: /workspace/home
+              - name: OPENCODE_CONFIG
+                value: /config/opencode.json
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
 
-              # Runs opencode with a watchdog. Qwen models sometimes keep calling a nonexistent tool (e.g. "step"), which would
-              # otherwise burn the whole timeout, and a rejected permission (a path outside the allowed directories) aborts the
-              # whole non-interactive run. In both cases the run is restarted (max 2 times) with a hint; edits already made
-              # stay in the working tree.
-              run_opencode() {
-                local limit="$1" prompt_file="$2" log=/workspace/opencode.log
-                local max_loops=15 max_retries=2 retry=0 prompt opid tpid rc loops rejected note
-                prompt="$(cat "$prompt_file")"
-                while true; do
-                  : > "$log"
-                  timeout "$limit" opencode run "$prompt" > "$log" 2>&1 &
-                  opid=$!
-                  tail -n +1 -f "$log" &
-                  tpid=$!
-                  while kill -0 "$opid" 2>/dev/null; do
-                    sleep 5
-                    if [ "$(grep -c 'unavailable tool' "$log" || true)" -ge "$max_loops" ]; then
-                      echo "=== Watchdog: opencode is looping on unavailable tools, stopping it ==="
-                      kill "$opid" 2>/dev/null || true
-                      break
-                    fi
-                  done
-                  rc=0
-                  wait "$opid" || rc=$?
-                  sleep 1
-                  kill "$tpid" 2>/dev/null || true
-                  wait "$tpid" 2>/dev/null || true
-                  loops="$(grep -c 'unavailable tool' "$log" || true)"
-                  rejected="$(grep -c 'rejected permission' "$log" || true)"
-                  if [ "$loops" -ge "$max_loops" ]; then
-                    note='The previous attempt got stuck calling a nonexistent tool. There is no tool named "step" (or "run", "todo"). Do not write "Step N" headings and never try to call them; call only bash, read, edit, write, glob, grep, skill and task.'
-                  elif [ "$rc" -ne 0 ] && [ "$rejected" -gt 0 ]; then
-                    echo "=== Watchdog: opencode aborted on a rejected permission ==="
-                    note='The previous attempt was aborted because a tool call tried to access a path outside the allowed directories. Use only the repository, /tmp and /workspace/tmp; do not read or list other directories (e.g. /opt, /etc, the Maven installation). Java and Maven are already configured, just run mvn.'
-                  else
-                    return "$rc"
-                  fi
-                  if [ "$retry" -ge "$max_retries" ]; then
-                    echo "=== Watchdog: giving up after $retry restarts ==="
-                    return 1
-                  fi
-                  retry=$((retry + 1))
-                  echo "=== Watchdog: restart $retry/$max_retries ==="
-                  prompt="$(cat "$prompt_file"; printf '\n\nNOTE: %s Changes already made are still in the working tree (check git status and git diff); continue from there instead of starting over.' "$note")"
-                done
-              }
+              if [ -f /workspace/skip ]; then
+                echo "Nothing to do"
+                exit 0
+              fi
+
+              BRANCH="$(cat /workspace/branch)"
+              PROMPT="You are working on the pull request below, on its head branch '${BRANCH}' (base branch '${BASE_BRANCH}'), following the repository's AGENTS.md.
+              A new ${EVENT_TYPE} event was triggered by a comment from ${COMMENT_AUTHOR}. Act on THIS comment, using the rest of the conversation as context:
+
+              ----- NEW COMMENT -----
+              ${COMMENT_BODY}
+              -----------------------
+
+              The full pull request conversation (description, comments, reviews, inline comments) is below.
+
+              $(cat /workspace/pr-conversation.md)
+
+              Rules:
+              - If the comment requests a change, implement it on the current branch, add or update tests where appropriate, and keep the change minimal. Inspect what the PR already changes with 'git diff origin/${BASE_BRANCH}...HEAD'.
+              - If the comment is only a question or needs no code change, do not modify any file; answer it in the summary.
+              - Pipeline context: you run non-interactively with no GitHub credentials; the pipeline handles git and the pull request reply, so ignore those sections of AGENTS.md. Use only the available tools (bash, read, edit, write, glob, grep, skill, task); there is no 'step', 'run' or 'todo' tool.
+              - When done, write a 2-4 bullet summary to .agent-summary.md in the repository root (the pipeline posts it as the reply and removes it from the commit): what was changed in plain language (or the answer to the question), the test result, anything left undone or worth a reviewer's attention."
 
               echo "=== Running opencode ==="
-              run_opencode 75m /workspace/prompt.txt || echo "opencode exited with $? (timeout or error); continuing"
+              timeout 3h opencode run "$PROMPT" 2>&1 | tee /workspace/opencode.log \
+                || echo "opencode exited with $? (timeout or error); continuing"
 
-              mkdir -p /workspace/out
-              [ -f .agent-summary.md ] && mv .agent-summary.md /workspace/out/summary.md
+              # Only sources: never commit build output (target/ is tracked in this repo) or the agent summary
+              if [ -f .agent-summary.md ]; then mv .agent-summary.md /workspace/out/summary.md; fi
 
-              BUILD_STATUS="not verified (no code changes)"
-              COMMIT_INFO="No code changes were made."
+          # Commit, push and PR reply. Mints a fresh token: the agent run may outlast the 1h token lifetime.
+          - name: publish
+            image: quay.io/pminkows/opencode:latest
+            workingDir: /workspace/repo
+            volumeMounts:
+              - name: work
+                mountPath: /workspace
+              - name: config
+                mountPath: /config
+                readOnly: true
+            env:
+              - name: GITHUB_APP_ID
+                valueFrom:
+                  secretKeyRef:
+                    name: github-app
+                    key: app-id
+              - name: GITHUB_APP_INSTALLATION_ID
+                valueFrom:
+                  secretKeyRef:
+                    name: github-app
+                    key: installation-id
+              - name: GITHUB_APP_PRIVATE_KEY
+                valueFrom:
+                  secretKeyRef:
+                    name: github-app
+                    key: private-key.pem
+              - name: REPO_FULL_NAME
+                value: $(params.repo-full-name)
+              - name: PR_NUMBER
+                value: $(params.pr-number)
+              - name: HOME
+                value: /workspace/home
+              - name: GIT_AUTHOR_NAME
+                value: ai-software-factory-agent[bot]
+              - name: GIT_AUTHOR_EMAIL
+                value: 5642464+ai-software-factory-agent[bot]@users.noreply.github.com
+              - name: GIT_COMMITTER_NAME
+                value: ai-software-factory-agent[bot]
+              - name: GIT_COMMITTER_EMAIL
+                value: 5642464+ai-software-factory-agent[bot]@users.noreply.github.com
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+
+              if [ -f /workspace/skip ]; then
+                echo "Nothing to do"
+                exit 0
+              fi
+
+              BRANCH="$(cat /workspace/branch)"
+
+              # Installation tokens expire after 1h and the agent run can take longer, so mint the token only now
+              GH_TOKEN="$(bash /config/gh-app-token.sh)"
+              export GH_TOKEN
+
               if [ -n "$(git status --porcelain -uall -- . ':(exclude)**/target/**')" ]; then
-                # Build gate: compile main and test sources of every Maven module touched by the agent.
-                # On failure the agent is re-run with the compiler output (max $MAX_FIX_ATTEMPTS times).
-                MAX_FIX_ATTEMPTS=2
-
-                build_modules() {
-                  : > /workspace/build.log
-                  local rc=0 f d root rel
-                  # unique "root|module" pairs for changed files: module = nearest pom dir, root = topmost pom dir
-                  git status --porcelain -uall -- . ':(exclude)**/target/**' | cut -c4- | while read -r f; do
-                    d="$(dirname "$f")"
-                    while [ "$d" != "." ] && [ ! -f "$d/pom.xml" ]; do d="$(dirname "$d")"; done
-                    [ -f "$d/pom.xml" ] || continue
-                    root="$d"
-                    while [ "$(dirname "$root")" != "." ] && [ -f "$(dirname "$root")/pom.xml" ]; do root="$(dirname "$root")"; done
-                    echo "$root|$d"
-                  done | sort -u > /workspace/modules.txt
-                  while IFS='|' read -r root d; do
-                    if [ "$root" = "$d" ]; then
-                      echo "=== mvn test-compile in $root ===" | tee -a /workspace/build.log
-                      (cd "$root" && timeout 10m mvn -B -q -DskipTests test-compile) >> /workspace/build.log 2>&1 || rc=1
-                    else
-                      rel="${d#"$root"/}"
-                      echo "=== mvn test-compile in $root (module $rel) ===" | tee -a /workspace/build.log
-                      (cd "$root" && timeout 10m mvn -B -q -DskipTests test-compile -pl "$rel" -am) >> /workspace/build.log 2>&1 || rc=1
-                    fi
-                  done < /workspace/modules.txt
-                  return $rc
-                }
-
-                ATTEMPT=0
-                while true; do
-                  echo "=== Build verification (attempt $((ATTEMPT + 1))) ==="
-                  if build_modules; then
-                    if [ -s /workspace/modules.txt ]; then
-                      BUILD_STATUS="compiles"
-                    else
-                      BUILD_STATUS="not verified (no Maven module changed)"
-                    fi
-                    break
-                  fi
-                  tail -n 100 /workspace/build.log
-                  if [ "$ATTEMPT" -ge "$MAX_FIX_ATTEMPTS" ]; then
-                    BUILD_STATUS="FAILED to compile after ${MAX_FIX_ATTEMPTS} fix attempts"
-                    break
-                  fi
-                  ATTEMPT=$((ATTEMPT + 1))
-                  {
-                    cat /workspace/prompt.txt
-                    echo
-                    echo "The build of your changes FAILED. Fix the compilation errors below (fix attempt ${ATTEMPT}/${MAX_FIX_ATTEMPTS})."
-                    echo "Do not rewrite unrelated code. Compile again with mvn test-compile before finishing."
-                    echo
-                    echo "Compiler output (last 100 lines):"
-                    tail -n 100 /workspace/build.log
-                  } > /workspace/fix-prompt.txt
-                  run_opencode 25m /workspace/fix-prompt.txt || echo "opencode fix run exited with $?"
-                done
-                echo "Build status: $BUILD_STATUS"
-
-                # Only sources: never commit build output (target/ is tracked in this repo) or the agent summary
-                [ -f .agent-summary.md ] && mv .agent-summary.md /workspace/out/summary.md
-                refresh_gh_token
                 git add -A -- . ':(exclude)**/target/**'
                 git commit -m "fix: address comment on pull request #${PR_NUMBER}" -m "Refs #${PR_NUMBER}"
                 git push origin "$BRANCH"
-                COMMIT_INFO="Pushed commit $(git rev-parse --short HEAD) to \`${BRANCH}\`."
               fi
 
               echo "=== Replying on the pull request ==="
-              refresh_gh_token
               if [ -s /workspace/out/summary.md ]; then
-                SUMMARY="$(cat /workspace/out/summary.md)"
-              else
-                SUMMARY="- The agent did not produce a summary; see the commits on this branch. Tests: unknown."
+                gh pr comment "$PR_NUMBER" --repo "$REPO_FULL_NAME" --body-file /workspace/out/summary.md
               fi
-              gh pr comment "$PR_NUMBER" \
-                --repo "$REPO_FULL_NAME" \
-                --body "${SUMMARY}
-
-              - Build verification (pipeline, mvn test-compile): ${BUILD_STATUS}
-              - ${COMMIT_INFO}"
