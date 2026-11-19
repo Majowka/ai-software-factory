@@ -39,6 +39,15 @@ OpenShift Route ──► EventListener (Tekton Triggers)
 Every trigger only accepts events from users whose `author_association` is `OWNER` or `MEMBER`
 and ignores bots. Forks and closed issues or pull requests are skipped.
 
+## Showcase
+
+The approach described here is in use in a sample application repository:
+[piomin/ai-software-factory-showcase](https://github.com/piomin/ai-software-factory-showcase).
+The GitHub App from this guide is installed there, and the repository has an `AGENTS.md` with the
+rules the agent follows. Browse its closed issues and merged pull requests to see the factory at
+work: the plan comment on a new issue, the pull request opened by the bot, the human approval and
+the auto-merge. The GitHub screenshots in this README come from that repository.
+
 ## Event flows
 
 Each diagram follows one event from GitHub through the OpenShift cluster (Route, EventListener,
