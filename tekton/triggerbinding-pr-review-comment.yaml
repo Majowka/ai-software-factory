@@ -1,7 +1,6 @@
 apiVersion: triggers.tekton.dev/v1beta1
 kind: TriggerBinding
 metadata:
-  annotations: {}
   name: pr-review-comment
   namespace: agents
 spec:

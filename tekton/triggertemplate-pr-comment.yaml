@@ -1,7 +1,6 @@
 apiVersion: triggers.tekton.dev/v1beta1
 kind: TriggerTemplate
 metadata:
-  annotations: {}
   name: pr-comment
   namespace: agents
 spec:

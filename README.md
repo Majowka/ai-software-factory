@@ -1,4 +1,4 @@
-# AI Software Factory on OpenShift
+# AI Software Factory on Kubernetes / OpenShift
 
 A self-hosted "software factory" that turns GitHub issues and comments into pull requests.
 GitHub events are received by Tekton Triggers, executed as Tekton pipelines, and handled by a
@@ -76,7 +76,8 @@ drawings, not the official logos.
 │   ├── route-new-issue.yaml             public HTTPS endpoint for the GitHub webhook
 │   └── serviceaccount-*.yaml, rolebinding-*.yaml   service account and RBAC for the EventListener
 ├── secrets/                             secret skeletons with placeholders only (never commit real values)
-├── ai/                                  vLLM Deployment and Service for qwen38-flash and qwen3-coder
+│   └── secret-github-app.yaml, secret-github-webhook-secret.yaml, secret-hf-token.yaml, ...
+├── ai/                                  the model: cache volume, Deployment and Service for qwen38-flash and qwen3-coder
 └── docs/
     ├── diagrams/                        SVG diagrams of the three event flows
     └── images/                          screenshots used in this README
@@ -200,25 +201,79 @@ gh api "/users/<app-slug>%5Bbot%5D" --jq .id
 
 ## 3. Secrets on OpenShift
 
-The `secrets/secret-*.yaml` files are skeletons. Create the real secrets from the command line:
+The `secrets/` directory holds secret **skeletons** with placeholders only. Never commit real
+values: fill in a local copy (or use `oc create secret` instead) and apply it.
+
+**GitHub App credentials** (`secrets/secret-github-app.yaml`). They are used to mint short-lived
+installation tokens. Keep the private key as a multi-line block:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: github-app
+  namespace: agents
+type: Opaque
+stringData:
+  app-id: "<APP_ID>"
+  installation-id: "<INSTALLATION_ID>"
+  private-key.pem: |
+    -----BEGIN RSA PRIVATE KEY-----
+    <PRIVATE_KEY_BODY>
+    -----END RSA PRIVATE KEY-----
+```
 
 ```bash
-# GitHub App credentials used to mint installation tokens
+oc apply -f secrets/secret-github-app.yaml
+```
+
+**Webhook secret** (`secrets/secret-github-webhook-secret.yaml`). The same value must be set as the
+webhook secret in the GitHub App. The EventListener uses it to verify every delivery:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: github-webhook-secret
+  namespace: agents
+type: Opaque
+stringData:
+  secret: "<WEBHOOK_SECRET>"
+```
+
+```bash
+oc apply -f secrets/secret-github-webhook-secret.yaml
+```
+
+**Hugging Face token** (`secrets/secret-hf-token.yaml`). The model deployment uses it to download
+the weights:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: hf-token
+  namespace: ai
+type: Opaque
+stringData:
+  token: "<HF_TOKEN>"
+```
+
+```bash
+oc apply -f secrets/secret-hf-token.yaml
+```
+
+The same secrets can be created without a file, for example:
+
+```bash
 oc create secret generic github-app -n agents \
   --from-literal=app-id=<APP_ID> \
   --from-literal=installation-id=<INSTALLATION_ID> \
   --from-file=private-key.pem=./<app-private-key>.pem
-
-# Shared secret used to verify webhook signatures (same value as in the GitHub App)
-oc create secret generic github-webhook-secret -n agents \
-  --from-literal=secret=<WEBHOOK_SECRET>
-
-# Hugging Face token to download the model weights
-oc create secret generic hf-token -n ai --from-literal=token=<HF_TOKEN>
 ```
 
-`secrets/secret-claude-github-secrets.yaml` (`ANTHROPIC_API_KEY`, `GH_TOKEN`) is only needed if you run a
-Claude Code based variant. The OpenCode pipelines do not use it.
+`secrets/secret-claude-github-secrets.yaml` (`ANTHROPIC_API_KEY`, `GH_TOKEN`) is only needed if you
+run a Claude Code based variant. The OpenCode pipelines do not use it.
 
 If your Quay repositories are private, create an image pull secret and link it:
 
@@ -232,21 +287,78 @@ oc secrets link pipeline quay-pull --for=pull -n agents
 
 ### 4.1 Agent image
 
+`agents/Dockerfile.opencode` builds the image that runs in the `prepare`, `plan`, `agent` and
+`publish` steps. It is based on UBI with Node.js and adds OpenCode, the GitHub CLI, a JDK, Maven,
+`skaffold` and `kubectl`:
+
+```dockerfile
+FROM registry.access.redhat.com/ubi9/nodejs-22
+
+USER 0
+
+RUN dnf install -y git jq tar gzip \
+    && dnf clean all
+
+RUN npm install -g opencode-ai
+
+# GitHub CLI
+ARG GH_VERSION=2.83.2
+RUN curl -fsSL \
+    "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" \
+    -o /tmp/gh.tar.gz \
+    && tar -xzf /tmp/gh.tar.gz -C /tmp \
+    && cp /tmp/gh_${GH_VERSION}_linux_amd64/bin/gh /usr/local/bin/gh \
+    && rm -rf /tmp/gh*
+
+# Skaffold (build and deploy an application to Kubernetes)
+ARG SKAFFOLD_VERSION=2.25.0
+RUN curl -fsSL \
+    "https://storage.googleapis.com/skaffold/releases/v${SKAFFOLD_VERSION}/skaffold-linux-amd64" \
+    -o /usr/local/bin/skaffold \
+    && chmod +x /usr/local/bin/skaffold
+
+# kubectl (used by skaffold when it deploys)
+ARG KUBECTL_VERSION=1.37.2
+RUN curl -fsSL \
+    "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
+    -o /usr/local/bin/kubectl \
+    && chmod +x /usr/local/bin/kubectl
+
+# OpenJDK 25 (Eclipse Temurin)
+RUN mkdir -p /opt/java \
+    && curl -fsSL \
+    "https://api.adoptium.net/v3/binary/latest/25/ga/linux/x64/jdk/hotspot/normal/eclipse" \
+    | tar -xz -C /opt/java --strip-components=1
+ENV JAVA_HOME=/opt/java
+
+# Maven
+ARG MAVEN_VERSION=3.9.11
+RUN mkdir -p /opt/maven \
+    && curl -fsSL \
+    "https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/${MAVEN_VERSION}/apache-maven-${MAVEN_VERSION}-bin.tar.gz" \
+    | tar -xz -C /opt/maven --strip-components=1
+ENV MAVEN_HOME=/opt/maven
+ENV PATH="${JAVA_HOME}/bin:${MAVEN_HOME}/bin:${PATH}"
+
+USER 1001
+```
+
+Build and push it:
+
 ```bash
 podman build -f agents/Dockerfile.opencode -t quay.io/<org>/opencode:latest agents/
 podman push quay.io/<org>/opencode:latest
 ```
 
-The image contains OpenCode, `git`, `gh`, `jq`, JDK 25, Maven, `skaffold` and `kubectl`
-(`SKAFFOLD_VERSION`, `KUBECTL_VERSION` and the other versions are build arguments). The
-pipelines reference it as `quay.io/pminkows/opencode:latest`; replace that with your own
+The pipelines reference the image as `quay.io/pminkows/opencode:latest`. Replace that with your own
 repository and, preferably, a pinned tag:
 
 ```bash
 sed -i 's#quay.io/pminkows#quay.io/<org>#g' tekton/pipeline-*.yaml
 ```
 
-The optional Claude Code image is built the same way from `agents/Dockerfile`.
+`agents/Dockerfile` is the same image with Claude Code (`npm install -g @anthropic-ai/claude-code`)
+instead of OpenCode, and without the JDK and Maven. It is optional and not used by the pipelines.
 
 `skaffold` and `kubectl` are in the image so that an agent can deploy an application to
 Kubernetes. They do nothing by default: the agent pods have no kubeconfig or RBAC. Granting that
@@ -271,30 +383,129 @@ Set the repository and tag in the `skills-artifact` parameter of the pipelines (
 
 The manifests in `ai/` run `vllm serve` for Qwen3.8 Flash (`qwen38-flash`) and Qwen3 Coder
 (`qwen3-coder`). The pipelines use **Qwen3.8 Flash**, served as `qwen38_flash`, with tool calling
-enabled (`--enable-auto-tool-choice --tool-call-parser=qwen3_coder`) and a 32k context.
+enabled and a 32k context.
 
-`qwen38-flash` keeps its Hugging Face cache on a persistent volume, so create it first:
+**Cache volume** (`ai/pvc-qwen38-flash-cache.yaml`). The Hugging Face cache lives on a persistent
+volume so the weights are downloaded only once:
 
-```bash
-cat <<'EOF' | oc apply -n ai -f -
+```yaml
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: qwen38-flash-cache
+  namespace: ai
 spec:
-  accessModes: [ReadWriteOnce]
+  accessModes:
+    - ReadWriteOnce
   resources:
     requests:
       storage: 300Gi
   storageClassName: gp3-csi
-EOF
+```
 
-oc apply -n ai -f ai/deployment-qwen38-flash.yaml -f ai/service-qwen38-flash.yaml
+```bash
+oc apply -f ai/pvc-qwen38-flash-cache.yaml
+```
+
+**Deployment** (`ai/deployment-qwen38-flash.yaml`, shortened). The arguments that matter are the
+served model name, tensor parallelism over two GPUs, the context length and the tool-calling
+parser, which OpenCode relies on:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qwen38-flash
+  namespace: ai
+spec:
+  replicas: 0                    # scale to 1 when you want the model running
+  strategy:
+    type: Recreate               # the cache volume is ReadWriteOnce
+  selector:
+    matchLabels:
+      app: qwen38-flash
+  template:
+    metadata:
+      labels:
+        app: qwen38-flash
+    spec:
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: vllm
+          image: registry.redhat.io/rhaii-preview/vllm-cuda-rhel9:v0.31.0
+          command: ["vllm", "serve"]
+          args:
+            - RedHatAI/Qwen3.8-Flash-Next-NVFP4
+            - --port=8000
+            - --served-model-name=qwen38_flash
+            - --tensor-parallel-size=2
+            - --max-model-len=32768
+            - --gpu-memory-utilization=0.90
+            - --enable-auto-tool-choice
+            - --tool-call-parser=qwen3_coder
+            - --reasoning-parser=qwen3
+            - --enforce-eager
+            - --no-enable-flashinfer-autotune
+          env:
+            - name: HUGGING_FACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+            - name: HF_HOME
+              value: /cache/hf
+          ports:
+            - containerPort: 8000
+          resources:
+            requests: { cpu: "4", memory: 180Gi, nvidia.com/gpu: "2" }
+            limits:   { cpu: "16", memory: 200Gi, nvidia.com/gpu: "2" }
+          # startup, liveness and readiness probes on /health:8000 omitted;
+          # the startup probe allows about an hour for the first download
+          volumeMounts:
+            - { name: shm, mountPath: /dev/shm }
+            - { name: cache, mountPath: /cache/hf, subPath: hf }
+            - { name: cache, mountPath: /tmp/vllm, subPath: vllm }
+      volumes:
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 32Gi }
+        - name: cache
+          persistentVolumeClaim:
+            claimName: qwen38-flash-cache
+```
+
+**Service** (`ai/service-qwen38-flash.yaml`). It gives the agents a stable address,
+`http://qwen38-flash.ai.svc.cluster.local:8000/v1`:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: qwen38-flash
+  namespace: ai
+spec:
+  type: ClusterIP
+  selector:
+    app: qwen38-flash
+  ports:
+    - port: 8000
+      targetPort: 8000
+      protocol: TCP
+```
+
+```bash
+oc apply -f ai/deployment-qwen38-flash.yaml -f ai/service-qwen38-flash.yaml
 oc scale deployment/qwen38-flash -n ai --replicas=1
 ```
 
-The first start downloads the weights, which can take a long time. The startup probe allows about
-an hour. Watch it with `oc logs -f deployment/qwen38-flash -n ai`.
+`ai/deployment-qwen3-coder.yaml` and `ai/service-qwen3-coder.yaml` define the second model the same
+way (`RedHatAI/Qwen3-Coder-Next-NVFP4`, served as `qwen3_coder`, no cache volume). Both ship with
+`replicas: 0`; run only one at a time unless you have 4 GPUs.
+
+The first start downloads the weights, which can take a long time. Watch it with
+`oc logs -f deployment/qwen38-flash -n ai`.
 
 Verify the endpoint:
 
@@ -306,45 +517,458 @@ curl -s localhost:8000/v1/models | jq '.data[].id'     # expect "qwen38_flash"
 ![vLLM model pod running in the ai namespace](docs/images/vllm-pods-running.png)
 *The `qwen38-flash` pod is `Running` and `/v1/models` lists `qwen38_flash`.*
 
-The agent reaches the model at `http://qwen38-flash.ai.svc.cluster.local:8000/v1`. This address,
-the model name and the context limit live in `agents/configmap-agent-config.yaml`
-(`opencode.json`). To switch models, change the provider and model there and nothing else.
-
-Scale the model down when it is not needed (`--replicas=0`) to release the GPUs.
+The agent reaches the model through the address above. That address, the model name and the
+context limit live in the agent configuration (section 6.1). To switch models, change the provider
+and model there and nothing else. Scale the model down when it is not needed (`--replicas=0`) to
+release the GPUs.
 
 ## 6. Tekton: pipelines, triggers and the listener
 
-Apply the manifests in this order:
+### 6.1 Agent configuration (ConfigMap)
 
-```bash
-# Shared OpenCode config and GitHub App token script
-oc apply -n agents -f agents/configmap-agent-config.yaml
+`agents/configmap-agent-config.yaml` is shared by all pipelines and mounted at `/config`. It has
+three files: the script that mints GitHub App installation tokens, and two OpenCode configs. The
+model, its endpoint and the **permissions** of the agent are defined here.
 
-# RBAC for the EventListener
-oc apply -n agents -f tekton/serviceaccount-issue-agent-listener.yaml \
-                   -f tekton/rolebinding-issue-agent-listener.yaml
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-config
+  namespace: agents
+data:
+  # Prints a GitHub App installation token (valid 1h).
+  # Run it right before every step that talks to GitHub.
+  gh-app-token.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+    b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+    now="$(date +%s)"
+    header="$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)"
+    payload="$(printf '{"iat":%s,"exp":%s,"iss":"%s"}' "$((now - 60))" "$((now + 540))" "$GITHUB_APP_ID" | b64url)"
+    signature="$(printf '%s.%s' "$header" "$payload" | openssl dgst -sha256 -sign <(printf '%s\n' "$GITHUB_APP_PRIVATE_KEY") | b64url)"
+    curl -fsS -X POST \
+      -H "Authorization: Bearer ${header}.${payload}.${signature}" \
+      -H "Accept: application/vnd.github+json" \
+      "https://api.github.com/app/installations/${GITHUB_APP_INSTALLATION_ID}/access_tokens" | jq -er .token
 
-# Pipelines
-oc apply -n agents -f tekton/pipeline-issue-agent.yaml \
-                   -f tekton/pipeline-issue-comment-agent.yaml \
-                   -f tekton/pipeline-pr-comment-agent.yaml
+  # OpenCode config for the agent step: no commits, pushes or gh commands
+  opencode.json: |
+    {
+      "$schema": "https://opencode.ai/config.json",
+      "model": "qwen38-flash/qwen38_flash",
+      "permission": {
+        "edit": "allow",
+        "skill": "allow",
+        "task": "allow",
+        "webfetch": "deny",
+        "external_directory": "allow",
+        "bash": { "*": "allow", "git commit*": "deny", "git push*": "deny", "gh *": "deny" }
+      },
+      "tools": { "todowrite": false },
+      "provider": {
+        "qwen38-flash": {
+          "npm": "@ai-sdk/openai-compatible",
+          "name": "Qwen3.8 Flash",
+          "options": { "baseURL": "http://qwen38-flash.ai.svc.cluster.local:8000/v1", "apiKey": "none" },
+          "models": { "qwen38_flash": { "name": "Qwen3.8 Flash", "limit": { "context": 32768, "output": 8192 } } }
+        }
+      }
+    }
 
-# Bindings, templates, listener and public route
-oc apply -n agents -f tekton/triggerbinding-new-issue.yaml \
-                   -f tekton/triggerbinding-issue-comment.yaml \
-                   -f tekton/triggerbinding-pr-review.yaml \
-                   -f tekton/triggerbinding-pr-review-comment.yaml \
-                   -f tekton/triggertemplate-new-issue.yaml \
-                   -f tekton/triggertemplate-issue-comment.yaml \
-                   -f tekton/triggertemplate-pr-comment.yaml \
-                   -f tekton/eventlistener-new-issue.yaml \
-                   -f tekton/route-new-issue.yaml
+  # Same as opencode.json, but the plan step may post its plan with gh
+  opencode-plan.json: |
+    {
+      ...
+      "permission": {
+        ...
+        "bash": { "*": "allow", "git commit*": "deny", "git push*": "deny",
+                  "gh *": "deny", "gh issue comment*": "allow", "gh pr comment*": "allow" }
+      },
+      ...
+    }
 ```
 
-![PipelineRuns in the OpenShift console](docs/images/pipelines-in-console.png)
+```bash
+oc apply -f agents/configmap-agent-config.yaml
+```
+
+### 6.2 Listener service account and RBAC
+
+The EventListener runs under its own service account, bound to the cluster role that Tekton
+Triggers provides for listeners:
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: issue-agent-listener
+  namespace: agents
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: issue-agent-listener
+  namespace: agents
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: tekton-triggers-eventlistener-roles
+subjects:
+  - kind: ServiceAccount
+    name: issue-agent-listener
+    namespace: agents
+```
+
+```bash
+oc apply -f tekton/serviceaccount-issue-agent-listener.yaml -f tekton/rolebinding-issue-agent-listener.yaml
+```
+
+### 6.3 Pipelines
+
+All three pipelines have the same shape: `print-event`, `fetch-skills`, and one long task that
+runs the steps `prepare`, `plan`, `agent` and `publish`. Only the event parameters and the
+`prepare` and `publish` logic differ. The skills workspace is a volume that every `PipelineRun`
+creates for itself.
+
+`tekton/pipeline-issue-agent.yaml` (shortened; the scripts keep only their key commands):
+
+```yaml
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: issue-agent
+  namespace: agents
+spec:
+  params:
+    - { name: repo-url, type: string }
+    - { name: repo-full-name, type: string }
+    - { name: issue, type: string }
+    - { name: issue-title, type: string }
+    - { name: issue-body, type: string, default: "" }
+    - { name: base-branch, type: string, default: master }
+    - { name: skills-artifact, type: string, default: "quay.io/pminkows/claude-ai-spring-boot:1.3.1" }
+    # issue-id and issue-author are also declared; they are only printed
+  workspaces:
+    - name: skills
+  tasks:
+    - name: print-event                       # logs the key facts of the event
+      taskSpec:
+        steps:
+          - name: print
+            image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+            # script: echo repository, issue number, title, author and body
+
+    - name: fetch-skills
+      runAfter: [print-event]
+      workspaces: [{ name: skills, workspace: skills }]
+      taskSpec:
+        steps:
+          - name: pull
+            image: ghcr.io/oras-project/oras:v1.3.0
+            command: ["oras"]
+            args: ["pull", "$(params.skills-artifact)", "--output", "/skills/artifact"]
+          - name: unpack
+            image: registry.access.redhat.com/ubi9/ubi:latest
+            script: |
+              mkdir -p /skills/opencode
+              for f in /skills/artifact/*.tar.gz; do tar -xzf "$f" -C /skills/opencode; done
+
+    - name: implement-and-create-pr
+      runAfter: [fetch-skills]
+      timeout: "3h"
+      workspaces: [{ name: skills, workspace: skills }]
+      taskSpec:
+        volumes:
+          - { name: work, emptyDir: {} }             # shared by all steps: clone, plan, summary
+          - { name: config, configMap: { name: agent-config } }
+        steps:
+          - name: prepare                            # holds the GitHub App key
+            image: quay.io/pminkows/opencode:latest
+            env:                                     # GITHUB_APP_ID, GITHUB_APP_INSTALLATION_ID and
+              - name: GITHUB_APP_PRIVATE_KEY         # GITHUB_APP_PRIVATE_KEY come from the github-app secret
+                valueFrom: { secretKeyRef: { name: github-app, key: private-key.pem } }
+            script: |
+              cp -R /skills/opencode/. "$HOME/.config/opencode/"
+              GH_TOKEN="$(bash /config/gh-app-token.sh)"; export GH_TOKEN
+              gh auth setup-git
+              ( umask 077; printf '%s' "$GH_TOKEN" > /workspace/gh-token )   # for the plan step only
+              git clone --branch "$BASE_BRANCH" -- "$REPO_URL" /workspace/repo
+              git switch -c "issue-${ISSUE_NUMBER}-${SLUG}"
+
+          - name: plan                               # no App key, only the short-lived token
+            image: quay.io/pminkows/opencode:latest
+            env:
+              - { name: OPENCODE_CONFIG, value: /config/opencode-plan.json }
+            script: |
+              GH_TOKEN="$(cat /workspace/gh-token)"; export GH_TOKEN; rm -f /workspace/gh-token
+              timeout 15m opencode run "Write an implementation plan as a checklist to
+                /workspace/out/plan.md and post it with: gh issue comment ... (only gh command allowed)"
+              git reset -q --hard && git clean -qfd   # planning must not leave changes behind
+
+          - name: agent                              # no GitHub credentials at all
+            image: quay.io/pminkows/opencode:latest
+            env:
+              - { name: OPENCODE_CONFIG, value: /config/opencode.json }
+            script: |
+              PROMPT="Implement this GitHub issue, following the repository's AGENTS.md. ... $(cat /workspace/issue.txt)"
+              [ -s /workspace/out/plan.md ] && PROMPT="$PROMPT Follow this plan: $(cat /workspace/out/plan.md)"
+              timeout 3h opencode run "$PROMPT"
+              # the agent writes a short summary to .agent-summary.md; it is moved out of the repository
+
+          - name: publish                            # mints a fresh token: the agent may run longer than 1h
+            image: quay.io/pminkows/opencode:latest
+            script: |
+              GH_TOKEN="$(bash /config/gh-app-token.sh)"; export GH_TOKEN
+              git add -A && git commit -m "feat: implement issue #${ISSUE_NUMBER}" && git push origin "$BRANCH"
+              PR_URL="$(gh pr create --base "$BASE_BRANCH" --head "$BRANCH" --body "Closes #${ISSUE_NUMBER}" ...)"
+              gh pr merge "$PR_URL" --auto --merge     # waits for the required review and checks
+              gh issue comment "$ISSUE_NUMBER" --body-file /workspace/out/summary.md
+```
+
+```bash
+oc apply -f tekton/pipeline-issue-agent.yaml
+```
+
+The other two pipelines differ in what they read and where they write:
+
+- `tekton/pipeline-issue-comment-agent.yaml`: `prepare` fetches the whole issue thread through the
+  API and creates a branch per comment (`issue-<n>-<slug>-c<comment id>`). `plan` posts a plan
+  only when the comment asks for a code change. `publish` opens a pull request only if files
+  changed, and always replies on the issue.
+- `tekton/pipeline-pr-comment-agent.yaml`: `prepare` checks that the PR is open and not from a
+  fork, collects the description, comments, reviews and inline comments, and clones the PR branch.
+  `publish` pushes to that branch and replies on the pull request.
+
+```bash
+oc apply -f tekton/pipeline-issue-comment-agent.yaml -f tekton/pipeline-pr-comment-agent.yaml
+```
+
+![Pipelines in the OpenShift console](docs/images/pipelines-in-console.png)
 *PipelineRuns of the three pipelines in the `agents` namespace, in the OpenShift Pipelines console.*
 
-### 6.1 How events become pipeline runs
+### 6.4 Trigger bindings and templates
+
+A **TriggerBinding** copies fields from the GitHub webhook payload into parameters. The one for
+new issues (`tekton/triggerbinding-new-issue.yaml`):
+
+```yaml
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: new-issue
+  namespace: agents
+spec:
+  params:
+    - name: repo-url
+      value: $(body.repository.clone_url)
+    - name: repo-full-name
+      value: $(body.repository.full_name)
+    - name: issue
+      value: $(body.issue.number)
+    - name: issue-title
+      value: $(body.issue.title)
+    - name: issue-body
+      value: $(body.issue.body)
+    - name: base-branch
+      value: $(body.repository.default_branch)
+    - name: issue-id
+      value: $(body.issue.id)
+    - name: issue-author
+      value: $(body.issue.user.login)
+```
+
+The binding for issue comments (`tekton/triggerbinding-issue-comment.yaml`) adds the event type
+(`$(header.X-Github-Event)`) and the comment (`$(body.comment.id)`, `$(body.comment.user.login)`,
+`$(body.comment.body)`). The two pull request bindings read `$(body.pull_request.number)`,
+`$(body.pull_request.title)` and `$(body.pull_request.head.ref)`, and take the author and text
+from `body.comment` (review comment) or `body.review` (review).
+
+A **TriggerTemplate** turns those parameters into a `PipelineRun`. The one for new issues
+(`tekton/triggertemplate-new-issue.yaml`, shortened):
+
+```yaml
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: new-issue
+  namespace: agents
+spec:
+  params:
+    - name: repo-url
+    - name: repo-full-name
+    - name: issue
+    - name: issue-title
+    - name: issue-body
+    - name: base-branch
+    - { name: issue-id, default: "" }
+    - { name: issue-author, default: "" }
+  resourcetemplates:
+    - apiVersion: tekton.dev/v1
+      kind: PipelineRun
+      metadata:
+        generateName: issue-agent-
+      spec:
+        pipelineRef:
+          name: issue-agent
+        timeouts:
+          pipeline: 3h0m0s
+        params:
+          - { name: repo-url, value: $(tt.params.repo-url) }
+          - { name: issue, value: $(tt.params.issue) }
+          # ... one entry per parameter above
+        workspaces:
+          - name: skills
+            volumeClaimTemplate:
+              spec:
+                accessModes: [ReadWriteOnce]
+                resources:
+                  requests:
+                    storage: 1Gi
+```
+
+The templates for comments and pull requests are the same with another `pipelineRef`, other
+parameters and `taskRunTemplate.serviceAccountName: pipeline`.
+
+```bash
+oc apply -f tekton/triggerbinding-new-issue.yaml \
+         -f tekton/triggerbinding-issue-comment.yaml \
+         -f tekton/triggerbinding-pr-review.yaml \
+         -f tekton/triggerbinding-pr-review-comment.yaml \
+         -f tekton/triggertemplate-new-issue.yaml \
+         -f tekton/triggertemplate-issue-comment.yaml \
+         -f tekton/triggertemplate-pr-comment.yaml
+```
+
+### 6.5 EventListener and Route
+
+The **EventListener** (`tekton/eventlistener-new-issue.yaml`) is the single entry point. Every
+trigger first verifies the webhook signature (`github` interceptor) and then filters with CEL
+(`cel` interceptor). Only events that pass both reach a binding and a template.
+
+```yaml
+apiVersion: triggers.tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: new-issue
+  namespace: agents
+spec:
+  serviceAccountName: issue-agent-listener
+  triggers:
+    - name: new-issue
+      interceptors:
+        - ref: { kind: ClusterInterceptor, name: github }
+          params:
+            - name: secretRef
+              value: { secretName: github-webhook-secret, secretKey: secret }
+            - name: eventTypes
+              value: [issues]
+        - ref: { kind: ClusterInterceptor, name: cel }
+          params:
+            - name: filter
+              value: >-
+                body.action == 'opened'
+                && body.issue.author_association in ['OWNER', 'MEMBER']
+      bindings:
+        - { kind: TriggerBinding, ref: new-issue }
+      template:
+        ref: new-issue
+
+    - name: issue-comment
+      interceptors:
+        - ref: { kind: ClusterInterceptor, name: github }
+          params:
+            - { name: secretRef, value: { secretName: github-webhook-secret, secretKey: secret } }
+            - { name: eventTypes, value: [issue_comment] }
+        - ref: { kind: ClusterInterceptor, name: cel }
+          params:
+            - name: filter
+              value: >-
+                body.action == 'created' && body.issue.state == 'open'
+                && !has(body.issue.pull_request) && body.sender.type != 'Bot'
+                && body.comment.author_association in ['OWNER', 'MEMBER']
+                && body.comment.body.startsWith('@ai')
+      bindings:
+        - { kind: TriggerBinding, ref: issue-comment }
+      template:
+        ref: issue-comment
+
+    - name: pr-review-comment
+      interceptors:
+        - ref: { kind: ClusterInterceptor, name: github }
+          params:
+            - { name: secretRef, value: { secretName: github-webhook-secret, secretKey: secret } }
+            - { name: eventTypes, value: [pull_request_review_comment] }
+        - ref: { kind: ClusterInterceptor, name: cel }
+          params:
+            - name: filter
+              value: >-
+                body.action == 'created' && body.pull_request.state == 'open'
+                && body.sender.type != 'Bot'
+                && body.comment.author_association in ['OWNER', 'MEMBER']
+      bindings:
+        - { kind: TriggerBinding, ref: pr-review-comment }
+      template:
+        ref: pr-comment
+
+    - name: pr-review
+      interceptors:
+        - ref: { kind: ClusterInterceptor, name: github }
+          params:
+            - { name: secretRef, value: { secretName: github-webhook-secret, secretKey: secret } }
+            - { name: eventTypes, value: [pull_request_review] }
+        - ref: { kind: ClusterInterceptor, name: cel }
+          params:
+            - name: filter
+              value: >-
+                body.action == 'submitted' && body.pull_request.state == 'open'
+                && body.sender.type != 'Bot'
+                && body.review.author_association in ['OWNER', 'MEMBER']
+                && body.review.body != null && body.review.body != ''
+      bindings:
+        - { kind: TriggerBinding, ref: pr-review }
+      template:
+        ref: pr-comment
+```
+
+The **Route** exposes the listener service over HTTPS. Its host is generated by OpenShift and is
+the payload URL for the GitHub webhook (section 7):
+
+```yaml
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: new-issue
+  namespace: agents
+spec:
+  to:
+    kind: Service
+    name: el-new-issue          # created by Tekton Triggers for the EventListener
+  port:
+    targetPort: http-listener
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+```
+
+```bash
+oc apply -f tekton/eventlistener-new-issue.yaml -f tekton/route-new-issue.yaml
+```
+
+All manifests of this section in one go, in a safe order:
+
+```bash
+oc apply -f agents/configmap-agent-config.yaml
+oc apply -f tekton/serviceaccount-issue-agent-listener.yaml -f tekton/rolebinding-issue-agent-listener.yaml
+oc apply -f tekton/pipeline-issue-agent.yaml -f tekton/pipeline-issue-comment-agent.yaml -f tekton/pipeline-pr-comment-agent.yaml
+oc apply -f tekton/triggerbinding-new-issue.yaml -f tekton/triggerbinding-issue-comment.yaml \
+         -f tekton/triggerbinding-pr-review.yaml -f tekton/triggerbinding-pr-review-comment.yaml \
+         -f tekton/triggertemplate-new-issue.yaml -f tekton/triggertemplate-issue-comment.yaml \
+         -f tekton/triggertemplate-pr-comment.yaml
+oc apply -f tekton/eventlistener-new-issue.yaml -f tekton/route-new-issue.yaml
+```
+
+### 6.6 How events become pipeline runs
 
 The `new-issue` EventListener has four triggers. Each verifies the webhook signature with the
 `github-webhook-secret` secret, filters with CEL, and then maps the payload with a binding.
@@ -359,7 +983,7 @@ The `new-issue` EventListener has four triggers. Each verifies the webhook signa
 Each `PipelineRun` gets its own 1 GiB volume (`volumeClaimTemplate`) for the skills workspace and
 a 3 hour timeout.
 
-### 6.2 What a run does
+### 6.7 What a run does
 
 1. **`print-event`**: prints the key facts of the event to the log.
 2. **`fetch-skills`**: `oras pull` of the skills artifact, then unpack.
@@ -378,7 +1002,7 @@ a 3 hour timeout.
 ![A PipelineRun in the OpenShift console](docs/images/pipelinerun-graph.png)
 *A finished `issue-agent` run: `print-event`, `fetch-skills` and `implement-and-create-pr`.*
 
-### 6.3 Security model
+### 6.8 Security model
 
 - The `agent` step has **no GitHub credentials**. Committing, pushing and any `gh` command are
   denied in `opencode.json`, and the model only sees code and the issue text.

@@ -1,7 +1,6 @@
 apiVersion: triggers.tekton.dev/v1beta1
 kind: TriggerBinding
 metadata:
-  annotations: {}
   name: new-issue
   namespace: agents
 spec:
