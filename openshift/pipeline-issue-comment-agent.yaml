@@ -1,0 +1,486 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: issue-comment-agent
+  namespace: agents
+spec:
+  params:
+    - name: event-type
+      type: string
+    - name: repo-url
+      type: string
+    - name: repo-full-name
+      type: string
+    - name: issue
+      type: string
+    - name: issue-title
+      type: string
+    - name: comment-id
+      type: string
+    - name: comment-author
+      type: string
+    - name: comment-body
+      type: string
+    - name: base-branch
+      type: string
+      default: master
+    - name: skills-artifact
+      type: string
+      default: quay.io/pminkows/claude-ai-spring-boot:1.3.1
+  workspaces:
+    - name: skills
+  tasks:
+    - name: print-event
+      params:
+        - name: event-type
+          value: $(params.event-type)
+        - name: repo-full-name
+          value: $(params.repo-full-name)
+        - name: issue
+          value: $(params.issue)
+        - name: issue-title
+          value: $(params.issue-title)
+        - name: comment-author
+          value: $(params.comment-author)
+        - name: comment-body
+          value: $(params.comment-body)
+      taskSpec:
+        params:
+          - name: event-type
+            type: string
+          - name: repo-full-name
+            type: string
+          - name: issue
+            type: string
+          - name: issue-title
+            type: string
+          - name: comment-author
+            type: string
+          - name: comment-body
+            type: string
+        steps:
+          - name: print
+            image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+            env:
+              - name: EVENT_TYPE
+                value: $(params.event-type)
+              - name: REPO_FULL_NAME
+                value: $(params.repo-full-name)
+              - name: ISSUE_NUMBER
+                value: $(params.issue)
+              - name: ISSUE_TITLE
+                value: $(params.issue-title)
+              - name: COMMENT_AUTHOR
+                value: $(params.comment-author)
+              - name: COMMENT_BODY
+                value: $(params.comment-body)
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+
+              echo "=============== Issue comment event ==============="
+              echo "Event type    : ${EVENT_TYPE}"
+              echo "Repository    : ${REPO_FULL_NAME}"
+              echo "Issue number  : ${ISSUE_NUMBER}"
+              echo "Issue title   : ${ISSUE_TITLE}"
+              echo "Comment author: ${COMMENT_AUTHOR}"
+              echo "Comment       :"
+              printf '%s\n' "$COMMENT_BODY"
+              echo "==================================================="
+    - name: fetch-skills
+      runAfter:
+        - print-event
+      params:
+        - name: skills-artifact
+          value: $(params.skills-artifact)
+      workspaces:
+        - name: skills
+          workspace: skills
+      taskSpec:
+        params:
+          - name: skills-artifact
+            type: string
+        workspaces:
+          - name: skills
+            mountPath: /skills
+        steps:
+          - name: pull
+            image: ghcr.io/oras-project/oras:v1.3.0
+            workingDir: /skills
+            command: ["oras"]
+            args: ["pull", "$(params.skills-artifact)", "--output", "/skills/artifact"]
+          - name: unpack
+            image: registry.access.redhat.com/ubi9/ubi:latest
+            workingDir: /skills
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+              # artifact: one tar.gz holding skills/ and agents/ in OpenCode format
+              mkdir -p /skills/opencode
+              for f in /skills/artifact/*.tar.gz; do tar -xzf "$f" -C /skills/opencode 2>/dev/null; done
+              echo "Installed skills: $(ls /skills/opencode/skills | tr '\n' ' ')"
+              echo "Installed agents: $(ls /skills/opencode/agents | tr '\n' ' ')"
+    - name: handle-issue-comment
+      runAfter:
+        - fetch-skills
+      timeout: "3h"
+      workspaces:
+        - name: skills
+          workspace: skills
+      params:
+        - name: event-type
+          value: $(params.event-type)
+        - name: repo-url
+          value: $(params.repo-url)
+        - name: repo-full-name
+          value: $(params.repo-full-name)
+        - name: issue
+          value: $(params.issue)
+        - name: issue-title
+          value: $(params.issue-title)
+        - name: comment-id
+          value: $(params.comment-id)
+        - name: comment-author
+          value: $(params.comment-author)
+        - name: comment-body
+          value: $(params.comment-body)
+        - name: base-branch
+          value: $(params.base-branch)
+      taskSpec:
+        params:
+          - name: event-type
+            type: string
+          - name: repo-url
+            type: string
+          - name: repo-full-name
+            type: string
+          - name: issue
+            type: string
+          - name: issue-title
+            type: string
+          - name: comment-id
+            type: string
+          - name: comment-author
+            type: string
+          - name: comment-body
+            type: string
+          - name: base-branch
+            type: string
+        workspaces:
+          - name: skills
+            mountPath: /skills
+            readOnly: true
+        volumes:
+          - name: work
+            emptyDir: {}
+          - name: config
+            configMap:
+              name: agent-config
+        steps:
+          # Fetches the issue conversation, clones the repo and creates the branch. Holds the GitHub App key, the agent steps do not.
+          - name: prepare
+            image: quay.io/pminkows/opencode:latest
+            workingDir: /workspace
+            volumeMounts:
+              - name: work
+                mountPath: /workspace
+              - name: config
+                mountPath: /config
+                readOnly: true
+            env:
+              - name: GITHUB_APP_ID
+                valueFrom:
+                  secretKeyRef:
+                    name: github-app
+                    key: app-id
+              - name: GITHUB_APP_INSTALLATION_ID
+                valueFrom:
+                  secretKeyRef:
+                    name: github-app
+                    key: installation-id
+              - name: GITHUB_APP_PRIVATE_KEY
+                valueFrom:
+                  secretKeyRef:
+                    name: github-app
+                    key: private-key.pem
+              - name: REPO_URL
+                value: $(params.repo-url)
+              - name: REPO_FULL_NAME
+                value: $(params.repo-full-name)
+              - name: ISSUE_NUMBER
+                value: $(params.issue)
+              - name: ISSUE_TITLE
+                value: $(params.issue-title)
+              - name: COMMENT_ID
+                value: $(params.comment-id)
+              - name: BASE_BRANCH
+                value: $(params.base-branch)
+              - name: HOME
+                value: /workspace/home
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+
+              mkdir -p "$HOME/.config/opencode" /workspace/out
+              # Skills and agents fetched by the fetch-skills task
+              cp -R /skills/opencode/. "$HOME/.config/opencode/"
+
+              GH_TOKEN="$(bash /config/gh-app-token.sh)"
+              export GH_TOKEN
+              gh auth setup-git
+
+              # /workspace/skip tells the following steps there is nothing to do
+              ISSUE_STATE="$(gh issue view "$ISSUE_NUMBER" --repo "$REPO_FULL_NAME" --json state -q .state)"
+              echo "Issue #${ISSUE_NUMBER} state=${ISSUE_STATE}"
+              if [ "$ISSUE_STATE" != "OPEN" ]; then
+                echo "Issue is not open; nothing to do"
+                touch /workspace/skip
+                exit 0
+              fi
+
+              # Whole issue conversation: description and comments
+              {
+                printf '# Issue #%s: %s\n\n' "$ISSUE_NUMBER" "$ISSUE_TITLE"
+                gh issue view "$ISSUE_NUMBER" --repo "$REPO_FULL_NAME" --json body -q '.body // ""'
+                printf '\n## Comments (oldest first)\n\n'
+                gh api --paginate "repos/${REPO_FULL_NAME}/issues/${ISSUE_NUMBER}/comments" | jq -s -r 'add // [] | sort_by(.created_at) | .[] | "### \(.user.login), \(.created_at)\n\(.body)\n"'
+              } > /workspace/issue-conversation.md
+              echo "=== Issue conversation ==="
+              cat /workspace/issue-conversation.md
+
+              git clone --branch "$BASE_BRANCH" -- "$REPO_URL" /workspace/repo
+              cd /workspace/repo
+
+              # Branch name per AGENTS.md: issue-<number>-<short-kebab-case-description>, plus the comment id so that every comment gets its own branch
+              SLUG="$(printf '%s' "$ISSUE_TITLE" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g' | cut -c1-40 | sed -E 's/-+$//')"
+              BRANCH="issue-${ISSUE_NUMBER}-${SLUG}-c${COMMENT_ID}"
+              git switch -c "$BRANCH"
+              echo "$BRANCH" > /workspace/branch
+              # Short-lived token (1h) handed to the plan step; the GitHub App key stays in this step
+              ( umask 077; printf '%s' "$GH_TOKEN" > /workspace/gh-token )
+
+          # Planning: for a comment that requires code changes the agent writes a checklist to /workspace/out/plan.md and posts it
+          # on the issue itself (only `gh issue comment` is allowed in opencode-plan.json). For a plain question it does nothing.
+          # It gets the short-lived token from prepare, not the App key.
+          - name: plan
+            image: quay.io/pminkows/opencode:latest
+            workingDir: /workspace/repo
+            volumeMounts:
+              - name: work
+                mountPath: /workspace
+              - name: config
+                mountPath: /config
+                readOnly: true
+            computeResources:
+              requests:
+                memory: 1Gi
+                cpu: 500m
+              limits:
+                memory: 2Gi
+                cpu: "2"
+            env:
+              - name: REPO_FULL_NAME
+                value: $(params.repo-full-name)
+              - name: ISSUE_NUMBER
+                value: $(params.issue)
+              - name: EVENT_TYPE
+                value: $(params.event-type)
+              - name: COMMENT_AUTHOR
+                value: $(params.comment-author)
+              - name: COMMENT_BODY
+                value: $(params.comment-body)
+              - name: BASE_BRANCH
+                value: $(params.base-branch)
+              - name: HOME
+                value: /workspace/home
+              - name: OPENCODE_CONFIG
+                value: /config/opencode-plan.json
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+
+              if [ -f /workspace/skip ]; then
+                echo "Nothing to do"
+                exit 0
+              fi
+
+              GH_TOKEN="$(cat /workspace/gh-token)"
+              export GH_TOKEN
+              rm -f /workspace/gh-token
+
+              PLAN_PROMPT="You are working on the GitHub issue below, in a fresh clone of the repository (base branch '${BASE_BRANCH}').
+              A new ${EVENT_TYPE} event was triggered by a comment from ${COMMENT_AUTHOR}. The instruction is the text after '@ai':
+
+              ----- NEW COMMENT -----
+              ${COMMENT_BODY}
+              -----------------------
+
+              $(cat /workspace/issue-conversation.md)
+
+              Decide whether this comment requires changes in the code. Do not implement anything yet.
+              - If it is only a question or needs no code change, do nothing: do not write a plan and do not post anything.
+              - If it requires changes, analyze the repository and then:
+                1. Write the plan to /workspace/out/plan.md. The first line is '### Implementation plan', followed by a GitHub markdown checklist: one '- [ ] ' line per concrete step, in the order you will carry the steps out (code changes, tests), 3 to 10 lines, no other text.
+                2. Post it as a comment on the issue with: gh issue comment ${ISSUE_NUMBER} --repo ${REPO_FULL_NAME} --body-file /workspace/out/plan.md
+              This is the only gh command you may run. Do not modify any file in the repository and do not write .agent-summary.md."
+
+              echo "=== Planning ==="
+              timeout 15m opencode run "$PLAN_PROMPT" 2>&1 | tee /workspace/plan.log \
+                || echo "opencode exited with $? (timeout or error); continuing without a plan"
+
+              # Planning must not leave changes behind
+              git reset -q --hard
+              git clean -qfd
+
+          # Agent run. No GitHub credentials in this step; committing, pushing and gh are denied in opencode.json.
+          - name: agent
+            image: quay.io/pminkows/opencode:latest
+            workingDir: /workspace/repo
+            volumeMounts:
+              - name: work
+                mountPath: /workspace
+              - name: config
+                mountPath: /config
+                readOnly: true
+            computeResources:
+              requests:
+                memory: 1Gi
+                cpu: 500m
+              limits:
+                memory: 2Gi
+                cpu: "2"
+            env:
+              - name: EVENT_TYPE
+                value: $(params.event-type)
+              - name: COMMENT_AUTHOR
+                value: $(params.comment-author)
+              - name: COMMENT_BODY
+                value: $(params.comment-body)
+              - name: BASE_BRANCH
+                value: $(params.base-branch)
+              - name: HOME
+                value: /workspace/home
+              - name: OPENCODE_CONFIG
+                value: /config/opencode.json
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+
+              if [ -f /workspace/skip ]; then
+                echo "Nothing to do"
+                exit 0
+              fi
+
+              BRANCH="$(cat /workspace/branch)"
+              PROMPT="You are working on the GitHub issue below, in a fresh clone of the repository on branch '${BRANCH}' (base branch '${BASE_BRANCH}'), following the repository's AGENTS.md.
+              A new ${EVENT_TYPE} event was triggered by a comment from ${COMMENT_AUTHOR}. The instruction is the text after '@ai'. Act on THIS comment, using the rest of the conversation as context:
+
+              ----- NEW COMMENT -----
+              ${COMMENT_BODY}
+              -----------------------
+
+              The full issue conversation (description and comments) is below.
+
+              $(cat /workspace/issue-conversation.md)
+
+              Rules:
+              - If the comment requests a change, implement it, add or update tests where appropriate, and keep the change minimal.
+              - If the comment is only a question or needs no code change, do not modify any file; answer it in the summary.
+              - Pipeline context: you run non-interactively with no GitHub credentials; the pipeline handles git, the pull request and the issue comment, so ignore those sections of AGENTS.md. Use only the available tools (bash, read, edit, write, glob, grep, skill, task); there is no 'step', 'run' or 'todo' tool.
+              - When done, write a 2-4 bullet summary to .agent-summary.md in the repository root (the pipeline posts it as the reply and removes it from the commit): what was changed in plain language (or the answer to the question), the test result, anything left undone or worth a reviewer's attention."
+              if [ -s /workspace/out/plan.md ]; then
+                PROMPT="$PROMPT
+
+              Follow this plan:
+              $(cat /workspace/out/plan.md)"
+              fi
+
+              echo "=== Running opencode ==="
+              timeout 3h opencode run "$PROMPT" 2>&1 | tee /workspace/opencode.log \
+                || echo "opencode exited with $? (timeout or error); continuing"
+
+              # Only sources: never commit build output (target/ is tracked in this repo) or the agent summary
+              if [ -f .agent-summary.md ]; then mv .agent-summary.md /workspace/out/summary.md; fi
+
+          # Commit, push, PR and reply on the issue. Mints a fresh token: the agent run may outlast the 1h token lifetime.
+          - name: publish
+            image: quay.io/pminkows/opencode:latest
+            workingDir: /workspace/repo
+            volumeMounts:
+              - name: work
+                mountPath: /workspace
+              - name: config
+                mountPath: /config
+                readOnly: true
+            env:
+              - name: GITHUB_APP_ID
+                valueFrom:
+                  secretKeyRef:
+                    name: github-app
+                    key: app-id
+              - name: GITHUB_APP_INSTALLATION_ID
+                valueFrom:
+                  secretKeyRef:
+                    name: github-app
+                    key: installation-id
+              - name: GITHUB_APP_PRIVATE_KEY
+                valueFrom:
+                  secretKeyRef:
+                    name: github-app
+                    key: private-key.pem
+              - name: REPO_FULL_NAME
+                value: $(params.repo-full-name)
+              - name: ISSUE_NUMBER
+                value: $(params.issue)
+              - name: BASE_BRANCH
+                value: $(params.base-branch)
+              - name: HOME
+                value: /workspace/home
+              - name: GIT_AUTHOR_NAME
+                value: ai-software-factory-agent[bot]
+              - name: GIT_AUTHOR_EMAIL
+                value: 5642464+ai-software-factory-agent[bot]@users.noreply.github.com
+              - name: GIT_COMMITTER_NAME
+                value: ai-software-factory-agent[bot]
+              - name: GIT_COMMITTER_EMAIL
+                value: 5642464+ai-software-factory-agent[bot]@users.noreply.github.com
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+
+              if [ -f /workspace/skip ]; then
+                echo "Nothing to do"
+                exit 0
+              fi
+
+              BRANCH="$(cat /workspace/branch)"
+
+              # Installation tokens expire after 1h and the agent run can take longer, so mint the token only now
+              GH_TOKEN="$(bash /config/gh-app-token.sh)"
+              export GH_TOKEN
+
+              if [ -n "$(git status --porcelain -uall -- . ':(exclude)**/target/**')" ]; then
+                git add -A -- . ':(exclude)**/target/**'
+                git commit -m "feat: address comment on issue #${ISSUE_NUMBER}" -m "Refs #${ISSUE_NUMBER}"
+                git push origin "$BRANCH"
+
+                PR_URL="$(gh pr create \
+                  --repo "$REPO_FULL_NAME" \
+                  --base "$BASE_BRANCH" \
+                  --head "$BRANCH" \
+                  --title "AI: address comment on issue #${ISSUE_NUMBER}" \
+                  --body "Closes #${ISSUE_NUMBER}")"
+                echo "Created PR: $PR_URL"
+
+                # Merge automatically once branch protection is satisfied (required review and checks); never fails the pipeline
+                if gh pr merge "$PR_URL" --auto --merge; then
+                  echo "auto-merge enabled (merges once the required review and checks pass)"
+                else
+                  echo "auto-merge could not be enabled; merge manually"
+                fi
+              fi
+
+              echo "=== Replying on the issue ==="
+              if [ -s /workspace/out/summary.md ]; then
+                gh issue comment "$ISSUE_NUMBER" --repo "$REPO_FULL_NAME" --body-file /workspace/out/summary.md
+              fi

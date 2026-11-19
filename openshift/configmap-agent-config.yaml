@@ -39,7 +39,7 @@ data:
         }
       }
     }
-  # Used by the plan step only: same as opencode.json, but the agent may post its plan with `gh issue comment`.
+  # Used by the plan steps only: same as opencode.json, but the agent may post its plan with `gh issue comment` / `gh pr comment`.
   opencode-plan.json: |
     {
       "$schema": "https://opencode.ai/config.json",
@@ -50,7 +50,7 @@ data:
         "task": "allow",
         "webfetch": "deny",
         "external_directory": "allow",
-        "bash": { "*": "allow", "git commit*": "deny", "git push*": "deny", "gh *": "deny", "gh issue comment*": "allow" }
+        "bash": { "*": "allow", "git commit*": "deny", "git push*": "deny", "gh *": "deny", "gh issue comment*": "allow", "gh pr comment*": "allow" }
       },
       "tools": { "todowrite": false },
       "provider": {

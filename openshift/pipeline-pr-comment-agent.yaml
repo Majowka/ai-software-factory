@@ -273,6 +273,82 @@ spec:
               echo "=== Cloning repository, branch ${BRANCH} ==="
               git clone --branch "$BRANCH" -- "$REPO_URL" /workspace/repo
               echo "$BRANCH" > /workspace/branch
+              # Short-lived token (1h) handed to the plan step; the GitHub App key stays in this step
+              ( umask 077; printf '%s' "$GH_TOKEN" > /workspace/gh-token )
+
+          # Planning: for a comment that requires code changes the agent writes a checklist to /workspace/out/plan.md and posts it
+          # on the PR itself (only `gh pr comment` is allowed in opencode-plan.json). For a plain question it does nothing.
+          # It gets the short-lived token from prepare, not the App key.
+          - name: plan
+            image: quay.io/pminkows/opencode:latest
+            workingDir: /workspace/repo
+            volumeMounts:
+              - name: work
+                mountPath: /workspace
+              - name: config
+                mountPath: /config
+                readOnly: true
+            computeResources:
+              requests:
+                memory: 1Gi
+                cpu: 500m
+              limits:
+                memory: 2Gi
+                cpu: "2"
+            env:
+              - name: REPO_FULL_NAME
+                value: $(params.repo-full-name)
+              - name: PR_NUMBER
+                value: $(params.pr-number)
+              - name: EVENT_TYPE
+                value: $(params.event-type)
+              - name: COMMENT_AUTHOR
+                value: $(params.comment-author)
+              - name: COMMENT_BODY
+                value: $(params.comment-body)
+              - name: BASE_BRANCH
+                value: $(params.base-branch)
+              - name: HOME
+                value: /workspace/home
+              - name: OPENCODE_CONFIG
+                value: /config/opencode-plan.json
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+
+              if [ -f /workspace/skip ]; then
+                echo "Nothing to do"
+                exit 0
+              fi
+
+              GH_TOKEN="$(cat /workspace/gh-token)"
+              export GH_TOKEN
+              rm -f /workspace/gh-token
+
+              BRANCH="$(cat /workspace/branch)"
+              PLAN_PROMPT="You are working on the pull request below, on its head branch '${BRANCH}' (base branch '${BASE_BRANCH}').
+              A new ${EVENT_TYPE} event was triggered by a comment from ${COMMENT_AUTHOR}:
+
+              ----- NEW COMMENT -----
+              ${COMMENT_BODY}
+              -----------------------
+
+              $(cat /workspace/pr-conversation.md)
+
+              Decide whether this comment requires changes in the code. Do not implement anything yet.
+              - If it is only a question or needs no code change, do nothing: do not write a plan and do not post anything.
+              - If it requires changes, analyze the repository (inspect what the PR already changes with 'git diff origin/${BASE_BRANCH}...HEAD') and then:
+                1. Write the plan to /workspace/out/plan.md. The first line is '### Implementation plan', followed by a GitHub markdown checklist: one '- [ ] ' line per concrete step, in the order you will carry the steps out (code changes, tests), 3 to 10 lines, no other text.
+                2. Post it as a comment on the pull request with: gh pr comment ${PR_NUMBER} --repo ${REPO_FULL_NAME} --body-file /workspace/out/plan.md
+              This is the only gh command you may run. Do not modify any file in the repository and do not write .agent-summary.md."
+
+              echo "=== Planning ==="
+              timeout 15m opencode run "$PLAN_PROMPT" 2>&1 | tee /workspace/plan.log \
+                || echo "opencode exited with $? (timeout or error); continuing without a plan"
+
+              # Planning must not leave changes behind
+              git reset -q --hard
+              git clean -qfd
 
           # Agent run. No GitHub credentials in this step; committing, pushing and gh are denied in opencode.json.
           - name: agent
@@ -330,6 +406,12 @@ spec:
               - If the comment is only a question or needs no code change, do not modify any file; answer it in the summary.
               - Pipeline context: you run non-interactively with no GitHub credentials; the pipeline handles git and the pull request reply, so ignore those sections of AGENTS.md. Use only the available tools (bash, read, edit, write, glob, grep, skill, task); there is no 'step', 'run' or 'todo' tool.
               - When done, write a 2-4 bullet summary to .agent-summary.md in the repository root (the pipeline posts it as the reply and removes it from the commit): what was changed in plain language (or the answer to the question), the test result, anything left undone or worth a reviewer's attention."
+              if [ -s /workspace/out/plan.md ]; then
+                PROMPT="$PROMPT
+
+              Follow this plan:
+              $(cat /workspace/out/plan.md)"
+              fi
 
               echo "=== Running opencode ==="
               timeout 3h opencode run "$PROMPT" 2>&1 | tee /workspace/opencode.log \

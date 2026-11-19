@@ -87,3 +87,30 @@ spec:
       name: pr-review
       template:
         ref: pr-comment
+    - bindings:
+        - kind: TriggerBinding
+          ref: issue-comment
+      interceptors:
+        - params:
+            - name: secretRef
+              value:
+                secretKey: secret
+                secretName: github-webhook-secret
+            - name: eventTypes
+              value:
+                - issue_comment
+          ref:
+            kind: ClusterInterceptor
+            name: github
+        - params:
+            - name: filter
+              value: body.action == 'created' && body.issue.state == 'open'
+                && !has(body.issue.pull_request) && body.sender.type != 'Bot'
+                && body.comment.author_association in ['OWNER', 'MEMBER']
+                && body.comment.body.startsWith('@ai')
+          ref:
+            kind: ClusterInterceptor
+            name: cel
+      name: issue-comment
+      template:
+        ref: issue-comment

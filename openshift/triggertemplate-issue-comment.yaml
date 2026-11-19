@@ -1,0 +1,56 @@
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: issue-comment
+  namespace: agents
+spec:
+  params:
+    - name: event-type
+    - name: repo-url
+    - name: repo-full-name
+    - name: issue
+    - name: issue-title
+    - name: comment-id
+    - name: comment-author
+    - name: comment-body
+    - name: base-branch
+  resourcetemplates:
+    - apiVersion: tekton.dev/v1
+      kind: PipelineRun
+      metadata:
+        generateName: issue-comment-agent-
+      spec:
+        params:
+          - name: event-type
+            value: $(tt.params.event-type)
+          - name: repo-url
+            value: $(tt.params.repo-url)
+          - name: repo-full-name
+            value: $(tt.params.repo-full-name)
+          - name: issue
+            value: $(tt.params.issue)
+          - name: issue-title
+            value: $(tt.params.issue-title)
+          - name: comment-id
+            value: $(tt.params.comment-id)
+          - name: comment-author
+            value: $(tt.params.comment-author)
+          - name: comment-body
+            value: $(tt.params.comment-body)
+          - name: base-branch
+            value: $(tt.params.base-branch)
+        pipelineRef:
+          name: issue-comment-agent
+        taskRunTemplate:
+          serviceAccountName: pipeline
+        timeouts:
+          pipeline: 3h0m0s
+        workspaces:
+          - name: skills
+            volumeClaimTemplate:
+              spec:
+                accessModes:
+                  - ReadWriteOnce
+                resources:
+                  requests:
+                    storage: 1Gi
