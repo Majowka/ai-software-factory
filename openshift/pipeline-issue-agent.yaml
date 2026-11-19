@@ -162,20 +162,20 @@ spec:
         volumes:
           - name: work
             emptyDir: {}
+          - name: config
+            configMap:
+              name: issue-agent-config
         steps:
-          - name: implement
+          # Clone and branch. Holds the GitHub App key, the agent step does not.
+          - name: prepare
             image: quay.io/pminkows/opencode:latest
             workingDir: /workspace
             volumeMounts:
               - name: work
                 mountPath: /workspace
-            computeResources:
-              requests:
-                memory: 1Gi
-                cpu: 500m
-              limits:
-                memory: 2Gi
-                cpu: "2"
+              - name: config
+                mountPath: /config
+                readOnly: true
             env:
               - name: GITHUB_APP_ID
                 valueFrom:
@@ -194,14 +194,171 @@ spec:
                     key: private-key.pem
               - name: REPO_URL
                 value: $(params.repo-url)
-              - name: REPO_FULL_NAME
-                value: $(params.repo-full-name)
               - name: ISSUE_NUMBER
                 value: $(params.issue)
               - name: ISSUE_TITLE
                 value: $(params.issue-title)
               - name: ISSUE_BODY
                 value: $(params.issue-body)
+              - name: BASE_BRANCH
+                value: $(params.base-branch)
+              - name: HOME
+                value: /workspace/home
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+
+              mkdir -p "$HOME/.config/opencode" /workspace/out
+              # Skills and agents fetched by the fetch-skills task
+              cp -R /skills/opencode/. "$HOME/.config/opencode/"
+              printf '# Issue #%s: %s\n\n%s\n' "$ISSUE_NUMBER" "$ISSUE_TITLE" "$ISSUE_BODY" > /workspace/issue.txt
+
+              GH_TOKEN="$(bash /config/gh-app-token.sh)"
+              export GH_TOKEN
+              gh auth setup-git
+              # Short-lived token (1h) handed to the plan step; the GitHub App key stays in this step
+              ( umask 077; printf '%s' "$GH_TOKEN" > /workspace/gh-token )
+
+              git clone --branch "$BASE_BRANCH" -- "$REPO_URL" /workspace/repo
+              cd /workspace/repo
+
+              # Branch name per AGENTS.md: issue-<number>-<short-kebab-case-description>
+              SLUG="$(printf '%s' "$ISSUE_TITLE" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g' | cut -c1-40 | sed -E 's/-+$//')"
+              BRANCH="issue-${ISSUE_NUMBER}-${SLUG}"
+              git switch -c "$BRANCH"
+              echo "$BRANCH" > /workspace/branch
+
+          # Planning: the agent analyzes the repo, writes the checklist to /workspace/out/plan.md and posts it on the issue
+          # itself (only `gh issue comment` is allowed in opencode-plan.json). It gets the short-lived token from prepare, not the App key.
+          - name: plan
+            image: quay.io/pminkows/opencode:latest
+            workingDir: /workspace/repo
+            volumeMounts:
+              - name: work
+                mountPath: /workspace
+              - name: config
+                mountPath: /config
+                readOnly: true
+            computeResources:
+              requests:
+                memory: 1Gi
+                cpu: 500m
+              limits:
+                memory: 2Gi
+                cpu: "2"
+            env:
+              - name: REPO_FULL_NAME
+                value: $(params.repo-full-name)
+              - name: ISSUE_NUMBER
+                value: $(params.issue)
+              - name: HOME
+                value: /workspace/home
+              - name: OPENCODE_CONFIG
+                value: /config/opencode-plan.json
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+
+              GH_TOKEN="$(cat /workspace/gh-token)"
+              export GH_TOKEN
+              rm -f /workspace/gh-token
+
+              PLAN_PROMPT="Analyze this repository and write an implementation plan for the GitHub issue below. Do not implement anything yet.
+
+              1. Write the plan to /workspace/out/plan.md. The first line is '### Implementation plan', followed by a GitHub markdown checklist: one '- [ ] ' line per concrete step, in the order you will carry the steps out (code changes, tests, build verification), 3 to 10 lines, no other text.
+              2. Post it as a comment on the issue with: gh issue comment ${ISSUE_NUMBER} --repo ${REPO_FULL_NAME} --body-file /workspace/out/plan.md
+              This is the only gh command you may run. Do not modify any file in the repository and do not write .agent-summary.md.
+
+              $(cat /workspace/issue.txt)"
+
+              echo "=== Planning ==="
+              timeout 15m opencode run "$PLAN_PROMPT" 2>&1 | tee /workspace/plan.log \
+                || echo "opencode exited with $? (timeout or error); continuing without a plan"
+
+              # Planning must not leave changes behind
+              git reset -q --hard
+              git clean -qfd
+
+          # Agent run. No GitHub credentials in this step; committing, pushing and gh are denied in opencode.json.
+          - name: agent
+            image: quay.io/pminkows/opencode:latest
+            workingDir: /workspace/repo
+            volumeMounts:
+              - name: work
+                mountPath: /workspace
+              - name: config
+                mountPath: /config
+                readOnly: true
+            computeResources:
+              requests:
+                memory: 1Gi
+                cpu: 500m
+              limits:
+                memory: 2Gi
+                cpu: "2"
+            env:
+              - name: HOME
+                value: /workspace/home
+              - name: OPENCODE_CONFIG
+                value: /config/opencode.json
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+
+              PROMPT="Implement this GitHub issue, following the repository's AGENTS.md.
+
+              Pipeline context: you run non-interactively with no GitHub credentials; the pipeline handles git, the pull request and the issue comment, so ignore those sections of AGENTS.md. Use only the available tools (bash, read, edit, write, glob, grep, skill, task); there is no 'step', 'run' or 'todo' tool. When done, write a 2-4 bullet summary to .agent-summary.md in the repository root (the pipeline posts it on the issue and removes it from the commit): what was changed, the test result, anything left undone or worth a reviewer's attention.
+
+              $(cat /workspace/issue.txt)"
+              if [ -s /workspace/out/plan.md ]; then
+                PROMPT="$PROMPT
+
+              Follow this plan:
+              $(cat /workspace/out/plan.md)"
+              fi
+
+              echo "=== Running opencode ==="
+              timeout 3h opencode run "$PROMPT" 2>&1 | tee /workspace/opencode.log \
+                || echo "opencode exited with $? (timeout or error); continuing"
+
+              if [ -z "$(git status --porcelain -uall -- . ':(exclude)**/target/**')" ]; then
+                echo "No changes generated"
+                exit 1
+              fi
+
+              # Only sources: never commit build output (target/ is tracked in this repo) or the agent summary
+              if [ -f .agent-summary.md ]; then mv .agent-summary.md /workspace/out/summary.md; fi
+
+          # Commit, push, PR and issue comment. Mints a fresh token: the agent run may outlast the 1h token lifetime.
+          - name: publish
+            image: quay.io/pminkows/opencode:latest
+            workingDir: /workspace/repo
+            volumeMounts:
+              - name: work
+                mountPath: /workspace
+              - name: config
+                mountPath: /config
+                readOnly: true
+            env:
+              - name: GITHUB_APP_ID
+                valueFrom:
+                  secretKeyRef:
+                    name: github-app
+                    key: app-id
+              - name: GITHUB_APP_INSTALLATION_ID
+                valueFrom:
+                  secretKeyRef:
+                    name: github-app
+                    key: installation-id
+              - name: GITHUB_APP_PRIVATE_KEY
+                valueFrom:
+                  secretKeyRef:
+                    name: github-app
+                    key: private-key.pem
+              - name: REPO_FULL_NAME
+                value: $(params.repo-full-name)
+              - name: ISSUE_NUMBER
+                value: $(params.issue)
               - name: BASE_BRANCH
                 value: $(params.base-branch)
               - name: HOME
@@ -214,205 +371,16 @@ spec:
                 value: ai-software-factory-agent[bot]
               - name: GIT_COMMITTER_EMAIL
                 value: 5642464+ai-software-factory-agent[bot]@users.noreply.github.com
-              - name: OPENCODE_CONFIG_CONTENT
-                value: |
-                  {
-                    "$schema": "https://opencode.ai/config.json",
-                    "model": "qwen38-flash/qwen38_flash",
-                    "permission": { "edit": "allow", "bash": "allow", "skill": "allow", "task": "allow", "webfetch": "deny", "external_directory": { "/tmp/*": "allow", "/workspace/tmp/*": "allow", "/workspace/home/.config/opencode/*": "allow", "/opt/maven/*": "allow", "/workspace/home/.m2/*": "allow" } },
-                    "tools": { "todowrite": false },
-                    "provider": {
-                      "qwen38-flash": {
-                        "npm": "@ai-sdk/openai-compatible",
-                        "name": "Qwen3.8 Flash",
-                        "options": { "baseURL": "http://qwen38-flash.ai.svc.cluster.local:8000/v1", "apiKey": "none" },
-                        "models": { "qwen38_flash": { "name": "Qwen3.8 Flash", "limit": { "context": 32768, "output": 8192 } } }
-                      }
-                    }
-                  }
             script: |
               #!/usr/bin/env bash
               set -euo pipefail
 
-              mkdir -p "$HOME/.config/opencode"
-              # Skills and agents fetched by the fetch-skills task (global OpenCode config dir)
-              cp -R /skills/opencode/. "$HOME/.config/opencode/"
+              BRANCH="$(cat /workspace/branch)"
 
-              # GitHub App installation token (valid 1h), signed with the app's private key
-              b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
-              # Kept in a non-exported variable so the agent (a child process) cannot read the key
-              APP_KEY="$GITHUB_APP_PRIVATE_KEY"
-              unset GITHUB_APP_PRIVATE_KEY
+              # Installation tokens expire after 1h and the agent run can take longer, so mint the token only now
+              GH_TOKEN="$(bash /config/gh-app-token.sh)"
+              export GH_TOKEN
 
-              # Installation tokens expire after 1h and the agent run can take longer, so mint a fresh one before pushing
-              refresh_gh_token() {
-                local now jwt_header jwt_payload jwt_signature
-                now="$(date +%s)"
-                jwt_header="$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)"
-                jwt_payload="$(printf '{"iat":%s,"exp":%s,"iss":"%s"}' "$((now - 60))" "$((now + 540))" "$GITHUB_APP_ID" | b64url)"
-                jwt_signature="$(printf '%s.%s' "$jwt_header" "$jwt_payload" | openssl dgst -sha256 -sign <(printf '%s\n' "$APP_KEY") | b64url)"
-                GH_TOKEN="$(curl -fsS -X POST \
-                  -H "Authorization: Bearer ${jwt_header}.${jwt_payload}.${jwt_signature}" \
-                  -H "Accept: application/vnd.github+json" \
-                  "https://api.github.com/app/installations/${GITHUB_APP_INSTALLATION_ID}/access_tokens" | jq -er .token)"
-                export GH_TOKEN
-              }
-              refresh_gh_token
-
-              gh auth setup-git
-
-              printf '# Issue #%s: %s\n\n%s\n' "$ISSUE_NUMBER" "$ISSUE_TITLE" "$ISSUE_BODY" > /workspace/issue.txt
-              cat /workspace/issue.txt
-
-              echo "=== Cloning repository ==="
-              git clone --branch "$BASE_BRANCH" -- "$REPO_URL" /workspace/repo
-              cd /workspace/repo
-
-              # Branch name per AGENTS.md: issue-<number>-<short-kebab-case-description>
-              SLUG="$(printf '%s' "$ISSUE_TITLE" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g' | cut -c1-40 | sed -E 's/-+$//')"
-              BRANCH="issue-${ISSUE_NUMBER}-${SLUG}"
-              git switch -c "$BRANCH"
-
-              {
-                echo "Implement the GitHub issue below in this repository."
-                echo
-                cat /workspace/issue.txt
-                echo
-                echo "Rules:"
-                echo "- Analyze the existing code, implement the requested changes, add or update tests where appropriate."
-                echo "- Run the relevant module's tests before finishing."
-                echo "- Verify that the code compiles (mvn -q test-compile in the affected module) after EACH subtask or group of file changes, not only at the end; fix compilation errors before moving on."
-                echo "- Do NOT use Lombok in any new or modified code (no @Data, @Getter, @Setter, @Builder, @RequiredArgsConstructor, @Slf4j, etc.). Write getters, setters and constructors by hand, use Java records for DTOs, constructor injection, and an explicit SLF4J LoggerFactory logger. Do not add new Lombok dependencies."
-                echo "- Never create or modify build output (target/ directories); only source, test and documentation files belong in the change."
-                echo "- Write logs and temporary files (e.g. test output) only to /tmp or /workspace/tmp, never inside the repository."
-                echo "- Available tools are: bash, read, edit, write, glob, grep, skill and task. Use exactly these names; there is no 'run' or 'todo' tool. Use the skill tool to load the relevant skills (e.g. conventions, testing-patterns) and the task tool to delegate to the subagents where useful."
-                echo "- There is no tool named 'step'. Do not write 'Step 1', 'Step 2', ... headings or try to call them; describe progress in plain sentences and call only the tools listed above."
-                echo "- Use only paths inside the repository, /tmp and /workspace/tmp. Do not read or list other directories (e.g. /opt, /etc, ~/.m2) and do not inspect the Maven or Java installation; they are already configured, just run mvn."
-                echo "- When calling bash, never pass the 'timeout' parameter; just run the command."
-                echo "- Do not run git commit or git push, do not create a pull request, do not comment on the issue, do not access secrets."
-                echo "- The pipeline handles git, the pull request and the issue comment; ignore those sections of AGENTS.md."
-                echo "- When done, write a 2-4 bullet summary to .agent-summary.md in the repository root (the pipeline reads it and removes it from the commit): what was changed in plain language, the test result, and anything left undone or worth a reviewer's attention. No diffs, no long explanations."
-              } > /workspace/prompt.txt
-
-              # Runs opencode with a watchdog. Qwen models sometimes keep calling a nonexistent tool (e.g. "step"), which would
-              # otherwise burn the whole timeout, and a rejected permission (a path outside the allowed directories) aborts the
-              # whole non-interactive run. In both cases the run is restarted (max 2 times) with a hint; edits already made
-              # stay in the working tree.
-              run_opencode() {
-                local limit="$1" prompt_file="$2" log=/workspace/opencode.log
-                local max_loops=15 max_retries=2 retry=0 prompt opid tpid rc loops rejected note
-                prompt="$(cat "$prompt_file")"
-                while true; do
-                  : > "$log"
-                  timeout "$limit" opencode run "$prompt" > "$log" 2>&1 &
-                  opid=$!
-                  tail -n +1 -f "$log" &
-                  tpid=$!
-                  while kill -0 "$opid" 2>/dev/null; do
-                    sleep 5
-                    if [ "$(grep -c 'unavailable tool' "$log" || true)" -ge "$max_loops" ]; then
-                      echo "=== Watchdog: opencode is looping on unavailable tools, stopping it ==="
-                      kill "$opid" 2>/dev/null || true
-                      break
-                    fi
-                  done
-                  rc=0
-                  wait "$opid" || rc=$?
-                  sleep 1
-                  kill "$tpid" 2>/dev/null || true
-                  wait "$tpid" 2>/dev/null || true
-                  loops="$(grep -c 'unavailable tool' "$log" || true)"
-                  rejected="$(grep -c 'rejected permission' "$log" || true)"
-                  if [ "$loops" -ge "$max_loops" ]; then
-                    note='The previous attempt got stuck calling a nonexistent tool. There is no tool named "step" (or "run", "todo"). Do not write "Step N" headings and never try to call them; call only bash, read, edit, write, glob, grep, skill and task.'
-                  elif [ "$rc" -ne 0 ] && [ "$rejected" -gt 0 ]; then
-                    echo "=== Watchdog: opencode aborted on a rejected permission ==="
-                    note='The previous attempt was aborted because a tool call tried to access a path outside the allowed directories. Use only the repository, /tmp and /workspace/tmp; do not read or list other directories (e.g. /opt, /etc, the Maven installation). Java and Maven are already configured, just run mvn.'
-                  else
-                    return "$rc"
-                  fi
-                  if [ "$retry" -ge "$max_retries" ]; then
-                    echo "=== Watchdog: giving up after $retry restarts ==="
-                    return 1
-                  fi
-                  retry=$((retry + 1))
-                  echo "=== Watchdog: restart $retry/$max_retries ==="
-                  prompt="$(cat "$prompt_file"; printf '\n\nNOTE: %s Changes already made are still in the working tree (check git status and git diff); continue from there instead of starting over.' "$note")"
-                done
-              }
-
-              echo "=== Running opencode ==="
-              run_opencode 75m /workspace/prompt.txt || echo "opencode exited with $? (timeout or error); continuing to build verification"
-
-              if [ -z "$(git status --porcelain -uall -- . ':(exclude)**/target/**')" ]; then
-                echo "No changes generated"
-                exit 1
-              fi
-
-              # Build gate: compile main and test sources of every Maven module touched by the agent.
-              # On failure the agent is re-run with the compiler output (max $MAX_FIX_ATTEMPTS times).
-              MAX_FIX_ATTEMPTS=2
-
-              build_modules() {
-                : > /workspace/build.log
-                local rc=0 f d root rel
-                # unique "root|module" pairs for changed files: module = nearest pom dir, root = topmost pom dir
-                git status --porcelain -uall -- . ':(exclude)**/target/**' | cut -c4- | while read -r f; do
-                  d="$(dirname "$f")"
-                  while [ "$d" != "." ] && [ ! -f "$d/pom.xml" ]; do d="$(dirname "$d")"; done
-                  [ -f "$d/pom.xml" ] || continue
-                  root="$d"
-                  while [ "$(dirname "$root")" != "." ] && [ -f "$(dirname "$root")/pom.xml" ]; do root="$(dirname "$root")"; done
-                  echo "$root|$d"
-                done | sort -u > /workspace/modules.txt
-                while IFS='|' read -r root d; do
-                  if [ "$root" = "$d" ]; then
-                    echo "=== mvn test-compile in $root ===" | tee -a /workspace/build.log
-                    (cd "$root" && timeout 10m mvn -B -q -DskipTests test-compile) >> /workspace/build.log 2>&1 || rc=1
-                  else
-                    rel="${d#"$root"/}"
-                    echo "=== mvn test-compile in $root (module $rel) ===" | tee -a /workspace/build.log
-                    (cd "$root" && timeout 10m mvn -B -q -DskipTests test-compile -pl "$rel" -am) >> /workspace/build.log 2>&1 || rc=1
-                  fi
-                done < /workspace/modules.txt
-                return $rc
-              }
-
-              BUILD_STATUS="not verified"
-              ATTEMPT=0
-              while true; do
-                echo "=== Build verification (attempt $((ATTEMPT + 1))) ==="
-                if build_modules; then
-                  if [ -s /workspace/modules.txt ]; then
-                    BUILD_STATUS="compiles"
-                  else
-                    BUILD_STATUS="not verified (no Maven module changed)"
-                  fi
-                  break
-                fi
-                tail -n 100 /workspace/build.log
-                if [ "$ATTEMPT" -ge "$MAX_FIX_ATTEMPTS" ]; then
-                  BUILD_STATUS="FAILED to compile after ${MAX_FIX_ATTEMPTS} fix attempts"
-                  break
-                fi
-                ATTEMPT=$((ATTEMPT + 1))
-                {
-                  cat /workspace/prompt.txt
-                  echo
-                  echo "The build of your changes FAILED. Fix the compilation errors below (fix attempt ${ATTEMPT}/${MAX_FIX_ATTEMPTS})."
-                  echo "Do not rewrite unrelated code. Compile again with mvn test-compile before finishing."
-                  echo
-                  echo "Compiler output (last 100 lines):"
-                  tail -n 100 /workspace/build.log
-                } > /workspace/fix-prompt.txt
-                run_opencode 25m /workspace/fix-prompt.txt || echo "opencode fix run exited with $?"
-              done
-              echo "Build status: $BUILD_STATUS"
-
-              # Only sources: never commit build output (target/ is tracked in this repo) or the agent summary
-              mkdir -p /workspace/out
-              [ -f .agent-summary.md ] && mv .agent-summary.md /workspace/out/summary.md
-              refresh_gh_token
               git add -A -- . ':(exclude)**/target/**'
               git commit -m "feat: implement issue #${ISSUE_NUMBER}" -m "Refs #${ISSUE_NUMBER}"
               git push origin "$BRANCH"
@@ -422,32 +390,17 @@ spec:
                 --base "$BASE_BRANCH" \
                 --head "$BRANCH" \
                 --title "AI: implement issue #${ISSUE_NUMBER}" \
-                --body "Closes #${ISSUE_NUMBER}
-
-              Changes generated by opencode. Review required before merging.
-
-              Build verification (mvn test-compile): ${BUILD_STATUS}")"
+                --body "Closes #${ISSUE_NUMBER}")"
               echo "Created PR: $PR_URL"
 
               # Merge automatically once branch protection is satisfied (required review and checks); never fails the pipeline
               if gh pr merge "$PR_URL" --auto --merge; then
-                AUTO_MERGE="auto-merge enabled (merges once the required review and checks pass)"
+                echo "auto-merge enabled (merges once the required review and checks pass)"
               else
-                AUTO_MERGE="auto-merge could not be enabled; merge manually"
+                echo "auto-merge could not be enabled; merge manually"
               fi
-              echo "$AUTO_MERGE"
 
               echo "=== Commenting on the issue ==="
               if [ -s /workspace/out/summary.md ]; then
-                SUMMARY="$(cat /workspace/out/summary.md)"
-              else
-                SUMMARY="- The agent did not produce a summary; see the PR diff. Tests: unknown."
+                gh issue comment "$ISSUE_NUMBER" --repo "$REPO_FULL_NAME" --body-file /workspace/out/summary.md
               fi
-              gh issue comment "$ISSUE_NUMBER" \
-                --repo "$REPO_FULL_NAME" \
-                --body "${SUMMARY}
-
-              - Build verification (pipeline, mvn test-compile): ${BUILD_STATUS}
-              - Branch: \`${BRANCH}\`
-              - PR: ${PR_URL}
-              - Merge: ${AUTO_MERGE}"
