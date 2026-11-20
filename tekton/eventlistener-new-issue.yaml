@@ -4,8 +4,6 @@ metadata:
   name: new-issue
   namespace: agents
 spec:
-  namespaceSelector: {}
-  resources: {}
   serviceAccountName: issue-agent-listener
   triggers:
     - bindings:

@@ -74,7 +74,7 @@ drawings, not the official logos.
 ```
 .
 ├── agents/                              the agent: images and shared configuration
-│   ├── Dockerfile.opencode              agent image with OpenCode, git, gh, JDK 25, Maven, skaffold, kubectl
+│   ├── Dockerfile.opencode              reference Dockerfile of the agent image (the pipelines pull it from Quay)
 │   ├── Dockerfile                       same tooling with Claude Code (optional, not used by the pipelines)
 │   └── configmap-agent-config.yaml      OpenCode config (model, permissions) and the GitHub App token script
 ├── tekton/                              pipelines and everything that triggers them
@@ -140,7 +140,8 @@ oc get clusterinterceptors
 
 ### 1.3 Local tools
 
-`oc`, `podman` (or `docker`), `oras`, optionally `tkn` and `gh`.
+`oc`, optionally `tkn` and `gh`. `podman` and `oras` are only needed if you build your own agent
+image or publish your own skills artifact (section 4).
 
 ### 1.4 Namespaces
 
@@ -284,7 +285,8 @@ oc create secret generic github-app -n agents \
 `secrets/secret-claude-github-secrets.yaml` (`ANTHROPIC_API_KEY`, `GH_TOKEN`) is only needed if you
 run a Claude Code based variant. The OpenCode pipelines do not use it.
 
-If your Quay repositories are private, create an image pull secret and link it:
+The default agent image and skills artifact are pulled from `quay.io/pminkows`. If you host your
+own copies in private Quay repositories, create an image pull secret and link it:
 
 ```bash
 oc create secret docker-registry quay-pull -n agents \
@@ -296,9 +298,10 @@ oc secrets link pipeline quay-pull --for=pull -n agents
 
 ### 4.1 Agent image
 
-`agents/Dockerfile.opencode` builds the image that runs in the `prepare`, `plan`, `agent` and
-`publish` steps. It is based on UBI with Node.js and adds OpenCode, the GitHub CLI, a JDK, Maven,
-`skaffold` and `kubectl`:
+The pipelines pull a ready-made agent image from Quay, `quay.io/pminkows/opencode:latest`, so you
+do not have to build anything to follow this guide. It runs in the `prepare`, `plan`, `agent` and
+`publish` steps. `agents/Dockerfile.opencode` is included for reference, to show what the image
+contains: OpenCode, the GitHub CLI, a JDK, Maven, `skaffold` and `kubectl`.
 
 ```dockerfile
 FROM registry.access.redhat.com/ubi9/nodejs-22
@@ -352,22 +355,17 @@ ENV PATH="${JAVA_HOME}/bin:${MAVEN_HOME}/bin:${PATH}"
 USER 1001
 ```
 
-Build and push it:
-
-```bash
-podman build -f agents/Dockerfile.opencode -t quay.io/<org>/opencode:latest agents/
-podman push quay.io/<org>/opencode:latest
-```
-
-The pipelines reference the image as `quay.io/pminkows/opencode:latest`. Replace that with your own
-repository and, preferably, a pinned tag:
-
-```bash
-sed -i 's#quay.io/pminkows#quay.io/<org>#g' tekton/pipeline-*.yaml
-```
-
-`agents/Dockerfile` is the same image with Claude Code (`npm install -g @anthropic-ai/claude-code`)
+`agents/Dockerfile` is a variant with Claude Code (`npm install -g @anthropic-ai/claude-code`)
 instead of OpenCode, and without the JDK and Maven. It is optional and not used by the pipelines.
+
+**Only if you need a different configuration** (another JDK, extra CLIs, another toolchain), adapt
+the Dockerfile, build and push your own image, and point the pipelines at it:
+
+```bash
+podman build -f agents/Dockerfile.opencode -t quay.io/<org>/opencode:<tag> agents/
+podman push quay.io/<org>/opencode:<tag>
+sed -i 's#quay.io/pminkows/opencode:latest#quay.io/<org>/opencode:<tag>#g' tekton/pipeline-*.yaml
+```
 
 `skaffold` and `kubectl` are in the image so that an agent can deploy an application to
 Kubernetes. They do nothing by default: the agent pods have no kubeconfig or RBAC. Granting that
@@ -380,13 +378,16 @@ Skills and subagents are distributed as an OCI artifact: one `tar.gz` with `skil
 `agents/` directories in OpenCode format. The `fetch-skills` task pulls it with `oras`, unpacks it
 to `/skills/opencode`, and the `prepare` step copies it to `~/.config/opencode`.
 
+The pipelines pull `quay.io/pminkows/claude-ai-spring-boot:1.3.1` by default (the
+`skills-artifact` parameter), so there is nothing to publish to get started.
+
+**Only if you want your own skills**, publish them as an artifact and set the `skills-artifact`
+parameter of the pipelines to it:
+
 ```bash
 tar -czf skills.tar.gz skills agents
 oras push quay.io/<org>/<skills-repo>:<version> skills.tar.gz
 ```
-
-Set the repository and tag in the `skills-artifact` parameter of the pipelines (default
-`quay.io/pminkows/claude-ai-spring-boot:1.3.1`).
 
 ## 5. The AI model (vLLM)
 
@@ -445,7 +446,9 @@ spec:
       containers:
         - name: vllm
           image: registry.redhat.io/rhaii-preview/vllm-cuda-rhel9:v0.31.0
-          command: ["vllm", "serve"]
+          command:
+            - vllm
+            - serve
           args:
             - RedHatAI/Qwen3.8-Flash-Next-NVFP4
             - --port=8000
@@ -469,17 +472,30 @@ spec:
           ports:
             - containerPort: 8000
           resources:
-            requests: { cpu: "4", memory: 180Gi, nvidia.com/gpu: "2" }
-            limits:   { cpu: "16", memory: 200Gi, nvidia.com/gpu: "2" }
+            requests:
+              cpu: "4"
+              memory: 180Gi
+              nvidia.com/gpu: "2"
+            limits:
+              cpu: "16"
+              memory: 200Gi
+              nvidia.com/gpu: "2"
           # startup, liveness and readiness probes on /health:8000 omitted;
           # the startup probe allows about an hour for the first download
           volumeMounts:
-            - { name: shm, mountPath: /dev/shm }
-            - { name: cache, mountPath: /cache/hf, subPath: hf }
-            - { name: cache, mountPath: /tmp/vllm, subPath: vllm }
+            - name: shm
+              mountPath: /dev/shm
+            - name: cache
+              mountPath: /cache/hf
+              subPath: hf
+            - name: cache
+              mountPath: /tmp/vllm
+              subPath: vllm
       volumes:
         - name: shm
-          emptyDir: { medium: Memory, sizeLimit: 32Gi }
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
         - name: cache
           persistentVolumeClaim:
             claimName: qwen38-flash-cache
@@ -546,8 +562,7 @@ metadata:
   name: agent-config
   namespace: agents
 data:
-  # Prints a GitHub App installation token (valid 1h).
-  # Run it right before every step that talks to GitHub.
+  # Prints a GitHub App installation token (valid 1h). Run it right before every step that talks to GitHub.
   gh-app-token.sh: |
     #!/usr/bin/env bash
     set -euo pipefail
@@ -560,8 +575,6 @@ data:
       -H "Authorization: Bearer ${header}.${payload}.${signature}" \
       -H "Accept: application/vnd.github+json" \
       "https://api.github.com/app/installations/${GITHUB_APP_INSTALLATION_ID}/access_tokens" | jq -er .token
-
-  # OpenCode config for the agent step: no commits, pushes or gh commands
   opencode.json: |
     {
       "$schema": "https://opencode.ai/config.json",
@@ -572,27 +585,50 @@ data:
         "task": "allow",
         "webfetch": "deny",
         "external_directory": "allow",
-        "bash": { "*": "allow", "git commit*": "deny", "git push*": "deny", "gh *": "deny" }
+        "bash": {
+          "*": "allow",
+          "git commit*": "deny",
+          "git push*": "deny",
+          "gh *": "deny"
+        }
       },
-      "tools": { "todowrite": false },
+      "tools": {
+        "todowrite": false
+      },
       "provider": {
         "qwen38-flash": {
           "npm": "@ai-sdk/openai-compatible",
           "name": "Qwen3.8 Flash",
-          "options": { "baseURL": "http://qwen38-flash.ai.svc.cluster.local:8000/v1", "apiKey": "none" },
-          "models": { "qwen38_flash": { "name": "Qwen3.8 Flash", "limit": { "context": 32768, "output": 8192 } } }
+          "options": {
+            "baseURL": "http://qwen38-flash.ai.svc.cluster.local:8000/v1",
+            "apiKey": "none"
+          },
+          "models": {
+            "qwen38_flash": {
+              "name": "Qwen3.8 Flash",
+              "limit": {
+                "context": 32768,
+                "output": 8192
+              }
+            }
+          }
         }
       }
     }
-
-  # Same as opencode.json, but the plan step may post its plan with gh
+  # Used by the plan steps only: same as opencode.json, but the agent may post its plan with `gh issue comment` / `gh pr comment`.
   opencode-plan.json: |
     {
       ...
       "permission": {
         ...
-        "bash": { "*": "allow", "git commit*": "deny", "git push*": "deny",
-                  "gh *": "deny", "gh issue comment*": "allow", "gh pr comment*": "allow" }
+        "bash": {
+          "*": "allow",
+          "git commit*": "deny",
+          "git push*": "deny",
+          "gh *": "deny",
+          "gh issue comment*": "allow",
+          "gh pr comment*": "allow"
+        }
       },
       ...
     }
@@ -650,13 +686,23 @@ metadata:
   namespace: agents
 spec:
   params:
-    - { name: repo-url, type: string }
-    - { name: repo-full-name, type: string }
-    - { name: issue, type: string }
-    - { name: issue-title, type: string }
-    - { name: issue-body, type: string, default: "" }
-    - { name: base-branch, type: string, default: master }
-    - { name: skills-artifact, type: string, default: "quay.io/pminkows/claude-ai-spring-boot:1.3.1" }
+    - name: repo-url
+      type: string
+    - name: repo-full-name
+      type: string
+    - name: issue
+      type: string
+    - name: issue-title
+      type: string
+    - name: issue-body
+      type: string
+      default: ""
+    - name: base-branch
+      type: string
+      default: master
+    - name: skills-artifact
+      type: string
+      default: quay.io/pminkows/claude-ai-spring-boot:1.3.1
     # issue-id and issue-author are also declared; they are only printed
   workspaces:
     - name: skills
@@ -669,14 +715,22 @@ spec:
             # script: echo repository, issue number, title, author and body
 
     - name: fetch-skills
-      runAfter: [print-event]
-      workspaces: [{ name: skills, workspace: skills }]
+      runAfter:
+        - print-event
+      workspaces:
+        - name: skills
+          workspace: skills
       taskSpec:
         steps:
           - name: pull
             image: ghcr.io/oras-project/oras:v1.3.0
-            command: ["oras"]
-            args: ["pull", "$(params.skills-artifact)", "--output", "/skills/artifact"]
+            command:
+              - oras
+            args:
+              - pull
+              - $(params.skills-artifact)
+              - --output
+              - /skills/artifact
           - name: unpack
             image: registry.access.redhat.com/ubi9/ubi:latest
             script: |
@@ -684,19 +738,29 @@ spec:
               for f in /skills/artifact/*.tar.gz; do tar -xzf "$f" -C /skills/opencode; done
 
     - name: implement-and-create-pr
-      runAfter: [fetch-skills]
+      runAfter:
+        - fetch-skills
       timeout: "3h"
-      workspaces: [{ name: skills, workspace: skills }]
+      workspaces:
+        - name: skills
+          workspace: skills
       taskSpec:
         volumes:
-          - { name: work, emptyDir: {} }             # shared by all steps: clone, plan, summary
-          - { name: config, configMap: { name: agent-config } }
+          - name: work                           # shared by all steps: clone, plan, summary
+            emptyDir: {}
+          - name: config
+            configMap:
+              name: agent-config
         steps:
-          - name: prepare                            # holds the GitHub App key
+          - name: prepare                        # holds the GitHub App key
             image: quay.io/pminkows/opencode:latest
-            env:                                     # GITHUB_APP_ID, GITHUB_APP_INSTALLATION_ID and
-              - name: GITHUB_APP_PRIVATE_KEY         # GITHUB_APP_PRIVATE_KEY come from the github-app secret
-                valueFrom: { secretKeyRef: { name: github-app, key: private-key.pem } }
+            env:
+              # GITHUB_APP_ID and GITHUB_APP_INSTALLATION_ID come from the same secret
+              - name: GITHUB_APP_PRIVATE_KEY
+                valueFrom:
+                  secretKeyRef:
+                    name: github-app
+                    key: private-key.pem
             script: |
               cp -R /skills/opencode/. "$HOME/.config/opencode/"
               GH_TOKEN="$(bash /config/gh-app-token.sh)"; export GH_TOKEN
@@ -705,27 +769,29 @@ spec:
               git clone --branch "$BASE_BRANCH" -- "$REPO_URL" /workspace/repo
               git switch -c "issue-${ISSUE_NUMBER}-${SLUG}"
 
-          - name: plan                               # no App key, only the short-lived token
+          - name: plan                           # no App key, only the short-lived token
             image: quay.io/pminkows/opencode:latest
             env:
-              - { name: OPENCODE_CONFIG, value: /config/opencode-plan.json }
+              - name: OPENCODE_CONFIG
+                value: /config/opencode-plan.json
             script: |
               GH_TOKEN="$(cat /workspace/gh-token)"; export GH_TOKEN; rm -f /workspace/gh-token
               timeout 15m opencode run "Write an implementation plan as a checklist to
                 /workspace/out/plan.md and post it with: gh issue comment ... (only gh command allowed)"
               git reset -q --hard && git clean -qfd   # planning must not leave changes behind
 
-          - name: agent                              # no GitHub credentials at all
+          - name: agent                          # no GitHub credentials at all
             image: quay.io/pminkows/opencode:latest
             env:
-              - { name: OPENCODE_CONFIG, value: /config/opencode.json }
+              - name: OPENCODE_CONFIG
+                value: /config/opencode.json
             script: |
               PROMPT="Implement this GitHub issue, following the repository's AGENTS.md. ... $(cat /workspace/issue.txt)"
               [ -s /workspace/out/plan.md ] && PROMPT="$PROMPT Follow this plan: $(cat /workspace/out/plan.md)"
               timeout 3h opencode run "$PROMPT"
               # the agent writes a short summary to .agent-summary.md; it is moved out of the repository
 
-          - name: publish                            # mints a fresh token: the agent may run longer than 1h
+          - name: publish                        # mints a fresh token: the agent may run longer than 1h
             image: quay.io/pminkows/opencode:latest
             script: |
               GH_TOKEN="$(bash /config/gh-app-token.sh)"; export GH_TOKEN
@@ -810,8 +876,10 @@ spec:
     - name: issue-title
     - name: issue-body
     - name: base-branch
-    - { name: issue-id, default: "" }
-    - { name: issue-author, default: "" }
+    - name: issue-id
+      default: ""
+    - name: issue-author
+      default: ""
   resourcetemplates:
     - apiVersion: tekton.dev/v1
       kind: PipelineRun
@@ -823,14 +891,17 @@ spec:
         timeouts:
           pipeline: 3h0m0s
         params:
-          - { name: repo-url, value: $(tt.params.repo-url) }
-          - { name: issue, value: $(tt.params.issue) }
+          - name: repo-url
+            value: $(tt.params.repo-url)
+          - name: issue
+            value: $(tt.params.issue)
           # ... one entry per parameter above
         workspaces:
           - name: skills
             volumeClaimTemplate:
               spec:
-                accessModes: [ReadWriteOnce]
+                accessModes:
+                  - ReadWriteOnce
                 resources:
                   requests:
                     storage: 1Gi
@@ -866,30 +937,47 @@ spec:
   triggers:
     - name: new-issue
       interceptors:
-        - ref: { kind: ClusterInterceptor, name: github }
+        - ref:
+            kind: ClusterInterceptor
+            name: github
           params:
             - name: secretRef
-              value: { secretName: github-webhook-secret, secretKey: secret }
+              value:
+                secretName: github-webhook-secret
+                secretKey: secret
             - name: eventTypes
-              value: [issues]
-        - ref: { kind: ClusterInterceptor, name: cel }
+              value:
+                - issues
+        - ref:
+            kind: ClusterInterceptor
+            name: cel
           params:
             - name: filter
               value: >-
                 body.action == 'opened'
                 && body.issue.author_association in ['OWNER', 'MEMBER']
       bindings:
-        - { kind: TriggerBinding, ref: new-issue }
+        - kind: TriggerBinding
+          ref: new-issue
       template:
         ref: new-issue
 
     - name: issue-comment
       interceptors:
-        - ref: { kind: ClusterInterceptor, name: github }
+        - ref:
+            kind: ClusterInterceptor
+            name: github
           params:
-            - { name: secretRef, value: { secretName: github-webhook-secret, secretKey: secret } }
-            - { name: eventTypes, value: [issue_comment] }
-        - ref: { kind: ClusterInterceptor, name: cel }
+            - name: secretRef
+              value:
+                secretName: github-webhook-secret
+                secretKey: secret
+            - name: eventTypes
+              value:
+                - issue_comment
+        - ref:
+            kind: ClusterInterceptor
+            name: cel
           params:
             - name: filter
               value: >-
@@ -898,17 +986,27 @@ spec:
                 && body.comment.author_association in ['OWNER', 'MEMBER']
                 && body.comment.body.startsWith('@ai')
       bindings:
-        - { kind: TriggerBinding, ref: issue-comment }
+        - kind: TriggerBinding
+          ref: issue-comment
       template:
         ref: issue-comment
 
     - name: pr-review-comment
       interceptors:
-        - ref: { kind: ClusterInterceptor, name: github }
+        - ref:
+            kind: ClusterInterceptor
+            name: github
           params:
-            - { name: secretRef, value: { secretName: github-webhook-secret, secretKey: secret } }
-            - { name: eventTypes, value: [pull_request_review_comment] }
-        - ref: { kind: ClusterInterceptor, name: cel }
+            - name: secretRef
+              value:
+                secretName: github-webhook-secret
+                secretKey: secret
+            - name: eventTypes
+              value:
+                - pull_request_review_comment
+        - ref:
+            kind: ClusterInterceptor
+            name: cel
           params:
             - name: filter
               value: >-
@@ -916,17 +1014,27 @@ spec:
                 && body.sender.type != 'Bot'
                 && body.comment.author_association in ['OWNER', 'MEMBER']
       bindings:
-        - { kind: TriggerBinding, ref: pr-review-comment }
+        - kind: TriggerBinding
+          ref: pr-review-comment
       template:
         ref: pr-comment
 
     - name: pr-review
       interceptors:
-        - ref: { kind: ClusterInterceptor, name: github }
+        - ref:
+            kind: ClusterInterceptor
+            name: github
           params:
-            - { name: secretRef, value: { secretName: github-webhook-secret, secretKey: secret } }
-            - { name: eventTypes, value: [pull_request_review] }
-        - ref: { kind: ClusterInterceptor, name: cel }
+            - name: secretRef
+              value:
+                secretName: github-webhook-secret
+                secretKey: secret
+            - name: eventTypes
+              value:
+                - pull_request_review
+        - ref:
+            kind: ClusterInterceptor
+            name: cel
           params:
             - name: filter
               value: >-
@@ -935,7 +1043,8 @@ spec:
                 && body.review.author_association in ['OWNER', 'MEMBER']
                 && body.review.body != null && body.review.body != ''
       bindings:
-        - { kind: TriggerBinding, ref: pr-review }
+        - kind: TriggerBinding
+          ref: pr-review
       template:
         ref: pr-comment
 ```

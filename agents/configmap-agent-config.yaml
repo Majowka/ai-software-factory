@@ -27,15 +27,33 @@ data:
         "task": "allow",
         "webfetch": "deny",
         "external_directory": "allow",
-        "bash": { "*": "allow", "git commit*": "deny", "git push*": "deny", "gh *": "deny" }
+        "bash": {
+          "*": "allow",
+          "git commit*": "deny",
+          "git push*": "deny",
+          "gh *": "deny"
+        }
       },
-      "tools": { "todowrite": false },
+      "tools": {
+        "todowrite": false
+      },
       "provider": {
         "qwen38-flash": {
           "npm": "@ai-sdk/openai-compatible",
           "name": "Qwen3.8 Flash",
-          "options": { "baseURL": "http://qwen38-flash.ai.svc.cluster.local:8000/v1", "apiKey": "none" },
-          "models": { "qwen38_flash": { "name": "Qwen3.8 Flash", "limit": { "context": 32768, "output": 8192 } } }
+          "options": {
+            "baseURL": "http://qwen38-flash.ai.svc.cluster.local:8000/v1",
+            "apiKey": "none"
+          },
+          "models": {
+            "qwen38_flash": {
+              "name": "Qwen3.8 Flash",
+              "limit": {
+                "context": 32768,
+                "output": 8192
+              }
+            }
+          }
         }
       }
     }
@@ -50,15 +68,35 @@ data:
         "task": "allow",
         "webfetch": "deny",
         "external_directory": "allow",
-        "bash": { "*": "allow", "git commit*": "deny", "git push*": "deny", "gh *": "deny", "gh issue comment*": "allow", "gh pr comment*": "allow" }
+        "bash": {
+          "*": "allow",
+          "git commit*": "deny",
+          "git push*": "deny",
+          "gh *": "deny",
+          "gh issue comment*": "allow",
+          "gh pr comment*": "allow"
+        }
       },
-      "tools": { "todowrite": false },
+      "tools": {
+        "todowrite": false
+      },
       "provider": {
         "qwen38-flash": {
           "npm": "@ai-sdk/openai-compatible",
           "name": "Qwen3.8 Flash",
-          "options": { "baseURL": "http://qwen38-flash.ai.svc.cluster.local:8000/v1", "apiKey": "none" },
-          "models": { "qwen38_flash": { "name": "Qwen3.8 Flash", "limit": { "context": 32768, "output": 8192 } } }
+          "options": {
+            "baseURL": "http://qwen38-flash.ai.svc.cluster.local:8000/v1",
+            "apiKey": "none"
+          },
+          "models": {
+            "qwen38_flash": {
+              "name": "Qwen3.8 Flash",
+              "limit": {
+                "context": 32768,
+                "output": 8192
+              }
+            }
+          }
         }
       }
     }

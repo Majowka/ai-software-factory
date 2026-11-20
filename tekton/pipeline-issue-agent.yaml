@@ -108,8 +108,13 @@ spec:
           - name: pull
             image: ghcr.io/oras-project/oras:v1.3.0
             workingDir: /skills
-            command: ["oras"]
-            args: ["pull", "$(params.skills-artifact)", "--output", "/skills/artifact"]
+            command:
+              - oras
+            args:
+              - pull
+              - $(params.skills-artifact)
+              - --output
+              - /skills/artifact
           - name: unpack
             image: registry.access.redhat.com/ubi9/ubi:latest
             workingDir: /skills
