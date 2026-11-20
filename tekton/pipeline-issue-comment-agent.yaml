@@ -109,7 +109,6 @@ spec:
     - name: handle-issue-comment
       runAfter:
         - fetch-skills
-      timeout: "3h30m"
       workspaces:
         - name: skills
           workspace: skills
@@ -387,7 +386,6 @@ spec:
     - name: verify
       runAfter:
         - handle-issue-comment
-      timeout: "1h30m"
       taskRef:
         name: verify-build
       workspaces:
@@ -401,7 +399,6 @@ spec:
     - name: publish
       runAfter:
         - verify
-      timeout: "20m"
       workspaces:
         - name: work
           workspace: work

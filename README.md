@@ -88,7 +88,7 @@ drawings, not the official logos.
 ├── agents/                              the agent: images and shared configuration
 │   ├── Dockerfile.opencode              reference Dockerfile of the agent image (the pipelines pull it from Quay)
 │   ├── Dockerfile                       same tooling with Claude Code (optional, not used by the pipelines)
-│   └── configmap-agent-config.yaml      OpenCode config (model, permissions), the GitHub App token script and verify.sh
+│   └── configmap-agent-config.yaml      OpenCode config (model, permissions) and the GitHub App token script
 ├── tekton/                              pipelines and everything that triggers them
 │   ├── pipeline-*.yaml                  the three Tekton pipelines
 │   ├── triggerbinding-*.yaml            map webhook payloads to pipeline parameters
@@ -566,7 +566,7 @@ release the GPUs.
 ### 6.1 Agent configuration (ConfigMap)
 
 `agents/configmap-agent-config.yaml` is shared by all pipelines and mounted at `/config`. It has
-four files: the script that mints GitHub App installation tokens, the build verification script (`verify.sh`) and two OpenCode configs. The
+three files: the script that mints GitHub App installation tokens and two OpenCode configs. The
 model, its endpoint and the **permissions** of the agent are defined here.
 
 ```yaml
@@ -761,7 +761,6 @@ spec:
     - name: implement-and-create-pr
       runAfter:
         - fetch-skills
-      timeout: "3h30m"
       workspaces:
         - name: skills
           workspace: skills
@@ -813,10 +812,9 @@ spec:
               # the agent writes a short summary to .agent-summary.md; it is moved out of the repository
 
 
-    - name: verify                               # shared Task: build and test, the agent fixes a red build (verify.sh)
+    - name: verify                               # shared Task: build and test, the agent fixes a red build
       runAfter:
         - implement-and-create-pr
-      timeout: "1h30m"
       taskRef:
         name: verify-build
       # workspaces and params omitted
@@ -824,7 +822,6 @@ spec:
     - name: publish
       runAfter:
         - verify
-      timeout: "20m"
       taskSpec:
         steps:
           - name: publish                        # mints a fresh token: the agent may run longer than 1h
@@ -931,8 +928,8 @@ spec:
         pipelineRef:
           name: issue-agent
         timeouts:
-          pipeline: 5h45m0s
-          tasks: 5h30m0s
+          pipeline: 3h15m0s
+          tasks: 3h0m0s
           finally: 15m0s
         params:
           - name: repo-url
@@ -1152,8 +1149,11 @@ The `new-issue` EventListener has four triggers. Each verifies the webhook signa
 | `pr-review` | `pull_request_review` | action `submitted`, PR open, not a bot, author OWNER or MEMBER, non-empty body | `pr-comment`, `pr-comment-agent` |
 
 Each `PipelineRun` gets its own volumes (`volumeClaimTemplate`): 1 GiB for the skills workspace and
-10 GiB for the work workspace (the clone and the Maven cache). The timeout is 5 hours 45 minutes
-(5 h 30 min for the tasks, 15 min reserved for `finally`); the agent step alone has 3 hours.
+10 GiB for the work workspace (the clone and the Maven cache). The only Tekton timeouts are
+global, set in the TriggerTemplates: 3 hours for all tasks together and 15 minutes reserved for
+`finally`, so the failure comment can still be posted. The steps bound themselves with `timeout` in
+their scripts (agent 3 h, planning 15 min, each build 20 min, each fix 15 min, and a 45 minute
+budget for the whole fix loop).
 
 The name of a `PipelineRun` is fixed and built from the event: `issue-agent-<issue id>`,
 `issue-comment-agent-<comment id>` and `pr-comment-agent-<c|r><comment or review id>`. GitHub
@@ -1177,7 +1177,7 @@ failing them. The waiting time counts against the timeout.
    (`issue-agent` always plans, because a new issue is always a task).
 5. **`agent`**: OpenCode implements the change against the vLLM endpoint, following the plan and
    the repository's `AGENTS.md`. It writes a short summary to `.agent-summary.md`. It has 3 hours.
-6. **`verify`** (its own task): builds and tests the result (`verify.sh` in the `agent-config` ConfigMap). If the
+6. **`verify`** (its own task): builds and tests the result (the script is in the `verify-build` Task). If the
    build fails, the agent gets the end of the log and fixes the code, up to `max-fix-attempts`
    times and within 45 minutes. The step never fails: it leaves a note with the result.
 7. **`publish`** (its own task): mints a fresh token, commits and pushes. The issue pipelines also open a pull
@@ -1268,8 +1268,9 @@ usually means a wrong secret.
 - `verify` only runs the build and tests of the repository (Maven by default). It does not replace
   required status checks and reviews through branch protection, and a repository without a
   recognised build is not verified.
-- The agent step has a 3 hour limit (3 h 30 min for its task). A very long agent run can still be cut off before
-  `publish`, and then no pull request is created. The `report-failure` comment tells you about it.
+- The agent step has a 3 hour limit, but the 3 hours of the whole run are shared with the clone,
+  planning, `verify` and `publish`. A run that uses them up is cut off by Tekton before `publish`,
+  and then no pull request is created. The `report-failure` comment tells you about it.
 - The model context is 128k tokens (`--max-model-len=131072`). It needs enough GPU memory for the KV cache: if
   the pod fails to start or runs out of memory, lower the value in `ai/deployment-qwen38-flash.yaml` and the
   `context` limit in the agent ConfigMap. Long issue threads or large repositories still reduce quality.
