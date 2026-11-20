@@ -39,6 +39,18 @@ OpenShift Route ──► EventListener (Tekton Triggers)
 Every trigger only accepts events from users whose `author_association` is `OWNER` or `MEMBER`
 and ignores bots. Forks and closed issues or pull requests are skipped.
 
+## Why these technologies
+
+| Technology | Why |
+|---|---|
+| **Kubernetes / OpenShift** | One platform for everything: pipelines, agents and models. Each agent run is an isolated pod, so many agents run in parallel and the scheduler places them. GPU nodes, secrets, RBAC and network policies come built in. |
+| **Tekton** | Kubernetes-native CI. Tekton Triggers turn a GitHub webhook straight into a `PipelineRun`, with signature checks and CEL filters. Every run is a recorded object that can be retried, logged and timed. |
+| **vLLM** | High-throughput inference with continuous batching, so parallel agents share one GPU deployment. It serves an OpenAI-compatible API, supports tool calling and tensor parallelism, and runs open models in the cluster. |
+| **Open model (Qwen)** | Code and issue text never leave the cluster, there is no per-token cost, and you can swap the model by changing one config entry. |
+| **OpenCode** | Open-source coding agent that works with any OpenAI-compatible endpoint, so it does not tie the factory to a single model vendor. Permissions are declared in a config file. |
+| **GitHub App** | Short-lived installation tokens instead of personal access tokens, with fine-grained permissions and its own bot identity. |
+| **OCI artifact for skills** | Skills and subagents are versioned and pulled from the same registry as images, with no extra infrastructure. |
+
 ## Showcase
 
 The approach described here is in use in a sample application repository:
