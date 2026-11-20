@@ -47,8 +47,8 @@ spec:
         taskRunTemplate:
           serviceAccountName: pipeline
         timeouts:
-          pipeline: 3h45m0s
-          tasks: 3h30m0s
+          pipeline: 5h45m0s
+          tasks: 5h30m0s
           finally: 15m0s
         workspaces:
           - name: skills
@@ -59,3 +59,11 @@ spec:
                 resources:
                   requests:
                     storage: 1Gi
+          - name: work
+            volumeClaimTemplate:
+              spec:
+                accessModes:
+                  - ReadWriteOnce
+                resources:
+                  requests:
+                    storage: 10Gi

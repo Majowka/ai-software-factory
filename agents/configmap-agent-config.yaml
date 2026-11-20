@@ -107,7 +107,7 @@ data:
             "qwen38_flash": {
               "name": "Qwen3.8 Flash",
               "limit": {
-                "context": 32768,
+                "context": 131072,
                 "output": 8192
               }
             }
@@ -150,7 +150,7 @@ data:
             "qwen38_flash": {
               "name": "Qwen3.8 Flash",
               "limit": {
-                "context": 32768,
+                "context": 131072,
                 "output": 8192
               }
             }

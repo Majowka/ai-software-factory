@@ -1,0 +1,52 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: verify-build
+  namespace: agents
+spec:
+  description: >-
+    Builds and tests the repository in the work workspace after the agent step. When the build fails, the agent gets
+    the log and fixes it (verify.sh in the agent-config ConfigMap). Never fails: the result is left in
+    /workspace/out/verify-note.md and, when the build stays red, /workspace/out/verify-failed.
+  params:
+    - name: verify-command
+      type: string
+      default: ""
+      description: Build and test command. Empty means `mvn -B -ntp verify` when there is a pom.xml, otherwise nothing. `skip` disables it.
+    - name: max-fix-attempts
+      type: string
+      default: "3"
+  workspaces:
+    - name: work
+      mountPath: /workspace
+  volumes:
+    - name: config
+      configMap:
+        name: agent-config
+  steps:
+    - name: verify
+      image: quay.io/pminkows/opencode:latest
+      workingDir: /workspace/repo
+      volumeMounts:
+        - name: config
+          mountPath: /config
+          readOnly: true
+      computeResources:
+        requests:
+          memory: 1Gi
+          cpu: 500m
+        limits:
+          memory: 3Gi
+          cpu: "2"
+      env:
+        - name: VERIFY_COMMAND
+          value: $(params.verify-command)
+        - name: MAX_FIX_ATTEMPTS
+          value: $(params.max-fix-attempts)
+        - name: HOME
+          value: /workspace/home
+        - name: OPENCODE_CONFIG
+          value: /config/opencode.json
+      script: |
+        #!/usr/bin/env bash
+        exec bash /config/verify.sh

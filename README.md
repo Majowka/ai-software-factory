@@ -21,10 +21,10 @@ OpenShift Route ──► EventListener (Tekton Triggers)
                                                         │
               ┌─────────────────────────────────────────┘
               ▼
-   print-event ─► fetch-skills ─► prepare ─► plan ─► agent ─► publish
-                      │              │        │       │         │
-                 OCI artifact     clone +   plan as  OpenCode   commit, push,
-                 (skills, agents) branch    comment  + vLLM     PR, reply
+   print-event ─► fetch-skills ─► prepare ─► plan ─► agent ─► verify ─► publish
+                      │              │        │       │         │          │
+                 OCI artifact     clone +   plan as  OpenCode   build,     commit, push,
+                 (skills, agents) branch    comment  + vLLM     test, fix   PR, reply
                                                       (Qwen)
 ```
 
@@ -94,6 +94,7 @@ drawings, not the official logos.
 │   ├── triggerbinding-*.yaml            map webhook payloads to pipeline parameters
 │   ├── triggertemplate-*.yaml           create the PipelineRuns
 │   ├── eventlistener-new-issue.yaml     the single EventListener with four triggers and their filters
+│   ├── task-*.yaml                      shared tasks: fetch-skills, verify-build, report-failure
 │   ├── resourcequota-agents.yaml        optional cap on parallel runs
 │   ├── route-new-issue.yaml             public HTTPS endpoint for the GitHub webhook
 │   └── serviceaccount-*.yaml, rolebinding-*.yaml   service account and RBAC for the EventListener
@@ -406,7 +407,7 @@ oras push quay.io/<org>/<skills-repo>:<version> skills.tar.gz
 
 The manifests in `ai/` run `vllm serve` for Qwen3.8 Flash (`qwen38-flash`) and Qwen3 Coder
 (`qwen3-coder`). The pipelines use **Qwen3.8 Flash**, served as `qwen38_flash`, with tool calling
-enabled and a 32k context.
+enabled and a 128k context.
 
 **Cache volume** (`ai/pvc-qwen38-flash-cache.yaml`). The Hugging Face cache lives on a persistent
 volume so the weights are downloaded only once:
@@ -467,7 +468,7 @@ spec:
             - --port=8000
             - --served-model-name=qwen38_flash
             - --tensor-parallel-size=2
-            - --max-model-len=32768
+            - --max-model-len=131072
             - --gpu-memory-utilization=0.90
             - --enable-auto-tool-choice
             - --tool-call-parser=qwen3_coder
@@ -620,7 +621,7 @@ data:
             "qwen38_flash": {
               "name": "Qwen3.8 Flash",
               "limit": {
-                "context": 32768,
+                "context": 131072,
                 "output": 8192
               }
             }
@@ -684,13 +685,27 @@ oc apply -f tekton/serviceaccount-issue-agent-listener.yaml -f tekton/rolebindin
 
 ### 6.3 Pipelines
 
-All three pipelines have the same shape: `print-event`, `fetch-skills`, and one long task that
-runs the steps `prepare`, `plan`, `agent`, `verify` and `publish`. A `finally` task, `report-failure`,
-comments on the issue or pull request when the run fails. Only the event parameters and the
-`prepare` and `publish` logic differ. Two optional parameters control `verify`: `verify-command`
-(default: `mvn -B -ntp verify` when there is a `pom.xml`, `skip` disables it) and `max-fix-attempts`
-(default `3`). The skills workspace is a volume that every `PipelineRun`
-creates for itself.
+All three pipelines have the same shape: `print-event`, `fetch-skills`, one long task
+(`prepare`, `plan` and `agent` steps), `verify` and `publish`. A `finally` task, `report-failure`,
+comments on the issue or pull request when the run fails. The steps that are the same in every
+pipeline are shared `Task` resources (`tekton/task-*.yaml`), referenced with `taskRef`:
+
+| Task | Used for |
+|---|---|
+| `fetch-skills` | pulls and unpacks the skills artifact |
+| `verify-build` | builds and tests the result, the agent fixes a red build |
+| `report-failure` | comments on the issue or pull request when the run failed |
+
+The pipelines keep only what differs: the event parameters and the `prepare`, `plan`, `agent` and
+`publish` logic. Two optional parameters control `verify`: `verify-command` (default:
+`mvn -B -ntp verify` when there is a `pom.xml`, `skip` disables it) and `max-fix-attempts`
+(default `3`). Two workspaces are volumes that every `PipelineRun` creates for itself: `skills`
+(the unpacked skills) and `work` (the clone, the plan and the summary, shared by all tasks after
+`fetch-skills`).
+
+```bash
+oc apply -f tekton/task-fetch-skills.yaml -f tekton/task-verify-build.yaml -f tekton/task-report-failure.yaml
+```
 
 `tekton/pipeline-issue-agent.yaml` (shortened; the scripts keep only their key commands):
 
@@ -722,6 +737,7 @@ spec:
     # issue-id and issue-author are also declared; they are only printed
   workspaces:
     - name: skills
+    - name: work
   tasks:
     - name: print-event                       # logs the key facts of the event
       taskSpec:
@@ -730,40 +746,29 @@ spec:
             image: registry.access.redhat.com/ubi9/ubi-minimal:latest
             # script: echo repository, issue number, title, author and body
 
-    - name: fetch-skills
+    - name: fetch-skills                      # shared Task
       runAfter:
         - print-event
+      taskRef:
+        name: fetch-skills
+      params:
+        - name: skills-artifact
+          value: $(params.skills-artifact)
       workspaces:
         - name: skills
           workspace: skills
-      taskSpec:
-        steps:
-          - name: pull
-            image: ghcr.io/oras-project/oras:v1.3.0
-            command:
-              - oras
-            args:
-              - pull
-              - $(params.skills-artifact)
-              - --output
-              - /skills/artifact
-          - name: unpack
-            image: registry.access.redhat.com/ubi9/ubi:latest
-            script: |
-              mkdir -p /skills/opencode
-              for f in /skills/artifact/*.tar.gz; do tar -xzf "$f" -C /skills/opencode; done
 
     - name: implement-and-create-pr
       runAfter:
         - fetch-skills
-      timeout: "3h"
+      timeout: "3h30m"
       workspaces:
         - name: skills
           workspace: skills
+        - name: work                             # mounted at /workspace: clone, plan, summary
+          workspace: work
       taskSpec:
         volumes:
-          - name: work                           # shared by all steps: clone, plan, summary
-            emptyDir: {}
           - name: config
             configMap:
               name: agent-config
@@ -807,11 +812,21 @@ spec:
               timeout 3h opencode run "$PROMPT"
               # the agent writes a short summary to .agent-summary.md; it is moved out of the repository
 
-          - name: verify                         # build and test; on failure the agent gets the log and fixes it (verify.sh)
-            image: quay.io/pminkows/opencode:latest
-            script: |
-              exec bash /config/verify.sh
 
+    - name: verify                               # shared Task: build and test, the agent fixes a red build (verify.sh)
+      runAfter:
+        - implement-and-create-pr
+      timeout: "1h30m"
+      taskRef:
+        name: verify-build
+      # workspaces and params omitted
+
+    - name: publish
+      runAfter:
+        - verify
+      timeout: "20m"
+      taskSpec:
+        steps:
           - name: publish                        # mints a fresh token: the agent may run longer than 1h
             image: quay.io/pminkows/opencode:latest
             script: |
@@ -820,6 +835,12 @@ spec:
               PR_URL="$(gh pr create --base "$BASE_BRANCH" --head "$BRANCH" $DRAFT_FLAG --body "Closes #${ISSUE_NUMBER}" ...)"
               gh pr merge "$PR_URL" --auto --merge     # waits for the required review and checks (not for a draft)
               gh issue comment "$ISSUE_NUMBER" --body-file /workspace/out/summary.md
+
+  finally:
+    - name: report-failure                       # shared Task: runs only when the pipeline failed
+      taskRef:
+        name: report-failure
+      # when expression and params omitted
 ```
 
 ```bash
@@ -910,8 +931,8 @@ spec:
         pipelineRef:
           name: issue-agent
         timeouts:
-          pipeline: 3h45m0s
-          tasks: 3h30m0s
+          pipeline: 5h45m0s
+          tasks: 5h30m0s
           finally: 15m0s
         params:
           - name: repo-url
@@ -928,6 +949,14 @@ spec:
                 resources:
                   requests:
                     storage: 1Gi
+          - name: work                           # same volumeClaimTemplate, 10Gi
+            volumeClaimTemplate:
+              spec:
+                accessModes:
+                  - ReadWriteOnce
+                resources:
+                  requests:
+                    storage: 10Gi
 ```
 
 The templates for comments and pull requests are the same with another `pipelineRef`, other
@@ -1101,6 +1130,7 @@ All manifests of this section in one go, in a safe order:
 ```bash
 oc apply -f agents/configmap-agent-config.yaml
 oc apply -f tekton/serviceaccount-issue-agent-listener.yaml -f tekton/rolebinding-issue-agent-listener.yaml
+oc apply -f tekton/task-fetch-skills.yaml -f tekton/task-verify-build.yaml -f tekton/task-report-failure.yaml
 oc apply -f tekton/pipeline-issue-agent.yaml -f tekton/pipeline-issue-comment-agent.yaml -f tekton/pipeline-pr-comment-agent.yaml
 oc apply -f tekton/triggerbinding-new-issue.yaml -f tekton/triggerbinding-issue-comment.yaml \
          -f tekton/triggerbinding-pr-review.yaml -f tekton/triggerbinding-pr-review-comment.yaml \
@@ -1121,8 +1151,9 @@ The `new-issue` EventListener has four triggers. Each verifies the webhook signa
 | `pr-review-comment` | `pull_request_review_comment` | action `created`, PR open, not a bot, author OWNER or MEMBER | `pr-comment`, `pr-comment-agent` |
 | `pr-review` | `pull_request_review` | action `submitted`, PR open, not a bot, author OWNER or MEMBER, non-empty body | `pr-comment`, `pr-comment-agent` |
 
-Each `PipelineRun` gets its own 1 GiB volume (`volumeClaimTemplate`) for the skills workspace and
-a 3 hour 45 minute timeout (3 h 30 min for the tasks, 15 min reserved for `finally`).
+Each `PipelineRun` gets its own volumes (`volumeClaimTemplate`): 1 GiB for the skills workspace and
+10 GiB for the work workspace (the clone and the Maven cache). The timeout is 5 hours 45 minutes
+(5 h 30 min for the tasks, 15 min reserved for `finally`); the agent step alone has 3 hours.
 
 The name of a `PipelineRun` is fixed and built from the event: `issue-agent-<issue id>`,
 `issue-comment-agent-<comment id>` and `pr-comment-agent-<c|r><comment or review id>`. GitHub
@@ -1145,11 +1176,11 @@ failing them. The waiting time counts against the timeout.
    (`- [ ] ...`) and posts it as a comment on the issue or pull request. Questions are not planned
    (`issue-agent` always plans, because a new issue is always a task).
 5. **`agent`**: OpenCode implements the change against the vLLM endpoint, following the plan and
-   the repository's `AGENTS.md`. It writes a short summary to `.agent-summary.md`. It has 2 hours.
-6. **`verify`**: builds and tests the result (`verify.sh` in the `agent-config` ConfigMap). If the
+   the repository's `AGENTS.md`. It writes a short summary to `.agent-summary.md`. It has 3 hours.
+6. **`verify`** (its own task): builds and tests the result (`verify.sh` in the `agent-config` ConfigMap). If the
    build fails, the agent gets the end of the log and fixes the code, up to `max-fix-attempts`
    times and within 45 minutes. The step never fails: it leaves a note with the result.
-7. **`publish`**: mints a fresh token, commits and pushes. The issue pipelines also open a pull
+7. **`publish`** (its own task): mints a fresh token, commits and pushes. The issue pipelines also open a pull
    request and enable auto-merge; `pr-comment-agent` pushes to the existing PR branch. The agent's
    summary is then posted as a comment, preceded by the verification result. If the build stays
    red, the pull request is opened as a **draft**, auto-merge is not enabled and the comment
@@ -1224,7 +1255,7 @@ usually means a wrong secret.
 | No `PipelineRun` is created | Webhook deliveries on GitHub; `oc logs deployment/el-new-issue -n agents`; the sender's `author_association` and the CEL filter. |
 | `fetch-skills` fails | `skills-artifact` reference and registry access; the artifact must contain a `.tar.gz`. |
 | `prepare` fails when minting a token | App ID, installation ID, key format of the `github-app` secret; the app must be installed on the repository. |
-| `agent` hangs or loops | vLLM health (`oc logs deployment/qwen38-flash -n ai`), context limit, and the 2 hour limit of the step. A small model sometimes needs more explicit `AGENTS.md` rules. |
+| `agent` hangs or loops | vLLM health (`oc logs deployment/qwen38-flash -n ai`), context limit, and the 3 hour limit of the step. A small model sometimes needs more explicit `AGENTS.md` rules. |
 | Pods stay `Pending` in `ai` | GPU capacity, taints and tolerations, and that the NVIDIA GPU Operator is healthy. |
 | `publish` fails on push | App permissions (Contents write), branch protection rules, and that the branch does not already exist. |
 | Auto-merge could not be enabled | Repository setting *Allow auto-merge* and branch protection on the base branch. |
@@ -1237,8 +1268,10 @@ usually means a wrong secret.
 - `verify` only runs the build and tests of the repository (Maven by default). It does not replace
   required status checks and reviews through branch protection, and a repository without a
   recognised build is not verified.
-- The long task has a 3 hour 30 minute timeout. A very long agent run can still be cut off before
+- The agent step has a 3 hour limit (3 h 30 min for its task). A very long agent run can still be cut off before
   `publish`, and then no pull request is created. The `report-failure` comment tells you about it.
-- The model context is 32k tokens. Long issue threads or large repositories reduce quality.
+- The model context is 128k tokens (`--max-model-len=131072`). It needs enough GPU memory for the KV cache: if
+  the pod fails to start or runs out of memory, lower the value in `ai/deployment-qwen38-flash.yaml` and the
+  `context` limit in the agent ConfigMap. Long issue threads or large repositories still reduce quality.
 - Comments on pull requests that start with `@ai` are not handled by `issue-comment-agent`
   (the trigger skips pull requests). Pull requests are handled by the review triggers.

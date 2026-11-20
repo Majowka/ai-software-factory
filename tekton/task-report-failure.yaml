@@ -1,0 +1,82 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: report-failure
+  namespace: agents
+spec:
+  description: Comments on the issue or pull request that the run failed, with the name of the PipelineRun. Meant for the finally section of a pipeline.
+  params:
+    - name: repo-full-name
+      type: string
+    - name: number
+      type: string
+      description: Issue or pull request number.
+    - name: target
+      type: string
+      default: issue
+      description: "`issue` or `pr`."
+    - name: what
+      type: string
+      description: What was not done, for example "No pull request was created from this run."
+    - name: retry-hint
+      type: string
+      description: How to run it again.
+    - name: pipelinerun
+      type: string
+    - name: namespace
+      type: string
+  volumes:
+    - name: config
+      configMap:
+        name: agent-config
+  steps:
+    - name: comment
+      image: quay.io/pminkows/opencode:latest
+      volumeMounts:
+        - name: config
+          mountPath: /config
+          readOnly: true
+      env:
+        - name: GITHUB_APP_ID
+          valueFrom:
+            secretKeyRef:
+              name: github-app
+              key: app-id
+        - name: GITHUB_APP_INSTALLATION_ID
+          valueFrom:
+            secretKeyRef:
+              name: github-app
+              key: installation-id
+        - name: GITHUB_APP_PRIVATE_KEY
+          valueFrom:
+            secretKeyRef:
+              name: github-app
+              key: private-key.pem
+        - name: REPO_FULL_NAME
+          value: $(params.repo-full-name)
+        - name: NUMBER
+          value: $(params.number)
+        - name: TARGET
+          value: $(params.target)
+        - name: WHAT
+          value: $(params.what)
+        - name: RETRY_HINT
+          value: $(params.retry-hint)
+        - name: PIPELINERUN
+          value: $(params.pipelinerun)
+        - name: PIPELINERUN_NAMESPACE
+          value: $(params.namespace)
+        - name: HOME
+          value: /tmp
+      script: |
+        #!/usr/bin/env bash
+        set -uo pipefail
+
+        GH_TOKEN="$(bash /config/gh-app-token.sh)" || { echo "Could not mint a GitHub token, no comment posted"; exit 0; }
+        export GH_TOKEN
+
+        printf ':x: **The agent run failed.** %s\n\nPipeline run `%s` in namespace `%s`. Logs: `tkn pipelinerun logs %s -n %s`\n\nUsual causes: the model endpoint was not available, the run hit its timeout, or the agent produced no changes. %s\n' \
+          "$WHAT" "$PIPELINERUN" "$PIPELINERUN_NAMESPACE" "$PIPELINERUN" "$PIPELINERUN_NAMESPACE" "$RETRY_HINT" > /tmp/failure.md
+
+        if [ "$TARGET" = "pr" ]; then comment=(gh pr comment); else comment=(gh issue comment); fi
+        "${comment[@]}" "$NUMBER" --repo "$REPO_FULL_NAME" --body-file /tmp/failure.md || echo "Could not post the failure comment"

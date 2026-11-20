@@ -1,0 +1,35 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: fetch-skills
+  namespace: agents
+spec:
+  description: Pulls the skills artifact (skills and subagents in OpenCode format) and unpacks it to /skills/opencode.
+  params:
+    - name: skills-artifact
+      type: string
+  workspaces:
+    - name: skills
+      mountPath: /skills
+  steps:
+    - name: pull
+      image: ghcr.io/oras-project/oras:v1.3.0
+      workingDir: /skills
+      command:
+        - oras
+      args:
+        - pull
+        - $(params.skills-artifact)
+        - --output
+        - /skills/artifact
+    - name: unpack
+      image: registry.access.redhat.com/ubi9/ubi:latest
+      workingDir: /skills
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        # artifact: one tar.gz holding skills/ and agents/ in OpenCode format
+        mkdir -p /skills/opencode
+        for f in /skills/artifact/*.tar.gz; do tar -xzf "$f" -C /skills/opencode; done
+        echo "Installed skills: $(ls /skills/opencode/skills | tr '\n' ' ')"
+        echo "Installed agents: $(ls /skills/opencode/agents | tr '\n' ' ')"

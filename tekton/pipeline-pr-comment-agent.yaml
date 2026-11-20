@@ -37,6 +37,7 @@ spec:
       default: "3"
   workspaces:
     - name: skills
+    - name: work
   tasks:
     - name: print-event
       params:
@@ -111,41 +112,14 @@ spec:
     - name: fetch-skills
       runAfter:
         - print-event
+      taskRef:
+        name: fetch-skills
       params:
         - name: skills-artifact
           value: $(params.skills-artifact)
       workspaces:
         - name: skills
           workspace: skills
-      taskSpec:
-        params:
-          - name: skills-artifact
-            type: string
-        workspaces:
-          - name: skills
-            mountPath: /skills
-        steps:
-          - name: pull
-            image: ghcr.io/oras-project/oras:v1.3.0
-            workingDir: /skills
-            command:
-              - oras
-            args:
-              - pull
-              - $(params.skills-artifact)
-              - --output
-              - /skills/artifact
-          - name: unpack
-            image: registry.access.redhat.com/ubi9/ubi:latest
-            workingDir: /skills
-            script: |
-              #!/usr/bin/env bash
-              set -euo pipefail
-              # artifact: one tar.gz holding skills/ and agents/ in OpenCode format
-              mkdir -p /skills/opencode
-              for f in /skills/artifact/*.tar.gz; do tar -xzf "$f" -C /skills/opencode 2>/dev/null; done
-              echo "Installed skills: $(ls /skills/opencode/skills | tr '\n' ' ')"
-              echo "Installed agents: $(ls /skills/opencode/agents | tr '\n' ' ')"
     - name: handle-pr-comment
       runAfter:
         - fetch-skills
@@ -153,6 +127,8 @@ spec:
       workspaces:
         - name: skills
           workspace: skills
+        - name: work
+          workspace: work
       params:
         - name: event-type
           value: $(params.event-type)
@@ -170,10 +146,6 @@ spec:
           value: $(params.comment-body)
         - name: base-branch
           value: $(params.base-branch)
-        - name: verify-command
-          value: $(params.verify-command)
-        - name: max-fix-attempts
-          value: $(params.max-fix-attempts)
       taskSpec:
         params:
           - name: event-type
@@ -192,17 +164,13 @@ spec:
             type: string
           - name: base-branch
             type: string
-          - name: verify-command
-            type: string
-          - name: max-fix-attempts
-            type: string
         workspaces:
           - name: skills
             mountPath: /skills
             readOnly: true
-        volumes:
           - name: work
-            emptyDir: {}
+            mountPath: /workspace
+        volumes:
           - name: config
             configMap:
               name: agent-config
@@ -212,8 +180,6 @@ spec:
             image: quay.io/pminkows/opencode:latest
             workingDir: /workspace
             volumeMounts:
-              - name: work
-                mountPath: /workspace
               - name: config
                 mountPath: /config
                 readOnly: true
@@ -303,8 +269,6 @@ spec:
             image: quay.io/pminkows/opencode:latest
             workingDir: /workspace/repo
             volumeMounts:
-              - name: work
-                mountPath: /workspace
               - name: config
                 mountPath: /config
                 readOnly: true
@@ -375,8 +339,6 @@ spec:
             image: quay.io/pminkows/opencode:latest
             workingDir: /workspace/repo
             volumeMounts:
-              - name: work
-                mountPath: /workspace
               - name: config
                 mountPath: /config
                 readOnly: true
@@ -434,50 +396,57 @@ spec:
               fi
 
               echo "=== Running opencode ==="
-              timeout 2h opencode run "$PROMPT" 2>&1 | tee /workspace/opencode.log \
+              timeout 3h opencode run "$PROMPT" 2>&1 | tee /workspace/opencode.log \
                 || echo "opencode exited with $? (timeout or error); continuing"
 
               # Only sources: never commit build output (target/ is tracked in this repo) or the agent summary
               if [ -f .agent-summary.md ]; then mv .agent-summary.md /workspace/out/summary.md; fi
 
-          # Build and test the result. If the build fails, the agent gets the log and fixes it (see verify.sh in agent-config).
-          # Never fails the step: when the build stays red, publish opens a draft pull request with the build log.
-          - name: verify
-            image: quay.io/pminkows/opencode:latest
-            workingDir: /workspace/repo
-            volumeMounts:
-              - name: work
-                mountPath: /workspace
-              - name: config
-                mountPath: /config
-                readOnly: true
-            computeResources:
-              requests:
-                memory: 1Gi
-                cpu: 500m
-              limits:
-                memory: 3Gi
-                cpu: "2"
-            env:
-              - name: VERIFY_COMMAND
-                value: $(params.verify-command)
-              - name: MAX_FIX_ATTEMPTS
-                value: $(params.max-fix-attempts)
-              - name: HOME
-                value: /workspace/home
-              - name: OPENCODE_CONFIG
-                value: /config/opencode.json
-            script: |
-              #!/usr/bin/env bash
-              exec bash /config/verify.sh
-
+    - name: verify
+      runAfter:
+        - handle-pr-comment
+      timeout: "1h30m"
+      taskRef:
+        name: verify-build
+      workspaces:
+        - name: work
+          workspace: work
+      params:
+        - name: verify-command
+          value: $(params.verify-command)
+        - name: max-fix-attempts
+          value: $(params.max-fix-attempts)
+    - name: publish
+      runAfter:
+        - verify
+      timeout: "20m"
+      workspaces:
+        - name: work
+          workspace: work
+      params:
+        - name: repo-full-name
+          value: $(params.repo-full-name)
+        - name: pr-number
+          value: $(params.pr-number)
+      taskSpec:
+        params:
+          - name: repo-full-name
+            type: string
+          - name: pr-number
+            type: string
+        workspaces:
+          - name: work
+            mountPath: /workspace
+        volumes:
+          - name: config
+            configMap:
+              name: agent-config
+        steps:
           # Commit, push and PR reply. Mints a fresh token: the agent run may outlast the 1h token lifetime.
           - name: publish
             image: quay.io/pminkows/opencode:latest
             workingDir: /workspace/repo
             volumeMounts:
-              - name: work
-                mountPath: /workspace
               - name: config
                 mountPath: /config
                 readOnly: true
@@ -550,70 +519,20 @@ spec:
           operator: in
           values:
             - Failed
+      taskRef:
+        name: report-failure
       params:
         - name: repo-full-name
           value: $(params.repo-full-name)
         - name: number
           value: $(params.pr-number)
+        - name: target
+          value: pr
+        - name: what
+          value: "Your comment was not handled."
+        - name: retry-hint
+          value: "To retry, comment on the pull request again."
         - name: pipelinerun
           value: $(context.pipelineRun.name)
         - name: namespace
           value: $(context.pipelineRun.namespace)
-      taskSpec:
-        params:
-          - name: repo-full-name
-            type: string
-          - name: number
-            type: string
-          - name: pipelinerun
-            type: string
-          - name: namespace
-            type: string
-        volumes:
-          - name: config
-            configMap:
-              name: agent-config
-        steps:
-          - name: comment
-            image: quay.io/pminkows/opencode:latest
-            volumeMounts:
-              - name: config
-                mountPath: /config
-                readOnly: true
-            env:
-              - name: GITHUB_APP_ID
-                valueFrom:
-                  secretKeyRef:
-                    name: github-app
-                    key: app-id
-              - name: GITHUB_APP_INSTALLATION_ID
-                valueFrom:
-                  secretKeyRef:
-                    name: github-app
-                    key: installation-id
-              - name: GITHUB_APP_PRIVATE_KEY
-                valueFrom:
-                  secretKeyRef:
-                    name: github-app
-                    key: private-key.pem
-              - name: REPO_FULL_NAME
-                value: $(params.repo-full-name)
-              - name: NUMBER
-                value: $(params.number)
-              - name: PIPELINERUN
-                value: $(params.pipelinerun)
-              - name: PIPELINERUN_NAMESPACE
-                value: $(params.namespace)
-              - name: HOME
-                value: /tmp
-            script: |
-              #!/usr/bin/env bash
-              set -uo pipefail
-
-              GH_TOKEN="$(bash /config/gh-app-token.sh)" || { echo "Could not mint a GitHub token, no comment posted"; exit 0; }
-              export GH_TOKEN
-
-              printf ':x: **The agent run failed.** Your comment was not handled.\n\nPipeline run `%s` in namespace `%s`. Logs: `tkn pipelinerun logs %s -n %s`\n\nUsual causes: the model endpoint was not available, the run hit its timeout, or the agent produced no changes. To retry, comment on the pull request again.\n' \
-                "$PIPELINERUN" "$PIPELINERUN_NAMESPACE" "$PIPELINERUN" "$PIPELINERUN_NAMESPACE" > /tmp/failure.md
-
-              gh pr comment "$NUMBER" --repo "$REPO_FULL_NAME" --body-file /tmp/failure.md || echo "Could not post the failure comment"
