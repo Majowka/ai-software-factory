@@ -1,0 +1,11 @@
+# Optional: caps the number of agent runs that work at the same time. Each PipelineRun has one active pod at a time,
+# and the EventListener is one more pod, so 4 pods mean at most 3 parallel runs. Tekton does not fail a run when the
+# quota is exhausted: the TaskRun waits and starts when a pod is free (the waiting time counts against its timeout).
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: agent-runs
+  namespace: agents
+spec:
+  hard:
+    pods: "4"

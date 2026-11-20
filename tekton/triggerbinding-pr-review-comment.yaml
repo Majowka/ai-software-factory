@@ -5,6 +5,8 @@ metadata:
   namespace: agents
 spec:
   params:
+    - name: event-id
+      value: c$(body.comment.id)
     - name: event-type
       value: $(header.X-Github-Event)
     - name: repo-url

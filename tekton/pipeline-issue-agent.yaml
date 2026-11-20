@@ -28,8 +28,16 @@ spec:
     - name: skills-artifact
       type: string
       default: quay.io/pminkows/claude-ai-spring-boot:1.3.1
+    # Build and test command run after the agent step. Empty: `mvn -B -ntp verify` when there is a pom.xml, otherwise nothing. `skip` disables it.
+    - name: verify-command
+      type: string
+      default: ""
+    - name: max-fix-attempts
+      type: string
+      default: "3"
   workspaces:
     - name: skills
+    - name: work
   tasks:
     - name: print-event
       params:
@@ -91,48 +99,22 @@ spec:
     - name: fetch-skills
       runAfter:
         - print-event
+      taskRef:
+        name: fetch-skills
       params:
         - name: skills-artifact
           value: $(params.skills-artifact)
       workspaces:
         - name: skills
           workspace: skills
-      taskSpec:
-        params:
-          - name: skills-artifact
-            type: string
-        workspaces:
-          - name: skills
-            mountPath: /skills
-        steps:
-          - name: pull
-            image: ghcr.io/oras-project/oras:v1.3.0
-            workingDir: /skills
-            command:
-              - oras
-            args:
-              - pull
-              - $(params.skills-artifact)
-              - --output
-              - /skills/artifact
-          - name: unpack
-            image: registry.access.redhat.com/ubi9/ubi:latest
-            workingDir: /skills
-            script: |
-              #!/usr/bin/env bash
-              set -euo pipefail
-              # artifact: one tar.gz holding skills/ and agents/ in OpenCode format
-              mkdir -p /skills/opencode
-              for f in /skills/artifact/*.tar.gz; do tar -xzf "$f" -C /skills/opencode; done
-              echo "Installed skills: $(ls /skills/opencode/skills | tr '\n' ' ')"
-              echo "Installed agents: $(ls /skills/opencode/agents | tr '\n' ' ')"
     - name: implement-and-create-pr
       runAfter:
         - fetch-skills
-      timeout: "3h"
       workspaces:
         - name: skills
           workspace: skills
+        - name: work
+          workspace: work
       params:
         - name: repo-url
           value: $(params.repo-url)
@@ -164,9 +146,9 @@ spec:
           - name: skills
             mountPath: /skills
             readOnly: true
-        volumes:
           - name: work
-            emptyDir: {}
+            mountPath: /workspace
+        volumes:
           - name: config
             configMap:
               name: agent-config
@@ -176,8 +158,6 @@ spec:
             image: quay.io/pminkows/opencode:latest
             workingDir: /workspace
             volumeMounts:
-              - name: work
-                mountPath: /workspace
               - name: config
                 mountPath: /config
                 readOnly: true
@@ -239,8 +219,6 @@ spec:
             image: quay.io/pminkows/opencode:latest
             workingDir: /workspace/repo
             volumeMounts:
-              - name: work
-                mountPath: /workspace
               - name: config
                 mountPath: /config
                 readOnly: true
@@ -289,8 +267,6 @@ spec:
             image: quay.io/pminkows/opencode:latest
             workingDir: /workspace/repo
             volumeMounts:
-              - name: work
-                mountPath: /workspace
               - name: config
                 mountPath: /config
                 readOnly: true
@@ -334,13 +310,53 @@ spec:
               # Only sources: never commit build output (target/ is tracked in this repo) or the agent summary
               if [ -f .agent-summary.md ]; then mv .agent-summary.md /workspace/out/summary.md; fi
 
+    - name: verify
+      runAfter:
+        - implement-and-create-pr
+      taskRef:
+        name: verify-build
+      workspaces:
+        - name: work
+          workspace: work
+      params:
+        - name: verify-command
+          value: $(params.verify-command)
+        - name: max-fix-attempts
+          value: $(params.max-fix-attempts)
+    - name: publish
+      runAfter:
+        - verify
+      workspaces:
+        - name: work
+          workspace: work
+      params:
+        - name: repo-full-name
+          value: $(params.repo-full-name)
+        - name: issue
+          value: $(params.issue)
+        - name: base-branch
+          value: $(params.base-branch)
+      taskSpec:
+        params:
+          - name: repo-full-name
+            type: string
+          - name: issue
+            type: string
+          - name: base-branch
+            type: string
+        workspaces:
+          - name: work
+            mountPath: /workspace
+        volumes:
+          - name: config
+            configMap:
+              name: agent-config
+        steps:
           # Commit, push, PR and issue comment. Mints a fresh token: the agent run may outlast the 1h token lifetime.
           - name: publish
             image: quay.io/pminkows/opencode:latest
             workingDir: /workspace/repo
             volumeMounts:
-              - name: work
-                mountPath: /workspace
               - name: config
                 mountPath: /config
                 readOnly: true
@@ -386,6 +402,15 @@ spec:
               GH_TOKEN="$(bash /config/gh-app-token.sh)"
               export GH_TOKEN
 
+              # A build that stays red after the fix attempts opens a draft pull request
+              DRAFT_FLAG=""
+              if [ -f /workspace/out/verify-failed ]; then DRAFT_FLAG="--draft"; fi
+              # Result of the verify step goes in front of the reply
+              if [ -s /workspace/out/verify-note.md ]; then
+                { cat /workspace/out/verify-note.md; echo; cat /workspace/out/summary.md 2>/dev/null || true; } > /workspace/out/summary.full.md
+                mv /workspace/out/summary.full.md /workspace/out/summary.md
+              fi
+
               git add -A -- . ':(exclude)**/target/**'
               git commit -m "feat: implement issue #${ISSUE_NUMBER}" -m "Refs #${ISSUE_NUMBER}"
               git push origin "$BRANCH"
@@ -394,12 +419,15 @@ spec:
                 --repo "$REPO_FULL_NAME" \
                 --base "$BASE_BRANCH" \
                 --head "$BRANCH" \
+                $DRAFT_FLAG \
                 --title "AI: implement issue #${ISSUE_NUMBER}" \
                 --body "Closes #${ISSUE_NUMBER}")"
               echo "Created PR: $PR_URL"
 
               # Merge automatically once branch protection is satisfied (required review and checks); never fails the pipeline
-              if gh pr merge "$PR_URL" --auto --merge; then
+              if [ -n "$DRAFT_FLAG" ]; then
+                echo "draft pull request (build verification failed); auto-merge not enabled"
+              elif gh pr merge "$PR_URL" --auto --merge; then
                 echo "auto-merge enabled (merges once the required review and checks pass)"
               else
                 echo "auto-merge could not be enabled; merge manually"
@@ -409,3 +437,28 @@ spec:
               if [ -s /workspace/out/summary.md ]; then
                 gh issue comment "$ISSUE_NUMBER" --repo "$REPO_FULL_NAME" --body-file /workspace/out/summary.md
               fi
+  # Runs after the tasks, also when they failed or timed out: tells the issue or pull request that nothing came out of this run
+  finally:
+    - name: report-failure
+      when:
+        - input: $(tasks.status)
+          operator: in
+          values:
+            - Failed
+      taskRef:
+        name: report-failure
+      params:
+        - name: repo-full-name
+          value: $(params.repo-full-name)
+        - name: number
+          value: $(params.issue)
+        - name: target
+          value: issue
+        - name: what
+          value: "No pull request was created from this run."
+        - name: retry-hint
+          value: "To retry, comment `@ai` with an instruction, for example `@ai please try again`."
+        - name: pipelinerun
+          value: $(context.pipelineRun.name)
+        - name: namespace
+          value: $(context.pipelineRun.namespace)
