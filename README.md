@@ -1276,3 +1276,35 @@ usually means a wrong secret.
   `context` limit in the agent ConfigMap. Long issue threads or large repositories still reduce quality.
 - Comments on pull requests that start with `@ai` are not handled by `issue-comment-agent`
   (the trigger skips pull requests). Pull requests are handled by the review triggers.
+
+## 11. Possible next steps
+
+Ideas for features and architecture changes, none of them implemented yet.
+
+- **Reviewer agent.** A second agent reviews the pull request before the human does. Splitting
+  the roles (planner, implementer, reviewer) usually helps more than a bigger model, and the second
+  model in `ai/` (Qwen3 Coder) can take the reviewer role.
+- **Self-healing after CI.** `check_run` or `workflow_run` events with a failure start
+  `pr-comment-agent` automatically, so the loop "pull request, red CI, fix" closes without a human.
+  It needs a limit on the number of automatic attempts per pull request.
+- **Preview environments.** `skaffold` and `kubectl` are already in the agent image. An ephemeral
+  namespace per pull request with end-to-end tests would be a much stronger check than the build
+  alone. It needs a separate service account and RBAC for the agent pods, which is the
+  security-sensitive part.
+- **Plan approval gate.** For larger issues the agent posts the plan and waits for a label or a
+  comment such as `@ai go` before it implements anything. For unclear issues it asks questions
+  instead of guessing. A triage step could also reject or split issues that are too big.
+- **Evaluation set.** A set of reference issues in the showcase repository, with a measured share of
+  runs that end in a green and merged pull request. Without it you cannot tell whether a new model,
+  prompt, skill or `AGENTS.md` rule improves the results or breaks them.
+- **Model routing.** Simple issues go to a cheaper model and hard ones to a stronger one, based on a
+  triage step. An external model could serve as a fallback; a Claude Code variant of the agent
+  image already exists.
+- **Observability.** vLLM metrics (Prometheus), duration and result of every run (Tekton Results)
+  and the share of pull requests merged without changes, in one Grafana dashboard. The last number
+  tells whether the factory actually helps.
+- **Many repositories.** Per-repository settings (base branch, verify command, model) in one place,
+  instead of assuming a single repository and a single stack.
+- **Hardening.** `NetworkPolicy` limiting egress to the model, GitHub and the Maven repositories,
+  `automountServiceAccountToken: false` for the agent pods, image digests instead of `:latest`,
+  a signed skills artifact, and secrets from External Secrets or Vault instead of `oc apply`.
