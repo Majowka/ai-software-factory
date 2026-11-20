@@ -28,6 +28,13 @@ spec:
     - name: skills-artifact
       type: string
       default: quay.io/pminkows/claude-ai-spring-boot:1.3.1
+    # Build and test command run after the agent step. Empty: `mvn -B -ntp verify` when there is a pom.xml, otherwise nothing. `skip` disables it.
+    - name: verify-command
+      type: string
+      default: ""
+    - name: max-fix-attempts
+      type: string
+      default: "3"
   workspaces:
     - name: skills
   tasks:
@@ -129,7 +136,7 @@ spec:
     - name: implement-and-create-pr
       runAfter:
         - fetch-skills
-      timeout: "3h"
+      timeout: "3h30m"
       workspaces:
         - name: skills
           workspace: skills
@@ -146,6 +153,10 @@ spec:
           value: $(params.issue-body)
         - name: base-branch
           value: $(params.base-branch)
+        - name: verify-command
+          value: $(params.verify-command)
+        - name: max-fix-attempts
+          value: $(params.max-fix-attempts)
       taskSpec:
         params:
           - name: repo-url
@@ -159,6 +170,10 @@ spec:
           - name: issue-body
             type: string
           - name: base-branch
+            type: string
+          - name: verify-command
+            type: string
+          - name: max-fix-attempts
             type: string
         workspaces:
           - name: skills
@@ -323,7 +338,7 @@ spec:
               fi
 
               echo "=== Running opencode ==="
-              timeout 3h opencode run "$PROMPT" 2>&1 | tee /workspace/opencode.log \
+              timeout 2h opencode run "$PROMPT" 2>&1 | tee /workspace/opencode.log \
                 || echo "opencode exited with $? (timeout or error); continuing"
 
               if [ -z "$(git status --porcelain -uall -- . ':(exclude)**/target/**')" ]; then
@@ -333,6 +348,37 @@ spec:
 
               # Only sources: never commit build output (target/ is tracked in this repo) or the agent summary
               if [ -f .agent-summary.md ]; then mv .agent-summary.md /workspace/out/summary.md; fi
+
+          # Build and test the result. If the build fails, the agent gets the log and fixes it (see verify.sh in agent-config).
+          # Never fails the step: when the build stays red, publish opens a draft pull request with the build log.
+          - name: verify
+            image: quay.io/pminkows/opencode:latest
+            workingDir: /workspace/repo
+            volumeMounts:
+              - name: work
+                mountPath: /workspace
+              - name: config
+                mountPath: /config
+                readOnly: true
+            computeResources:
+              requests:
+                memory: 1Gi
+                cpu: 500m
+              limits:
+                memory: 3Gi
+                cpu: "2"
+            env:
+              - name: VERIFY_COMMAND
+                value: $(params.verify-command)
+              - name: MAX_FIX_ATTEMPTS
+                value: $(params.max-fix-attempts)
+              - name: HOME
+                value: /workspace/home
+              - name: OPENCODE_CONFIG
+                value: /config/opencode.json
+            script: |
+              #!/usr/bin/env bash
+              exec bash /config/verify.sh
 
           # Commit, push, PR and issue comment. Mints a fresh token: the agent run may outlast the 1h token lifetime.
           - name: publish
@@ -386,6 +432,15 @@ spec:
               GH_TOKEN="$(bash /config/gh-app-token.sh)"
               export GH_TOKEN
 
+              # A build that stays red after the fix attempts opens a draft pull request
+              DRAFT_FLAG=""
+              if [ -f /workspace/out/verify-failed ]; then DRAFT_FLAG="--draft"; fi
+              # Result of the verify step goes in front of the reply
+              if [ -s /workspace/out/verify-note.md ]; then
+                { cat /workspace/out/verify-note.md; echo; cat /workspace/out/summary.md 2>/dev/null || true; } > /workspace/out/summary.full.md
+                mv /workspace/out/summary.full.md /workspace/out/summary.md
+              fi
+
               git add -A -- . ':(exclude)**/target/**'
               git commit -m "feat: implement issue #${ISSUE_NUMBER}" -m "Refs #${ISSUE_NUMBER}"
               git push origin "$BRANCH"
@@ -394,12 +449,15 @@ spec:
                 --repo "$REPO_FULL_NAME" \
                 --base "$BASE_BRANCH" \
                 --head "$BRANCH" \
+                $DRAFT_FLAG \
                 --title "AI: implement issue #${ISSUE_NUMBER}" \
                 --body "Closes #${ISSUE_NUMBER}")"
               echo "Created PR: $PR_URL"
 
               # Merge automatically once branch protection is satisfied (required review and checks); never fails the pipeline
-              if gh pr merge "$PR_URL" --auto --merge; then
+              if [ -n "$DRAFT_FLAG" ]; then
+                echo "draft pull request (build verification failed); auto-merge not enabled"
+              elif gh pr merge "$PR_URL" --auto --merge; then
                 echo "auto-merge enabled (merges once the required review and checks pass)"
               else
                 echo "auto-merge could not be enabled; merge manually"
@@ -409,3 +467,78 @@ spec:
               if [ -s /workspace/out/summary.md ]; then
                 gh issue comment "$ISSUE_NUMBER" --repo "$REPO_FULL_NAME" --body-file /workspace/out/summary.md
               fi
+  # Runs after the tasks, also when they failed or timed out: tells the issue or pull request that nothing came out of this run
+  finally:
+    - name: report-failure
+      when:
+        - input: $(tasks.status)
+          operator: in
+          values:
+            - Failed
+      params:
+        - name: repo-full-name
+          value: $(params.repo-full-name)
+        - name: number
+          value: $(params.issue)
+        - name: pipelinerun
+          value: $(context.pipelineRun.name)
+        - name: namespace
+          value: $(context.pipelineRun.namespace)
+      taskSpec:
+        params:
+          - name: repo-full-name
+            type: string
+          - name: number
+            type: string
+          - name: pipelinerun
+            type: string
+          - name: namespace
+            type: string
+        volumes:
+          - name: config
+            configMap:
+              name: agent-config
+        steps:
+          - name: comment
+            image: quay.io/pminkows/opencode:latest
+            volumeMounts:
+              - name: config
+                mountPath: /config
+                readOnly: true
+            env:
+              - name: GITHUB_APP_ID
+                valueFrom:
+                  secretKeyRef:
+                    name: github-app
+                    key: app-id
+              - name: GITHUB_APP_INSTALLATION_ID
+                valueFrom:
+                  secretKeyRef:
+                    name: github-app
+                    key: installation-id
+              - name: GITHUB_APP_PRIVATE_KEY
+                valueFrom:
+                  secretKeyRef:
+                    name: github-app
+                    key: private-key.pem
+              - name: REPO_FULL_NAME
+                value: $(params.repo-full-name)
+              - name: NUMBER
+                value: $(params.number)
+              - name: PIPELINERUN
+                value: $(params.pipelinerun)
+              - name: PIPELINERUN_NAMESPACE
+                value: $(params.namespace)
+              - name: HOME
+                value: /tmp
+            script: |
+              #!/usr/bin/env bash
+              set -uo pipefail
+
+              GH_TOKEN="$(bash /config/gh-app-token.sh)" || { echo "Could not mint a GitHub token, no comment posted"; exit 0; }
+              export GH_TOKEN
+
+              printf ':x: **The agent run failed.** No pull request was created from this run.\n\nPipeline run `%s` in namespace `%s`. Logs: `tkn pipelinerun logs %s -n %s`\n\nUsual causes: the model endpoint was not available, the run hit its timeout, or the agent produced no changes. To retry, comment `@ai` with an instruction, for example `@ai please try again`.\n' \
+                "$PIPELINERUN" "$PIPELINERUN_NAMESPACE" "$PIPELINERUN" "$PIPELINERUN_NAMESPACE" > /tmp/failure.md
+
+              gh issue comment "$NUMBER" --repo "$REPO_FULL_NAME" --body-file /tmp/failure.md || echo "Could not post the failure comment"

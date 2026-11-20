@@ -5,6 +5,7 @@ metadata:
   namespace: agents
 spec:
   params:
+    - name: event-id
     - name: event-type
     - name: repo-url
     - name: repo-full-name
@@ -19,7 +20,8 @@ spec:
     - apiVersion: tekton.dev/v1
       kind: PipelineRun
       metadata:
-        generateName: pr-comment-agent-
+        # Fixed name: a redelivered webhook cannot start a second run for the same review or review comment
+        name: pr-comment-agent-$(tt.params.event-id)
       spec:
         params:
           - name: event-type
@@ -45,7 +47,9 @@ spec:
         taskRunTemplate:
           serviceAccountName: pipeline
         timeouts:
-          pipeline: 3h0m0s
+          pipeline: 3h45m0s
+          tasks: 3h30m0s
+          finally: 15m0s
         workspaces:
           - name: skills
             volumeClaimTemplate:

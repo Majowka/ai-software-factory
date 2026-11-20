@@ -18,7 +18,8 @@ spec:
     - apiVersion: tekton.dev/v1
       kind: PipelineRun
       metadata:
-        generateName: issue-comment-agent-
+        # Fixed name: a redelivered webhook cannot start a second run for the same comment
+        name: issue-comment-agent-$(tt.params.comment-id)
       spec:
         params:
           - name: event-type
@@ -44,7 +45,9 @@ spec:
         taskRunTemplate:
           serviceAccountName: pipeline
         timeouts:
-          pipeline: 3h0m0s
+          pipeline: 3h45m0s
+          tasks: 3h30m0s
+          finally: 15m0s
         workspaces:
           - name: skills
             volumeClaimTemplate:
