@@ -392,7 +392,7 @@ Skills and subagents are distributed as an OCI artifact: one `tar.gz` with `skil
 `agents/` directories in OpenCode format. The `fetch-skills` task pulls it with `oras`, unpacks it
 to `/skills/opencode`, and the `prepare` step copies it to `~/.config/opencode`.
 
-The pipelines pull `quay.io/pminkows/claude-ai-spring-boot:1.3.1` by default (the
+The pipelines pull `quay.io/pminkows/claude-ai-spring-boot:1.3.2` by default (the
 `skills-artifact` parameter), so there is nothing to publish to get started.
 
 **Only if you want your own skills**, publish them as an artifact and set the `skills-artifact`
@@ -733,7 +733,7 @@ spec:
       default: master
     - name: skills-artifact
       type: string
-      default: quay.io/pminkows/claude-ai-spring-boot:1.3.1
+      default: quay.io/pminkows/claude-ai-spring-boot:1.3.2
     # issue-id and issue-author are also declared; they are only printed
   workspaces:
     - name: skills
@@ -1175,7 +1175,7 @@ failing them. The waiting time counts against the timeout.
 4. **`plan`**: the agent decides whether code changes are needed. If so, it writes a checklist
    (`- [ ] ...`) and posts it as a comment on the issue or pull request. Questions are not planned
    (`issue-agent` always plans, because a new issue is always a task). In `pr-comment-agent`
-   review remarks are not taken blindly: each one is checked against the code and the plan has a
+   review remarks are not taken blindly: both steps load the `review-triage` skill from the skills artifact, each remark is checked against the code and the plan has a
    `Not doing` section with the reasons for rejected or partly accepted points. The `agent` step
    implements only the checklist and its summary says, point by point, what was and was not done.
 5. **`agent`**: OpenCode implements the change against the vLLM endpoint, following the plan and

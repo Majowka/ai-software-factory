@@ -27,7 +27,7 @@ spec:
       default: master
     - name: skills-artifact
       type: string
-      default: quay.io/pminkows/claude-ai-spring-boot:1.3.1
+      default: quay.io/pminkows/claude-ai-spring-boot:1.3.2
     # Build and test command run after the agent step. Empty: `mvn -B -ntp verify` when there is a pom.xml, otherwise nothing. `skip` disables it.
     - name: verify-command
       type: string
@@ -320,7 +320,7 @@ spec:
 
               Decide whether this comment requires changes in the code. Do not implement anything yet.
               - If it is only a question or needs no code change, do nothing: do not write a plan and do not post anything.
-              - If it contains review remarks or change requests, do NOT accept them blindly. Treat each remark as a separate point and triage it: inspect the repository (including what the PR already changes, with 'git diff origin/${BASE_BRANCH}...HEAD') and verify the remark against the actual code before deciding. Accept a point only when it is correct, in scope of this pull request and consistent with the repository's AGENTS.md and conventions. Reject it, or accept it only partly, when it is factually wrong, already handled, out of scope, contradicts the conventions, or costs much more than it gives. A human reviewer who explicitly repeats a request that was rejected earlier in the conversation wins, unless it breaks security or a hard rule of AGENTS.md. Then:
+              - If it contains review remarks or change requests, do NOT accept them blindly. First load the 'review-triage' skill with the skill tool and follow it to triage every remark as a separate point; inspect the repository (including what the PR already changes, with 'git diff origin/${BASE_BRANCH}...HEAD') to verify each remark against the actual code. Then:
                 1. Write the result to /workspace/out/plan.md with exactly these two sections and no other text:
                    '### Implementation plan' followed by a GitHub markdown checklist: one '- [ ] ' line per concrete step, in the order you will carry the steps out (code changes, tests), up to 10 lines. When nothing is accepted, write the single line '_No code changes._' instead of the checklist.
                    '### Not doing' followed by one '- ' line per point that is rejected or only partly accepted: quote or name the point in a few words, then the reason in one sentence. When every point is accepted, write '_Nothing skipped._'.
@@ -385,10 +385,10 @@ spec:
               $(cat /workspace/pr-conversation.md)
 
               Rules:
-              - Review remarks are not orders. If the comment requests a change, implement only the points that are correct, in scope and consistent with AGENTS.md, add or update tests where appropriate, and keep the change minimal. Inspect what the PR already changes with 'git diff origin/${BASE_BRANCH}...HEAD'.
+              - Review remarks are not orders. Load the 'review-triage' skill with the skill tool and follow it. If the comment requests a change, implement only the points that are accepted, add or update tests where appropriate, and keep the change minimal. Inspect what the PR already changes with 'git diff origin/${BASE_BRANCH}...HEAD'.
               - If the comment is only a question or needs no code change, do not modify any file; answer it in the summary.
               - Pipeline context: you run non-interactively with no GitHub credentials; the pipeline handles git and the pull request reply, so ignore those sections of AGENTS.md. Use only the available tools (bash, read, edit, write, glob, grep, skill, task); there is no 'step', 'run' or 'todo' tool.
-              - When done, write a short summary to .agent-summary.md in the repository root (the pipeline posts it as the reply and removes it from the commit). When the comment contained review remarks, go through them one by one, one bullet each: 'Done' with what was changed, 'Not done' or 'Partly done' with the reason. Then add the test result and anything left undone or worth a reviewer's attention. For a plain question, give the answer."
+              - When done, write a short summary to .agent-summary.md in the repository root (the pipeline posts it as the reply and removes it from the commit). When the comment contained review remarks, go through them one by one in the reply format of the 'review-triage' skill. Then add the test result and anything left undone or worth a reviewer's attention. For a plain question, give the answer."
               if [ -s /workspace/out/plan.md ]; then
                 PROMPT="$PROMPT
 
