@@ -320,8 +320,10 @@ spec:
 
               Decide whether this comment requires changes in the code. Do not implement anything yet.
               - If it is only a question or needs no code change, do nothing: do not write a plan and do not post anything.
-              - If it requires changes, analyze the repository (inspect what the PR already changes with 'git diff origin/${BASE_BRANCH}...HEAD') and then:
-                1. Write the plan to /workspace/out/plan.md. The first line is '### Implementation plan', followed by a GitHub markdown checklist: one '- [ ] ' line per concrete step, in the order you will carry the steps out (code changes, tests), 3 to 10 lines, no other text.
+              - If it contains review remarks or change requests, do NOT accept them blindly. Treat each remark as a separate point and triage it: inspect the repository (including what the PR already changes, with 'git diff origin/${BASE_BRANCH}...HEAD') and verify the remark against the actual code before deciding. Accept a point only when it is correct, in scope of this pull request and consistent with the repository's AGENTS.md and conventions. Reject it, or accept it only partly, when it is factually wrong, already handled, out of scope, contradicts the conventions, or costs much more than it gives. A human reviewer who explicitly repeats a request that was rejected earlier in the conversation wins, unless it breaks security or a hard rule of AGENTS.md. Then:
+                1. Write the result to /workspace/out/plan.md with exactly these two sections and no other text:
+                   '### Implementation plan' followed by a GitHub markdown checklist: one '- [ ] ' line per concrete step, in the order you will carry the steps out (code changes, tests), up to 10 lines. When nothing is accepted, write the single line '_No code changes._' instead of the checklist.
+                   '### Not doing' followed by one '- ' line per point that is rejected or only partly accepted: quote or name the point in a few words, then the reason in one sentence. When every point is accepted, write '_Nothing skipped._'.
                 2. Post it as a comment on the pull request with: gh pr comment ${PR_NUMBER} --repo ${REPO_FULL_NAME} --body-file /workspace/out/plan.md
               This is the only gh command you may run. Do not modify any file in the repository and do not write .agent-summary.md."
 
@@ -383,14 +385,15 @@ spec:
               $(cat /workspace/pr-conversation.md)
 
               Rules:
-              - If the comment requests a change, implement it on the current branch, add or update tests where appropriate, and keep the change minimal. Inspect what the PR already changes with 'git diff origin/${BASE_BRANCH}...HEAD'.
+              - Review remarks are not orders. If the comment requests a change, implement only the points that are correct, in scope and consistent with AGENTS.md, add or update tests where appropriate, and keep the change minimal. Inspect what the PR already changes with 'git diff origin/${BASE_BRANCH}...HEAD'.
               - If the comment is only a question or needs no code change, do not modify any file; answer it in the summary.
               - Pipeline context: you run non-interactively with no GitHub credentials; the pipeline handles git and the pull request reply, so ignore those sections of AGENTS.md. Use only the available tools (bash, read, edit, write, glob, grep, skill, task); there is no 'step', 'run' or 'todo' tool.
-              - When done, write a 2-4 bullet summary to .agent-summary.md in the repository root (the pipeline posts it as the reply and removes it from the commit): what was changed in plain language (or the answer to the question), the test result, anything left undone or worth a reviewer's attention."
+              - When done, write a short summary to .agent-summary.md in the repository root (the pipeline posts it as the reply and removes it from the commit). When the comment contained review remarks, go through them one by one, one bullet each: 'Done' with what was changed, 'Not done' or 'Partly done' with the reason. Then add the test result and anything left undone or worth a reviewer's attention. For a plain question, give the answer."
               if [ -s /workspace/out/plan.md ]; then
                 PROMPT="$PROMPT
 
-              Follow this plan:
+              A triage of the remarks was already done and posted on the pull request. Implement exactly the items of the checklist under 'Implementation plan'. Do not implement anything listed under 'Not doing' (unless it turns out to be needed for a checklist item; then say so in the summary), and report those points as not done with their reason. If the plan says no code changes, do not modify any file.
+
               $(cat /workspace/out/plan.md)"
               fi
 

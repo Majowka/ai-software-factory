@@ -1174,7 +1174,10 @@ failing them. The waiting time counts against the timeout.
    that holds the GitHub App private key.
 4. **`plan`**: the agent decides whether code changes are needed. If so, it writes a checklist
    (`- [ ] ...`) and posts it as a comment on the issue or pull request. Questions are not planned
-   (`issue-agent` always plans, because a new issue is always a task).
+   (`issue-agent` always plans, because a new issue is always a task). In `pr-comment-agent`
+   review remarks are not taken blindly: each one is checked against the code and the plan has a
+   `Not doing` section with the reasons for rejected or partly accepted points. The `agent` step
+   implements only the checklist and its summary says, point by point, what was and was not done.
 5. **`agent`**: OpenCode implements the change against the vLLM endpoint, following the plan and
    the repository's `AGENTS.md`. It writes a short summary to `.agent-summary.md`. It has 3 hours.
 6. **`verify`** (its own task): builds and tests the result (the script is in the `verify-build` Task). If the
