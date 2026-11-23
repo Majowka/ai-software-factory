@@ -1,0 +1,229 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: requirements-agent
+  namespace: agents
+spec:
+  description: >-
+    Breaks a requirements issue (label `requirements`) into task issues. Started by the requirements-scan CronJob, never by a webhook.
+    mode `analyze`: the requirements are new or were edited. mode `review`: every task is done, check the code for gaps.
+    mode `release`: no agent, only creates the tasks whose dependencies became done.
+  params:
+    - name: repo-url
+      type: string
+    - name: repo-full-name
+      type: string
+    - name: issue
+      type: string
+    - name: base-branch
+      type: string
+      default: master
+    - name: mode
+      type: string
+    # Open task issues at a time, so a big requirement does not start dozens of agent runs at once
+    - name: max-open
+      type: string
+      default: "3"
+  workspaces:
+    - name: work
+  tasks:
+    - name: analyze
+      workspaces:
+        - name: work
+          workspace: work
+      params:
+        - name: repo-url
+          value: $(params.repo-url)
+        - name: repo-full-name
+          value: $(params.repo-full-name)
+        - name: issue
+          value: $(params.issue)
+        - name: base-branch
+          value: $(params.base-branch)
+        - name: mode
+          value: $(params.mode)
+      taskSpec:
+        params:
+          - name: repo-url
+            type: string
+          - name: repo-full-name
+            type: string
+          - name: issue
+            type: string
+          - name: base-branch
+            type: string
+          - name: mode
+            type: string
+        workspaces:
+          - name: work
+            mountPath: /workspace
+        volumes:
+          - name: config
+            configMap:
+              name: agent-config
+          - name: requirements-skill
+            configMap:
+              name: requirements-skill
+        steps:
+          # Clone and context for the agent. Holds the GitHub App key, the agent step does not. Nothing to do in `release` mode.
+          - name: prepare
+            image: quay.io/pminkows/opencode:latest
+            workingDir: /workspace
+            volumeMounts:
+              - name: config
+                mountPath: /config
+                readOnly: true
+              - name: requirements-skill
+                mountPath: /requirements-skill
+                readOnly: true
+            env:
+              - name: GITHUB_APP_ID
+                valueFrom:
+                  secretKeyRef:
+                    name: github-app
+                    key: app-id
+              - name: GITHUB_APP_INSTALLATION_ID
+                valueFrom:
+                  secretKeyRef:
+                    name: github-app
+                    key: installation-id
+              - name: GITHUB_APP_PRIVATE_KEY
+                valueFrom:
+                  secretKeyRef:
+                    name: github-app
+                    key: private-key.pem
+              - name: REPO_URL
+                value: $(params.repo-url)
+              - name: REPO_FULL_NAME
+                value: $(params.repo-full-name)
+              - name: ISSUE_NUMBER
+                value: $(params.issue)
+              - name: BASE_BRANCH
+                value: $(params.base-branch)
+              - name: MODE
+                value: $(params.mode)
+              - name: HOME
+                value: /workspace/home
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+              if [ "$MODE" = release ]; then echo "release mode: no analysis"; exit 0; fi
+              source /config/requirements-lib.sh
+
+              mkdir -p "$HOME/.config/opencode/skills/requirements-breakdown" /workspace/out
+              cp /requirements-skill/SKILL.md "$HOME/.config/opencode/skills/requirements-breakdown/SKILL.md"
+
+              GH_TOKEN="$(bash /config/gh-app-token.sh)"
+              export GH_TOKEN
+              gh auth setup-git
+
+              issue="$(gh issue view "$ISSUE_NUMBER" --repo "$REPO_FULL_NAME" --json title,body)"
+              title="$(jq -r .title <<<"$issue")"
+              body="$(jq -r '.body // ""' <<<"$issue")"
+              # The hash goes into the state comment, so a later edit of the issue starts a new analysis
+              req_hash "$title" "$body" > /workspace/out/hash
+              printf '# Requirements issue #%s: %s\n\n%s\n' "$ISSUE_NUMBER" "$title" "$body" > /workspace/issue.txt
+
+              # Tasks planned or created so far, with their status
+              state="$(req_state "$ISSUE_NUMBER")"
+              children="$(req_children "$ISSUE_NUMBER")"
+              jq -n --argjson s "$state" --argjson c "$children" '
+                [($s.state.plan // [])[] | . as $t | ($c | map(select(.id == $t.id)) | first) as $m
+                  | {id, title, depends_on, status: (if $m == null then "pending" elif $m.state == "CLOSED" then "done" else "in progress" end)}]
+              ' > /workspace/out/existing-tasks.json
+
+              git clone --branch "$BASE_BRANCH" -- "$REPO_URL" /workspace/repo
+
+          # Analysis. No GitHub credentials in this step and gh is denied in opencode-requirements.json.
+          - name: analyze
+            image: quay.io/pminkows/opencode:latest
+            workingDir: /workspace
+            volumeMounts:
+              - name: config
+                mountPath: /config
+                readOnly: true
+            computeResources:
+              requests:
+                memory: 1Gi
+                cpu: 500m
+              limits:
+                memory: 2Gi
+                cpu: "2"
+            env:
+              - name: MODE
+                value: $(params.mode)
+              - name: HOME
+                value: /workspace/home
+              - name: OPENCODE_CONFIG
+                value: /config/opencode-requirements.json
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+              if [ "$MODE" = release ]; then exit 0; fi
+              cd /workspace/repo
+
+              PROMPT="Break the requirements below into implementation tasks for coding agents. Use the requirements-breakdown skill and follow the repository's AGENTS.md.
+
+              Compare the requirements with the current code in this repository: plan only what is missing. Tasks already created or planned earlier are in /workspace/out/existing-tasks.json: do not repeat them, but you may use their ids in depends_on.
+
+              Pipeline context: you run non-interactively with no GitHub credentials. Write the result to /workspace/out/issues.json as described in the skill ([] when nothing is missing). Do not modify any file in the repository and do not run gh.
+
+              $(cat /workspace/issue.txt)
+
+              Existing tasks:
+              $(cat /workspace/out/existing-tasks.json)"
+
+              echo "=== Analyzing requirements ==="
+              timeout 40m opencode run "$PROMPT" 2>&1 | tee /workspace/opencode.log \
+                || echo "opencode exited with $? (timeout or error)"
+
+              # Analysis must not leave changes behind
+              git reset -q --hard
+              git clean -qfd
+
+              if ! jq -e 'type == "array"' /workspace/out/issues.json > /dev/null 2>&1; then
+                echo "The agent did not write a JSON array to /workspace/out/issues.json"
+                exit 1
+              fi
+    - name: create-issues
+      runAfter:
+        - analyze
+      taskRef:
+        name: create-issues
+      workspaces:
+        - name: work
+          workspace: work
+      params:
+        - name: repo-full-name
+          value: $(params.repo-full-name)
+        - name: issue
+          value: $(params.issue)
+        - name: mode
+          value: $(params.mode)
+        - name: max-open
+          value: $(params.max-open)
+  # Runs after the tasks, also when they failed or timed out: tells the requirements issue that nothing came out of this run
+  finally:
+    - name: report-failure
+      when:
+        - input: $(tasks.status)
+          operator: in
+          values:
+            - Failed
+      taskRef:
+        name: report-failure
+      params:
+        - name: repo-full-name
+          value: $(params.repo-full-name)
+        - name: number
+          value: $(params.issue)
+        - name: target
+          value: issue
+        - name: what
+          value: "No tasks were created from this run."
+        - name: retry-hint
+          value: "The scan does not retry the same state on its own: delete this PipelineRun to try again, or edit the requirements issue to start a new analysis."
+        - name: pipelinerun
+          value: $(context.pipelineRun.name)
+        - name: namespace
+          value: $(context.pipelineRun.namespace)

@@ -23,8 +23,8 @@ spec:
             name: github
         - params:
             - name: filter
-              value: body.action == 'opened' && body.issue.author_association in ['OWNER',
-                'MEMBER']
+              value: body.action == 'opened' && !body.issue.labels.exists(l, l.name
+                in ['manual', 'requirements'])
           ref:
             kind: ClusterInterceptor
             name: cel

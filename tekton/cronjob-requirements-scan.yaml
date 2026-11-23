@@ -1,0 +1,126 @@
+# Every 30 minutes: looks at the open issues labeled `requirements` and starts a requirements-agent PipelineRun for each one
+# that needs work. No AI here, only the decision. The PipelineRun name is derived from the state of the issue, so the same
+# state never starts a second run (a failed run is not retried until it is deleted or the state changes).
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: requirements-scan
+  namespace: agents
+spec:
+  schedule: "*/30 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 600
+      template:
+        spec:
+          serviceAccountName: requirements-scheduler
+          restartPolicy: Never
+          volumes:
+            - name: config
+              configMap:
+                name: agent-config
+          containers:
+            - name: scan
+              image: quay.io/pminkows/opencode:latest
+              volumeMounts:
+                - name: config
+                  mountPath: /config
+                  readOnly: true
+              env:
+                - name: GITHUB_APP_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: github-app
+                      key: app-id
+                - name: GITHUB_APP_INSTALLATION_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: github-app
+                      key: installation-id
+                - name: GITHUB_APP_PRIVATE_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: github-app
+                      key: private-key.pem
+                # Repositories to watch, space separated (owner/name)
+                - name: REPOS
+                  value: piomin/ai-software-factory-showcase
+                # Open task issues allowed at a time per requirements issue
+                - name: MAX_OPEN
+                  value: "3"
+                - name: HOME
+                  value: /tmp
+              command: [bash, -c]
+              args:
+              - |
+                #!/usr/bin/env bash
+                set -euo pipefail
+                source /config/requirements-lib.sh
+
+                GH_TOKEN="$(bash /config/gh-app-token.sh)"
+                export GH_TOKEN
+
+                start_run() {
+                  local repo="$1" base="$2" n="$3" mode="$4" key="$5" name
+                  name="requirements-${n}-${mode}-${key}"
+                  jq -n --arg name "$name" --arg repo "$repo" --arg base "$base" --arg n "$n" --arg mode "$mode" --arg max "$MAX_OPEN" '{
+                    apiVersion: "tekton.dev/v1", kind: "PipelineRun",
+                    metadata: {name: $name, namespace: "agents"},
+                    spec: {
+                      pipelineRef: {name: "requirements-agent"},
+                      params: [
+                        {name: "repo-url", value: ("https://github.com/" + $repo + ".git")},
+                        {name: "repo-full-name", value: $repo},
+                        {name: "issue", value: $n},
+                        {name: "base-branch", value: $base},
+                        {name: "mode", value: $mode},
+                        {name: "max-open", value: $max}
+                      ],
+                      timeouts: {pipeline: "1h15m0s", tasks: "1h0m0s", finally: "15m0s"},
+                      workspaces: [{name: "work", volumeClaimTemplate: {spec: {accessModes: ["ReadWriteOnce"], resources: {requests: {storage: "5Gi"}}}}}]
+                    }}' | { out="$(kubectl create -f - 2>&1)" && echo "$out" || {
+                      case "$out" in *AlreadyExists*) echo "already started: $name" ;; *) echo "$out" >&2; return 1 ;; esac; }; }
+                }
+
+                scan_issue() {
+                  local repo="$1" base="$2" issue="$3" n hash state children open_children closed_count created ready pending mode
+                  n="$(jq -r .number <<<"$issue")"
+                  hash="$(req_hash "$(jq -r .title <<<"$issue")" "$(jq -r '.body // ""' <<<"$issue")")"
+                  state="$(req_state "$n" | jq -c .state)"
+                  children="$(req_children "$n")"
+                  open_children="$(jq '[.[] | select(.state == "OPEN")] | length' <<<"$children")"
+                  closed_count="$(jq '[.[] | select(.state == "CLOSED")] | length' <<<"$children")"
+                  created="$(jq length <<<"$children")"
+                  pending="$(jq --argjson c "$children" '($c | map(.id)) as $created | [(.plan // [])[] | select(.id as $i | $created | index($i) | not)] | length' <<<"$state")"
+                  ready="$(jq --argjson c "$children" '
+                    ($c | map(.id)) as $created | ($c | map(select(.state == "CLOSED") | .id)) as $closed
+                    | [(.plan // [])[] | select(.id as $i | $created | index($i) | not)
+                                       | select(.depends_on | all(. as $d | $closed | index($d) != null))] | length' <<<"$state")"
+
+                  if [ "$(jq -r '.hash // ""' <<<"$state")" != "$hash" ]; then
+                    mode=analyze
+                  elif [ "$ready" -gt 0 ] && [ "$open_children" -lt "$MAX_OPEN" ]; then
+                    mode=release
+                  elif [ "$pending" -eq 0 ] && [ "$open_children" -eq 0 ] && [ "$(jq '.reviewed // -1' <<<"$state")" -ne "$closed_count" ]; then
+                    mode=review
+                  else
+                    echo "#${n}: nothing to do (${open_children} open, ${pending} waiting)"
+                    return 0
+                  fi
+                  echo "#${n}: ${mode}"
+                  start_run "$repo" "$base" "$n" "$mode" "$(printf '%s|%s|%s|%s|%s' "$mode" "$hash" "$pending" "$created" "$closed_count" | sha256sum | cut -c1-8)"
+                }
+
+                for repo in $REPOS; do
+                  export REPO_FULL_NAME="$repo"
+                  base="$(gh repo view "$repo" --json defaultBranchRef --jq .defaultBranchRef.name)"
+                  echo "=== $repo ($base) ==="
+                  while read -r issue; do
+                    [ -n "$issue" ] || continue
+                    scan_issue "$repo" "$base" "$issue" || echo "scan of #$(jq -r .number <<<"$issue") failed"
+                  done < <(gh issue list --repo "$repo" --label requirements --state open --limit 50 --json number,title,body | jq -c '.[]')
+                done
