@@ -36,8 +36,9 @@ OpenShift Route ──► EventListener (Tekton Triggers)
 | `issue-comment-agent` | an issue comment starting with `@ai` | Treats the comment as an instruction. A question gets an answer; a change request gets a plan, a branch and a pull request. |
 | `pr-comment-agent` | a pull request review or review comment | Reads the whole PR conversation, pushes the requested change to the PR branch (or answers a question) and replies on the PR. |
 
-Every trigger only accepts events from users whose `author_association` is `OWNER` or `MEMBER`
-and ignores bots. Forks and closed issues or pull requests are skipped.
+New issues are accepted from any author, except those labeled `manual` or `requirements`.
+Comment and review triggers only accept events from users whose `author_association` is `OWNER`
+or `MEMBER` and ignore bots. Forks and closed issues or pull requests are skipped.
 
 ## Why these technologies
 
@@ -88,13 +89,16 @@ drawings, not the official logos.
 ├── agents/                              the agent: images and shared configuration
 │   ├── Dockerfile.opencode              reference Dockerfile of the agent image (the pipelines pull it from Quay)
 │   ├── Dockerfile                       same tooling with Claude Code (optional, not used by the pipelines)
-│   └── configmap-agent-config.yaml      OpenCode config (model, permissions) and the GitHub App token script
+│   ├── configmap-agent-config.yaml      OpenCode config (model, permissions), the GitHub App token script and the requirements helpers
+│   └── skills/                          skills delivered as a ConfigMap (requirements-breakdown), built with `oc apply -k agents/skills`
 ├── tekton/                              pipelines and everything that triggers them
 │   ├── pipeline-*.yaml                  the three Tekton pipelines
 │   ├── triggerbinding-*.yaml            map webhook payloads to pipeline parameters
 │   ├── triggertemplate-*.yaml           create the PipelineRuns
 │   ├── eventlistener-new-issue.yaml     the single EventListener with four triggers and their filters
-│   ├── task-*.yaml                      shared tasks: fetch-skills, verify-build, report-failure
+│   ├── task-*.yaml                      shared tasks: fetch-skills, verify-build, report-failure, create-issues
+│   ├── pipeline-requirements-agent.yaml, cronjob-requirements-scan.yaml, role/rolebinding/serviceaccount-requirements-scheduler.yaml
+│   │                                    the requirements agent and the CronJob that starts it (section 6.9)
 │   ├── resourcequota-agents.yaml        optional cap on parallel runs
 │   ├── route-new-issue.yaml             public HTTPS endpoint for the GitHub webhook
 │   └── serviceaccount-*.yaml, rolebinding-*.yaml   service account and RBAC for the EventListener
@@ -1004,7 +1008,7 @@ spec:
             - name: filter
               value: >-
                 body.action == 'opened'
-                && body.issue.author_association in ['OWNER', 'MEMBER']
+                && !body.issue.labels.exists(l, l.name in ['manual', 'requirements'])
       bindings:
         - kind: TriggerBinding
           ref: new-issue
@@ -1143,7 +1147,7 @@ The `new-issue` EventListener has four triggers. Each verifies the webhook signa
 
 | Trigger | GitHub event | CEL filter (all conditions) | Template, pipeline |
 |---|---|---|---|
-| `new-issue` | `issues` | action `opened`, author is OWNER or MEMBER | `new-issue`, `issue-agent` |
+| `new-issue` | `issues` | action `opened`, any author, issue **without** the `manual` or `requirements` label | `new-issue`, `issue-agent` |
 | `issue-comment` | `issue_comment` | action `created`, issue open, **not a pull request**, not a bot, author OWNER or MEMBER, **body starts with `@ai`** | `issue-comment`, `issue-comment-agent` |
 | `pr-review-comment` | `pull_request_review_comment` | action `created`, PR open, not a bot, author OWNER or MEMBER | `pr-comment`, `pr-comment-agent` |
 | `pr-review` | `pull_request_review` | action `submitted`, PR open, not a bot, author OWNER or MEMBER, non-empty body | `pr-comment`, `pr-comment-agent` |
@@ -1203,11 +1207,50 @@ failing them. The waiting time counts against the timeout.
   `gh issue comment` or `gh pr comment` (`opencode-plan.json`).
 - A fresh token is minted in `publish`, because an agent run can exceed the one-hour token
   lifetime.
-- Only `OWNER` and `MEMBER` accounts can trigger runs, bot events are ignored, and
-  pull requests from forks are rejected.
+- New issues from any author start a run. Only `OWNER` and `MEMBER` accounts can trigger the
+  comment and review flows, bot events are ignored there, and pull requests from forks are
+  rejected. Use this setup only on private repositories or where issue creation is restricted.
 - Issue and comment text is untrusted input that reaches the model. The agent runs with a broad
   `bash` permission inside its pod, so keep the pods free of cluster credentials, and consider a
   `NetworkPolicy` that limits egress to the model, GitHub and your Maven repositories.
+
+### 6.9 Requirements agent (issues with the `requirements` label)
+
+A requirements issue is turned into task issues by a scheduled scan, not by a webhook. The task issues then
+run through the normal `issue-agent` flow. Nothing is stored outside GitHub.
+
+```
+CronJob requirements-scan (every 30 min, no AI)
+   for each open issue labeled `requirements`:
+      edited or never analyzed ........ analyze  (agent compares requirements and code, plans the missing tasks)
+      a task became ready ............. release  (no agent, creates the task issues whose dependencies are done)
+      every task done, not reviewed ... review   (agent looks for gaps; nothing missing: the issue is closed)
+   └─► PipelineRun requirements-agent:  analyze (prepare + agent) ─► create-issues ─► finally report-failure
+```
+
+- **State** is a comment of the bot on the requirements issue: a table with the status of every task, plus the plan
+  (task text and dependencies) in a hidden marker together with a hash of the requirements text. Task issues carry the
+  label `req-<number>` and a marker `<!-- requirements:<number>:<task id> -->`.
+- **Order.** The agent writes tasks with `depends_on`. `create-issues` only creates a task when every dependency is
+  closed (so the agent starts from a `master` that contains the result), and never more than `max-open` (default 3) task
+  issues open at a time. Task issues are not labeled `manual`, so `new-issue` starts an agent for each of them.
+- **No repeated analysis.** The PipelineRun name is derived from the state (mode, hash, task counts), so the same state
+  never starts a second run. A failed run is therefore not retried by itself: delete the PipelineRun, or edit the
+  requirements issue. The agent only plans what is missing: tasks already created are passed to it and are not repeated.
+- **Skill.** `agents/skills/requirements/SKILL.md` is mounted from the ConfigMap `requirements-skill` and copied to
+  `~/.config/opencode/skills` by the `prepare` step. The agent runs with `opencode-requirements.json` (no `gh`) and
+  has no GitHub credentials; only `create-issues` holds the App key and validates `issues.json` (schema, unique ids,
+  known dependencies, no cycles, at most 15 tasks) before anything is created.
+- **Limits.** Editing a requirement adds tasks but does not change tasks that already exist. The state comment must
+  stay under the 65536-character comment limit.
+
+```bash
+oc apply -f agents/configmap-agent-config.yaml
+oc apply -k agents/skills
+oc apply -f tekton/task-create-issues.yaml -f tekton/pipeline-requirements-agent.yaml
+oc apply -f tekton/serviceaccount-requirements-scheduler.yaml -f tekton/role-requirements-scheduler.yaml -f tekton/rolebinding-requirements-scheduler.yaml
+oc apply -f tekton/cronjob-requirements-scan.yaml   # set REPOS first
+```
 
 ## 7. Connect GitHub to the cluster
 

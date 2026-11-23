@@ -57,6 +57,67 @@ data:
         }
       }
     }
+  # Helpers shared by the requirements scan (CronJob) and the requirements-agent pipeline. Source it; it needs GH_TOKEN and REPO_FULL_NAME.
+  requirements-lib.sh: |
+    # sha256 of the requirements text: a different value means the issue was edited
+    req_hash() { printf '%s\n%s' "$1" "$2" | sha256sum | cut -d' ' -f1; }
+
+    # State of requirements issue $1 as {comment_id, state}. It lives in a comment of the bot, state is {} when there is none.
+    req_state() {
+      local comment encoded
+      comment="$(gh api --paginate "repos/${REPO_FULL_NAME}/issues/$1/comments" \
+        --jq '.[] | select(.user.type == "Bot" and (.body | contains("<!-- requirements-state:"))) | {id, body}' | jq -s 'last // empty')"
+      if [ -z "$comment" ]; then echo '{"comment_id":null,"state":{}}'; return; fi
+      encoded="$(jq -r .body <<<"$comment" | sed -n 's|.*<!-- requirements-state:\([A-Za-z0-9+/=]*\) -->.*|\1|p' | head -n1)"
+      jq -n --argjson id "$(jq .id <<<"$comment")" --argjson state "$(printf '%s' "$encoded" | base64 -d | gunzip)" '{comment_id: $id, state: $state}'
+    }
+
+    # Tasks already created for requirements issue $1 (label req-<n>, marker in the body): [{id, number, title, state}], state is OPEN or CLOSED
+    req_children() {
+      gh issue list --repo "$REPO_FULL_NAME" --label "req-$1" --state all --limit 200 --json number,title,state,body \
+        | jq --arg n "$1" '[.[] | (.body | capture("<!-- requirements:" + $n + ":(?<id>[a-z0-9-]+) -->")?) as $m | select($m) | {id: $m.id, number, title, state}]'
+    }
+  # Used by the requirements-agent analyze step: the agent only reads the repository and writes /workspace/out/issues.json, no gh at all.
+  opencode-requirements.json: |
+    {
+      "$schema": "https://opencode.ai/config.json",
+      "model": "qwen38-flash/qwen38_flash",
+      "permission": {
+        "edit": "allow",
+        "skill": "allow",
+        "task": "allow",
+        "webfetch": "deny",
+        "external_directory": "allow",
+        "bash": {
+          "*": "allow",
+          "git commit*": "deny",
+          "git push*": "deny",
+          "gh *": "deny"
+        }
+      },
+      "tools": {
+        "todowrite": false
+      },
+      "provider": {
+        "qwen38-flash": {
+          "npm": "@ai-sdk/openai-compatible",
+          "name": "Qwen3.8 Flash",
+          "options": {
+            "baseURL": "http://qwen38-flash.ai.svc.cluster.local:8000/v1",
+            "apiKey": "none"
+          },
+          "models": {
+            "qwen38_flash": {
+              "name": "Qwen3.8 Flash",
+              "limit": {
+                "context": 131072,
+                "output": 8192
+              }
+            }
+          }
+        }
+      }
+    }
   # Used by the plan steps only: same as opencode.json, but the agent may post its plan with `gh issue comment` / `gh pr comment`.
   opencode-plan.json: |
     {

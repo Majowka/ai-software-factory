@@ -1,0 +1,10 @@
+# Builds the requirements-skill ConfigMap from the SKILL.md file: oc apply -k agents/skills
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: agents
+generatorOptions:
+  disableNameSuffixHash: true
+configMapGenerator:
+  - name: requirements-skill
+    files:
+      - SKILL.md=requirements/SKILL.md

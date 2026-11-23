@@ -1,0 +1,160 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: create-issues
+  namespace: agents
+spec:
+  description: >-
+    Validates the task list written by the requirements agent, adds it to the plan kept in the state comment of the
+    requirements issue and creates the issues whose dependencies are already done (at most max-open open at a time).
+    Closes the requirements issue when nothing is missing and every task is done.
+  params:
+    - name: repo-full-name
+      type: string
+    - name: issue
+      type: string
+      description: Number of the requirements issue.
+    - name: mode
+      type: string
+      description: "`analyze` and `review` read /workspace/out/issues.json, `release` only creates tasks that became ready."
+    - name: max-open
+      type: string
+      default: "3"
+  workspaces:
+    - name: work
+      mountPath: /workspace
+  volumes:
+    - name: config
+      configMap:
+        name: agent-config
+  steps:
+    - name: create
+      image: quay.io/pminkows/opencode:latest
+      volumeMounts:
+        - name: config
+          mountPath: /config
+          readOnly: true
+      env:
+        - name: GITHUB_APP_ID
+          valueFrom:
+            secretKeyRef:
+              name: github-app
+              key: app-id
+        - name: GITHUB_APP_INSTALLATION_ID
+          valueFrom:
+            secretKeyRef:
+              name: github-app
+              key: installation-id
+        - name: GITHUB_APP_PRIVATE_KEY
+          valueFrom:
+            secretKeyRef:
+              name: github-app
+              key: private-key.pem
+        - name: REPO_FULL_NAME
+          value: $(params.repo-full-name)
+        - name: ISSUE_NUMBER
+          value: $(params.issue)
+        - name: MODE
+          value: $(params.mode)
+        - name: MAX_OPEN
+          value: $(params.max-open)
+        - name: HOME
+          value: /tmp
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        source /config/requirements-lib.sh
+
+        GH_TOKEN="$(bash /config/gh-app-token.sh)"
+        export GH_TOKEN
+
+        st="$(req_state "$ISSUE_NUMBER")"
+        comment_id="$(jq .comment_id <<<"$st")"
+        state="$(jq -c .state <<<"$st")"
+        old_plan="$(jq -c '.plan // []' <<<"$state")"
+        children="$(req_children "$ISSUE_NUMBER")"
+
+        if [ "$MODE" = release ]; then
+          new='[]'
+          hash="$(jq -r '.hash // ""' <<<"$state")"
+          reviewed="$(jq '.reviewed // -1' <<<"$state")"
+        else
+          # Only these fields are taken from the agent output
+          new="$(jq -c 'map({id, title, body, depends_on: (.depends_on // [])})' /workspace/out/issues.json)"
+          hash="$(cat /workspace/out/hash)"
+          reviewed="$(jq '[.[] | select(.state == "CLOSED")] | length' <<<"$children")"
+        fi
+
+        # Schema, unique ids, known dependencies and no cycles (repeatedly drop tasks whose dependencies are all gone)
+        jq -e --argjson old "$old_plan" '
+          (map(.id) + ($old | map(.id))) as $ids
+          | length <= 15
+          and all(.[]; (.id | test("^[a-z0-9][a-z0-9-]{0,39}$"))
+            and (.title | length > 0 and length <= 120)
+            and (.body | length > 0)
+            and (.depends_on | all(.[]; type == "string")))
+          and ($ids | length) == ($ids | unique | length)
+          and all(.[]; .depends_on | all(. as $d | $ids | index($d) != null))
+          and (($old + .) as $p
+            | reduce range(0; $p | length) as $_ ($p; (map(.id)) as $left | map(select(.depends_on | any(. as $d | $left | index($d) != null))))
+            | length == 0)
+        ' <<<"$new" > /dev/null \
+          || { echo "issues.json is not a valid task list: schema, duplicate id, unknown dependency or dependency cycle"; exit 1; }
+
+        plan="$(jq -nc --argjson o "$old_plan" --argjson n "$new" '$o + $n')"
+
+        # Plan and status table in one comment of the bot; the state itself is a gzip+base64 comment marker
+        write_state() {
+          local encoded rows
+          encoded="$(jq -nc --arg hash "$hash" --argjson reviewed "$reviewed" --argjson plan "$plan" '{hash: $hash, reviewed: $reviewed, plan: $plan}' | gzip -9 | base64 | tr -d '\n')"
+          rows="$(jq -r --argjson c "$children" '.[] | . as $t | ($c | map(select(.id == $t.id)) | first) as $m
+            | "| \($t.title | gsub("\\|"; "/")) | \(if $m then "#\($m.number)" else "-" end) | \(if $m == null then "waiting for dependencies" elif $m.state == "CLOSED" then "done" else "in progress" end) |"' <<<"$plan")"
+          printf '### Task breakdown\n\n| Task | Issue | Status |\n|---|---|---|\n%s\n\n<!-- requirements-state:%s -->\n' "$rows" "$encoded" > /tmp/state.md
+          if [ "$(wc -c < /tmp/state.md)" -gt 60000 ]; then echo "The state comment would exceed the GitHub comment limit"; exit 1; fi
+          if [ "$comment_id" = null ]; then
+            comment_id="$(gh api "repos/${REPO_FULL_NAME}/issues/${ISSUE_NUMBER}/comments" -F body=@/tmp/state.md --jq .id)"
+          else
+            gh api -X PATCH "repos/${REPO_FULL_NAME}/issues/comments/${comment_id}" -F body=@/tmp/state.md > /dev/null
+          fi
+        }
+
+        # State first: when creating the issues fails halfway, the next scan runs `release` and finishes the job
+        write_state
+
+        open_children="$(jq '[.[] | select(.state == "OPEN")] | length' <<<"$children")"
+        slots=$((MAX_OPEN - open_children))
+        ready="$(jq -c --argjson c "$children" --argjson slots "$slots" '
+          ($c | map(.id)) as $created | ($c | map(select(.state == "CLOSED") | .id)) as $closed
+          | [.[] | select(.id as $i | $created | index($i) | not)
+                 | select(.depends_on | all(. as $d | $closed | index($d) != null))]
+          | .[0:([$slots, 0] | max)]' <<<"$plan")"
+
+        gh label create "req-${ISSUE_NUMBER}" --repo "$REPO_FULL_NAME" --color 5319e7 \
+          --description "Tasks of requirements issue #${ISSUE_NUMBER}" 2>/dev/null || true
+
+        while read -r task; do
+          [ -n "$task" ] || continue
+          id="$(jq -r .id <<<"$task")"
+          title="$(jq -r .title <<<"$task")"
+          deps="$(jq -r --argjson c "$children" '.depends_on | map(. as $d | "#" + ($c | map(select(.id == $d)) | first | .number | tostring)) | join(", ")' <<<"$task")"
+          {
+            printf '<!-- requirements:%s:%s -->\n\n' "$ISSUE_NUMBER" "$id"
+            jq -r .body <<<"$task"
+            printf '\n\n---\nPart of #%s.' "$ISSUE_NUMBER"
+            if [ -n "$deps" ]; then printf ' Depends on %s, already merged.' "$deps"; fi
+            printf '\n'
+          } > /tmp/task.md
+          url="$(gh issue create --repo "$REPO_FULL_NAME" --title "$title" --body-file /tmp/task.md --label "req-${ISSUE_NUMBER}")"
+          number="${url##*/}"
+          children="$(jq -c --arg id "$id" --argjson number "$number" --arg title "$title" '. + [{id: $id, number: $number, title: $title, state: "OPEN"}]' <<<"$children")"
+          echo "Created #${number} (${id}): ${title}"
+        done < <(jq -c '.[]' <<<"$ready")
+
+        write_state
+
+        pending="$(jq --argjson c "$children" '($c | map(.id)) as $created | [.[] | select(.id as $i | $created | index($i) | not)] | length' <<<"$plan")"
+        open_children="$(jq '[.[] | select(.state == "OPEN")] | length' <<<"$children")"
+        if [ "$MODE" != release ] && [ "$(jq length <<<"$new")" -eq 0 ] && [ "$pending" -eq 0 ] && [ "$open_children" -eq 0 ]; then
+          gh issue close "$ISSUE_NUMBER" --repo "$REPO_FULL_NAME" --reason completed \
+            --comment "Nothing is missing: the code satisfies the requirements and every task is done."
+        fi
