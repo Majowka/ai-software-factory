@@ -1,4 +1,4 @@
-# Every 30 minutes: looks at the open issues labeled `requirements` and starts a requirements-agent PipelineRun for each one
+# Every hour: looks at the open issues labeled `requirements` and starts a requirements-agent PipelineRun for each one
 # that needs work. No AI here, only the decision. The PipelineRun name is derived from the state of the issue, so the same
 # state never starts a second run (a failed run is not retried until it is deleted or the state changes).
 apiVersion: batch/v1
@@ -7,7 +7,7 @@ metadata:
   name: requirements-scan
   namespace: agents
 spec:
-  schedule: "*/30 * * * *"
+  schedule: "0 * * * *"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 1
   failedJobsHistoryLimit: 3
@@ -82,8 +82,17 @@ spec:
                       ],
                       timeouts: {pipeline: "1h15m0s", tasks: "1h0m0s", finally: "15m0s"},
                       workspaces: [{name: "work", volumeClaimTemplate: {spec: {accessModes: ["ReadWriteOnce"], resources: {requests: {storage: "5Gi"}}}}}]
-                    }}' | { out="$(kubectl create -f - 2>&1)" && echo "$out" || {
-                      case "$out" in *AlreadyExists*) echo "already started: $name" ;; *) echo "$out" >&2; return 1 ;; esac; }; }
+                    }}' > /tmp/pipelinerun.json
+                  # The agent image has no kubectl or oc: call the API with the service account token
+                  local sa=/var/run/secrets/kubernetes.io/serviceaccount code
+                  code="$(curl -s -o /tmp/response.json -w '%{http_code}' --cacert "$sa/ca.crt" \
+                    -H "Authorization: Bearer $(cat "$sa/token")" -H 'Content-Type: application/json' \
+                    -X POST "https://kubernetes.default.svc/apis/tekton.dev/v1/namespaces/agents/pipelineruns" --data-binary @/tmp/pipelinerun.json)"
+                  case "$code" in
+                    201) echo "started: $name" ;;
+                    409) echo "already started: $name" ;;
+                    *) echo "could not start $name (HTTP $code): $(jq -r '.message // .' /tmp/response.json)" >&2; return 1 ;;
+                  esac
                 }
 
                 scan_issue() {
