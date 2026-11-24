@@ -7,7 +7,7 @@ coding agent ([OpenCode](https://opencode.ai)) that talks to an open model serve
 the calls to GitHub.
 
 ![AI Software Factory overview](docs/images/factory-overview.svg)
-*The factory at a glance: GitHub, Tekton on OpenShift, the coding agent and the model on vLLM.*
+*The factory at a glance: two ways in (a GitHub event, or the hourly scan of `requirements` issues), Tekton on OpenShift, the coding agent, the model on vLLM, the pull request with human approval, and the loop back: a merged pull request closes its task issue and the next scan releases the tasks that were waiting.*
 
 ```
 GitHub (issue, comment, review)
@@ -35,6 +35,7 @@ OpenShift Route ──► EventListener (Tekton Triggers)
 | `issue-agent` | a new issue (`issues` / `opened`) | Posts a checklist plan as an issue comment, implements the issue on a new branch, opens a pull request, enables auto-merge and replies with a summary. |
 | `issue-comment-agent` | an issue comment starting with `@ai` | Treats the comment as an instruction. A question gets an answer; a change request gets a plan, a branch and a pull request. |
 | `pr-comment-agent` | a pull request review or review comment | Reads the whole PR conversation, pushes the requested change to the PR branch (or answers a question) and replies on the PR. |
+| `requirements-agent` | the hourly `requirements-scan` CronJob, for open issues labeled `requirements` | Compares the requirements with the code and creates the task issues in dependency order, at most 3 open at a time (section 6.9). Each task issue then runs through `issue-agent`. |
 
 New issues are accepted from any author, except those labeled `manual` or `requirements`.
 Comment and review triggers only accept events from users whose `author_association` is `OWNER`
@@ -155,6 +156,18 @@ oc get clusterinterceptors
 
 ![GPU node advertising nvidia.com/gpu](docs/images/gpu-nodes.png)
 *A GPU node with the `nvidia.com/gpu` resource in its capacity and allocatable lists.*
+
+**Tekton setting for current OpenShift Pipelines (1.24 and newer).** The pipelines in this repository
+give one task two volumes (`skills` and `work`). By default Tekton schedules such pods with an affinity
+assistant that refuses more than one volume per task: the run fails with
+`TaskRunValidationFailed: more than one PersistentVolumeClaim is bound`. Turn the affinity assistant off
+(a cluster-wide setting of the Tekton operator; each task then waits for its volume to move between pods,
+usually well under a minute):
+
+```bash
+oc patch tektonconfig config --type merge -p '{"spec":{"pipeline":{"coschedule":"disabled"}}}'
+oc get cm feature-flags -n openshift-pipelines -o jsonpath='{.data.coschedule}{"\n"}'   # disabled
+```
 
 ### 1.3 Local tools
 
@@ -683,8 +696,28 @@ subjects:
     namespace: agents
 ```
 
+Current releases of Tekton Triggers also need a `ClusterRoleBinding`, because the listener reads the
+cluster-scoped `ClusterInterceptor` objects (`github`, `cel`). Without it the EventListener pod crash-loops
+with `cannot list resource "clusterinterceptors"`:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: issue-agent-listener
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: tekton-triggers-eventlistener-clusterroles
+subjects:
+  - kind: ServiceAccount
+    name: issue-agent-listener
+    namespace: agents
+```
+
 ```bash
-oc apply -f tekton/serviceaccount-issue-agent-listener.yaml -f tekton/rolebinding-issue-agent-listener.yaml
+oc apply -f tekton/serviceaccount-issue-agent-listener.yaml -f tekton/rolebinding-issue-agent-listener.yaml \
+         -f tekton/clusterrolebinding-issue-agent-listener.yaml
 ```
 
 ### 6.3 Pipelines
@@ -864,6 +897,12 @@ oc apply -f tekton/pipeline-issue-comment-agent.yaml -f tekton/pipeline-pr-comme
 
 ![Pipelines in the OpenShift console](docs/images/pipelines-in-console.png)
 *PipelineRuns of the three pipelines in the `agents` namespace, in the OpenShift Pipelines console.*
+
+**Why the scripts `cd /workspace/repo` instead of using `workingDir`.** A step with
+`workingDir: /workspace/repo` makes Tekton create that directory in an init container, and on current
+OpenShift Pipelines that container runs as root. The `prepare` step runs as a normal user and then cannot
+clone into the root-owned directory (`/workspace/repo/.git: Permission denied`). The steps therefore use
+`workingDir: /workspace` and change into the repository themselves, so `git clone` creates the directory.
 
 ### 6.4 Trigger bindings and templates
 
@@ -1130,7 +1169,8 @@ All manifests of this section in one go, in a safe order:
 
 ```bash
 oc apply -f agents/configmap-agent-config.yaml
-oc apply -f tekton/serviceaccount-issue-agent-listener.yaml -f tekton/rolebinding-issue-agent-listener.yaml
+oc apply -f tekton/serviceaccount-issue-agent-listener.yaml -f tekton/rolebinding-issue-agent-listener.yaml \
+         -f tekton/clusterrolebinding-issue-agent-listener.yaml
 oc apply -f tekton/task-fetch-skills.yaml -f tekton/task-verify-build.yaml -f tekton/task-report-failure.yaml
 oc apply -f tekton/pipeline-issue-agent.yaml -f tekton/pipeline-issue-comment-agent.yaml -f tekton/pipeline-pr-comment-agent.yaml
 oc apply -f tekton/triggerbinding-new-issue.yaml -f tekton/triggerbinding-issue-comment.yaml \
@@ -1220,7 +1260,7 @@ A requirements issue is turned into task issues by a scheduled scan, not by a we
 run through the normal `issue-agent` flow. Nothing is stored outside GitHub.
 
 ```
-CronJob requirements-scan (every 30 min, no AI)
+CronJob requirements-scan (every hour, no AI)
    for each open issue labeled `requirements`:
       edited or never analyzed ........ analyze  (agent compares requirements and code, plans the missing tasks)
       a task became ready ............. release  (no agent, creates the task issues whose dependencies are done)
@@ -1241,6 +1281,15 @@ CronJob requirements-scan (every 30 min, no AI)
   `~/.config/opencode/skills` by the `prepare` step. The agent runs with `opencode-requirements.json` (no `gh`) and
   has no GitHub credentials; only `create-issues` holds the App key and validates `issues.json` (schema, unique ids,
   known dependencies, no cycles, at most 15 tasks) before anything is created.
+- **Speed of the model.** The model generates about 13 tokens per second, so a long chain of thought can take minutes
+  per answer. The skill and the prompt therefore tell the agent to write a first draft of `issues.json` before it
+  explores the code, and `opencode-requirements.json` allows 16384 output tokens. An analysis takes roughly 15 to 20
+  minutes.
+- **The scan needs no `kubectl`.** The agent image has no `kubectl` or `oc`; the CronJob creates the `PipelineRun` with
+  `curl` against the Kubernetes API using its service account token.
+- **Running it on demand or pausing it.** `oc create job --from=cronjob/requirements-scan scan-now -n agents` runs a
+  scan immediately (delete the job before the next one). Set `suspend: true` on the CronJob to stop the schedule; manual
+  jobs still work while it is suspended.
 - **Limits.** Editing a requirement adds tasks but does not change tasks that already exist. The state comment must
   stay under the 65536-character comment limit.
 
@@ -1249,7 +1298,7 @@ oc apply -f agents/configmap-agent-config.yaml
 oc apply -k agents/skills
 oc apply -f tekton/task-create-issues.yaml -f tekton/pipeline-requirements-agent.yaml
 oc apply -f tekton/serviceaccount-requirements-scheduler.yaml -f tekton/role-requirements-scheduler.yaml -f tekton/rolebinding-requirements-scheduler.yaml
-oc apply -f tekton/cronjob-requirements-scan.yaml   # set REPOS first
+oc apply -f tekton/cronjob-requirements-scan.yaml   # set REPOS first (default: the showcase repository)
 ```
 
 ## 7. Connect GitHub to the cluster
@@ -1307,6 +1356,11 @@ usually means a wrong secret.
 | Auto-merge could not be enabled | Repository setting *Allow auto-merge* and branch protection on the base branch. |
 | The pull request is a draft | `verify` could not make the build pass. The comment shows the end of the build log. Fix it by hand or comment on the pull request. |
 | `verify` runs the wrong build | Set the `verify-command` parameter of the pipeline (for example `./gradlew build`), or `skip`. |
+| `TaskRunValidationFailed: more than one PersistentVolumeClaim is bound` | Turn the affinity assistant off: `coschedule: disabled` in the `TektonConfig` (section 1.2). |
+| `prepare` fails with `/workspace/repo/.git: Permission denied` | A step still has `workingDir: /workspace/repo`; use `/workspace` and `cd /workspace/repo` in the script (section 6.3). |
+| The EventListener pod crash-loops with `cannot list resource "clusterinterceptors"` | Apply `tekton/clusterrolebinding-issue-agent-listener.yaml` (section 6.2). |
+| A rerun fails with `pvc ... not found` | You deleted a `PipelineRun` and redelivered the webhook at once. The volume names depend on the run name, so the new run picked up volumes that were then garbage-collected. Delete the run, wait until `oc get pvc -n agents` no longer lists its volumes, then redeliver. |
+| `requirements-agent` fails with "The agent did not write a JSON array" | The model ran out of output or time before writing `issues.json`. Check `oc logs <pod> -c step-analyze -n agents` and the generation speed in the vLLM log; the skill asks for a first draft early (section 6.9). |
 | A webhook redelivery does nothing | The `PipelineRun` of that event already exists (`oc get pipelinerun -n agents`). Delete it to run the event again. |
 
 ## 10. Known limitations
