@@ -10,13 +10,19 @@ enough for one coding agent to implement in one pull request.
 
 ## Process
 
-1. Read the requirements completely. List every separate requirement for yourself.
-2. Read `AGENTS.md` and explore the code (modules, packages, existing endpoints, entities, tests, the frontend client)
-   to find out what already exists. A requirement that is already met needs no task.
-3. Read `/workspace/out/existing-tasks.json`. Those tasks were created earlier (`pending`, `in progress` or `done`).
-   Never repeat them. You may reference their `id` in `depends_on`.
-4. For each missing piece, write one task. Order them so that a task only depends on tasks that must be merged first.
-5. Write the result to `/workspace/out/issues.json`, nothing else. Do not change repository files.
+You are slow and your output per answer is limited, so work in this order and keep your reasoning short. A file that exists
+beats a perfect plan that was never written.
+
+1. Read the requirements completely, then `/workspace/out/existing-tasks.json`. Those tasks were created earlier (`pending`,
+   `in progress` or `done`). Never repeat them. You may reference their `id` in `depends_on`.
+2. **Write a first draft of `/workspace/out/issues.json` now**, before exploring the code, based on the requirements and the
+   project layout in `AGENTS.md`. One task per separate requirement, ordered by dependency. This guarantees a result exists.
+3. Explore the code to check what already exists (modules, endpoints, entities, tests, the frontend client). Use at most 10 tool
+   calls, only on source and test files and `pom.xml` files of the modules the requirements touch. Do not look at build
+   caches, `~/.m2`, `node_modules`, `target`, or at files unrelated to the requirements.
+4. Update `/workspace/out/issues.json` after what you found: drop or shrink tasks for things that already exist, add the
+   missing details (class and module names, contracts). Rewrite the whole file each time.
+5. Stop. Do not change repository files. Do not write anything else.
 
 ## What a good task looks like
 

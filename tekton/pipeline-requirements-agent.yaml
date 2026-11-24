@@ -168,6 +168,8 @@ spec:
 
               Pipeline context: you run non-interactively with no GitHub credentials. Write the result to /workspace/out/issues.json as described in the skill ([] when nothing is missing). Do not modify any file in the repository and do not run gh.
 
+              Time and size limits: the model is slow and one answer is capped, so do not think at length. Within your first five tool calls write a first draft of /workspace/out/issues.json from the requirements below, then check the code with at most ten more tool calls and rewrite the file. Never end without a valid /workspace/out/issues.json.
+
               $(cat /workspace/issue.txt)
 
               Existing tasks:

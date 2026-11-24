@@ -111,7 +111,7 @@ data:
               "name": "Qwen3.8 Flash",
               "limit": {
                 "context": 131072,
-                "output": 8192
+                "output": 16384
               }
             }
           }
