@@ -26,7 +26,7 @@ spec:
   steps:
     - name: verify
       image: quay.io/pminkows/opencode:latest
-      workingDir: /workspace/repo
+      workingDir: /workspace
       volumeMounts:
         - name: config
           mountPath: /config
@@ -53,6 +53,9 @@ spec:
       script: |
         #!/usr/bin/env bash
         set -uo pipefail
+
+        # The repo is cloned by the prepare step: a workingDir of /workspace/repo would be created as root by Tekton and could not be cloned into
+        cd /workspace/repo
 
         OUT=/workspace/out
         LOG=/workspace/verify.log

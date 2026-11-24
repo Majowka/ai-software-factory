@@ -217,7 +217,7 @@ spec:
           # itself (only `gh issue comment` is allowed in opencode-plan.json). It gets the short-lived token from prepare, not the App key.
           - name: plan
             image: quay.io/pminkows/opencode:latest
-            workingDir: /workspace/repo
+            workingDir: /workspace
             volumeMounts:
               - name: config
                 mountPath: /config
@@ -242,6 +242,9 @@ spec:
               #!/usr/bin/env bash
               set -euo pipefail
 
+              # The repo is cloned by the prepare step: a workingDir of /workspace/repo would be created as root by Tekton and could not be cloned into
+              cd /workspace/repo
+
               GH_TOKEN="$(cat /workspace/gh-token)"
               export GH_TOKEN
               rm -f /workspace/gh-token
@@ -265,7 +268,7 @@ spec:
           # Agent run. No GitHub credentials in this step; committing, pushing and gh are denied in opencode.json.
           - name: agent
             image: quay.io/pminkows/opencode:latest
-            workingDir: /workspace/repo
+            workingDir: /workspace
             volumeMounts:
               - name: config
                 mountPath: /config
@@ -285,6 +288,9 @@ spec:
             script: |
               #!/usr/bin/env bash
               set -euo pipefail
+
+              # The repo is cloned by the prepare step: a workingDir of /workspace/repo would be created as root by Tekton and could not be cloned into
+              cd /workspace/repo
 
               PROMPT="Implement this GitHub issue, following the repository's AGENTS.md.
 
@@ -355,7 +361,7 @@ spec:
           # Commit, push, PR and issue comment. Mints a fresh token: the agent run may outlast the 1h token lifetime.
           - name: publish
             image: quay.io/pminkows/opencode:latest
-            workingDir: /workspace/repo
+            workingDir: /workspace
             volumeMounts:
               - name: config
                 mountPath: /config
@@ -395,6 +401,9 @@ spec:
             script: |
               #!/usr/bin/env bash
               set -euo pipefail
+
+              # The repo is cloned by the prepare step: a workingDir of /workspace/repo would be created as root by Tekton and could not be cloned into
+              cd /workspace/repo
 
               BRANCH="$(cat /workspace/branch)"
 

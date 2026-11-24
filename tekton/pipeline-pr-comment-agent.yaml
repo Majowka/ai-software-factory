@@ -266,7 +266,7 @@ spec:
           # It gets the short-lived token from prepare, not the App key.
           - name: plan
             image: quay.io/pminkows/opencode:latest
-            workingDir: /workspace/repo
+            workingDir: /workspace
             volumeMounts:
               - name: config
                 mountPath: /config
@@ -298,6 +298,9 @@ spec:
             script: |
               #!/usr/bin/env bash
               set -euo pipefail
+
+              # The repo is cloned by the prepare step: a workingDir of /workspace/repo would be created as root by Tekton and could not be cloned into
+              cd /workspace/repo
 
               if [ -f /workspace/skip ]; then
                 echo "Nothing to do"
@@ -338,7 +341,7 @@ spec:
           # Agent run. No GitHub credentials in this step; committing, pushing and gh are denied in opencode.json.
           - name: agent
             image: quay.io/pminkows/opencode:latest
-            workingDir: /workspace/repo
+            workingDir: /workspace
             volumeMounts:
               - name: config
                 mountPath: /config
@@ -366,6 +369,9 @@ spec:
             script: |
               #!/usr/bin/env bash
               set -euo pipefail
+
+              # The repo is cloned by the prepare step: a workingDir of /workspace/repo would be created as root by Tekton and could not be cloned into
+              cd /workspace/repo
 
               if [ -f /workspace/skip ]; then
                 echo "Nothing to do"
@@ -445,7 +451,7 @@ spec:
           # Commit, push and PR reply. Mints a fresh token: the agent run may outlast the 1h token lifetime.
           - name: publish
             image: quay.io/pminkows/opencode:latest
-            workingDir: /workspace/repo
+            workingDir: /workspace
             volumeMounts:
               - name: config
                 mountPath: /config
@@ -483,6 +489,9 @@ spec:
             script: |
               #!/usr/bin/env bash
               set -euo pipefail
+
+              # The repo is cloned by the prepare step: a workingDir of /workspace/repo would be created as root by Tekton and could not be cloned into
+              cd /workspace/repo
 
               if [ -f /workspace/skip ]; then
                 echo "Nothing to do"
