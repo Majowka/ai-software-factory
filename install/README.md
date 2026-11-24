@@ -37,7 +37,7 @@ Update as you go.
 - [x] Phase 2: ROSA HCP cluster created and reachable with `oc` (cluster `factory-east`, us-east-2)
 - [x] Phase 3: GPU machine pools in every AZ, one node running (gpu-c, us-east-2c)
 - [x] Phase 4: operators and custom resources installed
-- [ ] Phase 5: verified (done), factory objects deployed (README sections 2-7, not yet)
+- [x] Phase 5: verified, factory deployed from `master` (requirements agent from PR #2 not deployed)
 
 ## Phase 0: preconditions
 
@@ -219,6 +219,7 @@ The first real signal is the pool: if no node after about 5 minutes, check Cloud
 | 2026-11-24 | **Capacity test (run-instances in each AZ):** us-west-2 a, b, c, d and us-east-2 a, b: InsufficientInstanceCapacity; **us-east-2c: launched**. Matches the Spot Placement Score (use2-az3 = 9). |
 | 2026-11-24 | **Success:** cluster `factory-east` in **us-east-2** (HCP 4.22.22, 3x m5.xlarge, subnets a, b, c; network stack `factory-east` with VPC `vpc-080c53e329a0a4fe4`; operator roles prefix `factory-east`; OIDC `2u9754j0i82gq99471h6k1n3lp55amnr`). Pools `gpu-a`, `gpu-b` (0) and `gpu-c` (1). The GPU node (g7e.12xlarge, us-east-2c) joined within ~5 minutes of the pool creation, with the `nvidia.com/gpu:NoSchedule` taint (no taint sync bug this time). NFD, GPU Operator v26.7.3 and Pipelines 1.24.3 installed; `ClusterPolicy` ready and the node shows `nvidia.com/gpu: 2` (the driver pod needed several minutes); interceptors `github` and `cel` present; default StorageClass `gp3-csi`; namespaces `ai` and `agents` exist. API `https://api.factory-east.b0ur.p3.openshiftapps.com:443`, user `cluster-admin`. GPU quota in us-east-2 is 64 vCPU: enough for exactly one node. |
 | 2026-11-24 | Deleted the failed us-west-2 cluster `factory-test` and its VPC stack (the orphan security group `...-vpce-private-router` had to be removed first, again). us-west-2, eu-central-1: no VPCs, NAT gateways or volumes left. Operator roles `factory-test-*` still exist in account 2 (free). |
+| 2026-11-24 | **Factory deployed on `factory-east`** from `master` (top-level README order). Secrets created with `oc create secret` (`github-app` from the user's app id, installation id and the key file in the showcase repo, `github-webhook-secret`, `hf-token`). The user changed the GitHub App webhook URL to the new Route (`https://new-issue-agents.apps.rosa.factory-east.b0ur.p3.openshiftapps.com`); the webhook secret they chose is very short and weak (the value is deliberately not recorded here; it should be replaced with a random one). **Gap found:** the EventListener crash-looped with "cannot list ClusterInterceptor" because the README only binds `tekton-triggers-eventlistener-roles`; newer Tekton Triggers also need a ClusterRoleBinding to `tekton-triggers-eventlistener-clusterroles` (added as `tekton/clusterrolebinding-issue-agent-listener.yaml`, not yet in README or committed). After that the EventListener was Ready. Model `qwen38-flash` scaled to 1: the image pull took ~7 minutes, weights ~178 GB on the PVC, both GPUs used (~88 of 98 GB each), the API answers (reasoning model: small `max_tokens` returns empty content). No real GitHub event has been sent yet. |
 
 ## Sources
 
