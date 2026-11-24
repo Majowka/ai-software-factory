@@ -37,9 +37,11 @@ OpenShift Route ──► EventListener (Tekton Triggers)
 | `pr-comment-agent` | a pull request review or review comment | Reads the whole PR conversation, pushes the requested change to the PR branch (or answers a question) and replies on the PR. |
 | `requirements-agent` | the hourly `requirements-scan` CronJob, for open issues labeled `requirements` | Compares the requirements with the code and creates the task issues in dependency order, at most 3 open at a time (section 6.9). Each task issue then runs through `issue-agent`. |
 
-New issues are accepted from any author, except those labeled `manual` or `requirements`.
-Comment and review triggers only accept events from users whose `author_association` is `OWNER`
-or `MEMBER` and ignore bots. Forks and closed issues or pull requests are skipped.
+Every trigger only accepts events from users whose `author_association` is `OWNER`, `MEMBER` or
+`COLLABORATOR`. New issues are also accepted from the GitHub App itself (the task issues that the
+requirements agent creates), and are skipped when labeled `manual` or `requirements`. Comment and review
+triggers ignore bots. Forks and closed issues or pull requests are skipped, so an issue opened by a
+stranger on a public repository does nothing.
 
 ## Why these technologies
 
@@ -1047,6 +1049,8 @@ spec:
             - name: filter
               value: >-
                 body.action == 'opened'
+                && (body.issue.author_association in ['OWNER', 'MEMBER', 'COLLABORATOR']
+                    || body.issue.user.login == 'ai-software-factory-agent[bot]')
                 && !body.issue.labels.exists(l, l.name in ['manual', 'requirements'])
       bindings:
         - kind: TriggerBinding
@@ -1075,7 +1079,7 @@ spec:
               value: >-
                 body.action == 'created' && body.issue.state == 'open'
                 && !has(body.issue.pull_request) && body.sender.type != 'Bot'
-                && body.comment.author_association in ['OWNER', 'MEMBER']
+                && body.comment.author_association in ['OWNER', 'MEMBER', 'COLLABORATOR']
                 && body.comment.body.startsWith('@ai')
       bindings:
         - kind: TriggerBinding
@@ -1104,7 +1108,7 @@ spec:
               value: >-
                 body.action == 'created' && body.pull_request.state == 'open'
                 && body.sender.type != 'Bot'
-                && body.comment.author_association in ['OWNER', 'MEMBER']
+                && body.comment.author_association in ['OWNER', 'MEMBER', 'COLLABORATOR']
       bindings:
         - kind: TriggerBinding
           ref: pr-review-comment
@@ -1132,7 +1136,7 @@ spec:
               value: >-
                 body.action == 'submitted' && body.pull_request.state == 'open'
                 && body.sender.type != 'Bot'
-                && body.review.author_association in ['OWNER', 'MEMBER']
+                && body.review.author_association in ['OWNER', 'MEMBER', 'COLLABORATOR']
                 && body.review.body != null && body.review.body != ''
       bindings:
         - kind: TriggerBinding
@@ -1187,10 +1191,10 @@ The `new-issue` EventListener has four triggers. Each verifies the webhook signa
 
 | Trigger | GitHub event | CEL filter (all conditions) | Template, pipeline |
 |---|---|---|---|
-| `new-issue` | `issues` | action `opened`, any author, issue **without** the `manual` or `requirements` label | `new-issue`, `issue-agent` |
-| `issue-comment` | `issue_comment` | action `created`, issue open, **not a pull request**, not a bot, author OWNER or MEMBER, **body starts with `@ai`** | `issue-comment`, `issue-comment-agent` |
-| `pr-review-comment` | `pull_request_review_comment` | action `created`, PR open, not a bot, author OWNER or MEMBER | `pr-comment`, `pr-comment-agent` |
-| `pr-review` | `pull_request_review` | action `submitted`, PR open, not a bot, author OWNER or MEMBER, non-empty body | `pr-comment`, `pr-comment-agent` |
+| `new-issue` | `issues` | action `opened`, author OWNER, MEMBER or COLLABORATOR (or the GitHub App bot), issue **without** the `manual` or `requirements` label | `new-issue`, `issue-agent` |
+| `issue-comment` | `issue_comment` | action `created`, issue open, **not a pull request**, not a bot, author OWNER, MEMBER or COLLABORATOR, **body starts with `@ai`** | `issue-comment`, `issue-comment-agent` |
+| `pr-review-comment` | `pull_request_review_comment` | action `created`, PR open, not a bot, author OWNER, MEMBER or COLLABORATOR | `pr-comment`, `pr-comment-agent` |
+| `pr-review` | `pull_request_review` | action `submitted`, PR open, not a bot, author OWNER, MEMBER or COLLABORATOR, non-empty body | `pr-comment`, `pr-comment-agent` |
 
 Each `PipelineRun` gets its own volumes (`volumeClaimTemplate`): 1 GiB for the skills workspace and
 10 GiB for the work workspace (the clone and the Maven cache). The only Tekton timeouts are
@@ -1247,9 +1251,10 @@ failing them. The waiting time counts against the timeout.
   `gh issue comment` or `gh pr comment` (`opencode-plan.json`).
 - A fresh token is minted in `publish`, because an agent run can exceed the one-hour token
   lifetime.
-- New issues from any author start a run. Only `OWNER` and `MEMBER` accounts can trigger the
-  comment and review flows, bot events are ignored there, and pull requests from forks are
-  rejected. Use this setup only on private repositories or where issue creation is restricted.
+- Only `OWNER`, `MEMBER` and `COLLABORATOR` accounts (and the GitHub App, for the task issues of
+  the requirements agent) can start a run. Bot events are ignored in the comment and review flows, and
+  pull requests from forks are rejected. The App's own login is part of the `new-issue` filter: change it
+  if your App has another name.
 - Issue and comment text is untrusted input that reaches the model. The agent runs with a broad
   `bash` permission inside its pod, so keep the pods free of cluster credentials, and consider a
   `NetworkPolicy` that limits egress to the model, GitHub and your Maven repositories.

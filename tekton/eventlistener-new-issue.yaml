@@ -23,8 +23,10 @@ spec:
             name: github
         - params:
             - name: filter
-              value: body.action == 'opened' && !body.issue.labels.exists(l, l.name
-                in ['manual', 'requirements'])
+              value: body.action == 'opened' && (body.issue.author_association in
+                ['OWNER', 'MEMBER', 'COLLABORATOR'] || body.issue.user.login ==
+                'ai-software-factory-agent[bot]') && !body.issue.labels.exists(l,
+                l.name in ['manual', 'requirements'])
           ref:
             kind: ClusterInterceptor
             name: cel
@@ -50,7 +52,7 @@ spec:
             - name: filter
               value: body.action == 'created' && body.pull_request.state == 'open'
                 && body.sender.type != 'Bot' && body.comment.author_association in
-                ['OWNER', 'MEMBER']
+                ['OWNER', 'MEMBER', 'COLLABORATOR']
           ref:
             kind: ClusterInterceptor
             name: cel
@@ -76,7 +78,7 @@ spec:
             - name: filter
               value: body.action == 'submitted' && body.pull_request.state == 'open'
                 && body.sender.type != 'Bot' && body.review.author_association in
-                ['OWNER', 'MEMBER'] && body.review.body != null && body.review.body
+                ['OWNER', 'MEMBER', 'COLLABORATOR'] && body.review.body != null && body.review.body
                 != ''
           ref:
             kind: ClusterInterceptor
@@ -103,7 +105,7 @@ spec:
             - name: filter
               value: body.action == 'created' && body.issue.state == 'open'
                 && !has(body.issue.pull_request) && body.sender.type != 'Bot'
-                && body.comment.author_association in ['OWNER', 'MEMBER']
+                && body.comment.author_association in ['OWNER', 'MEMBER', 'COLLABORATOR']
                 && body.comment.body.startsWith('@ai')
           ref:
             kind: ClusterInterceptor
