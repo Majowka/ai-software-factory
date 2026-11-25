@@ -4,6 +4,8 @@ metadata:
   name: new-issue
   namespace: agents
 spec:
+  # Trusted authors: org members with a public membership arrive as MEMBER; private members arrive as NONE, so their
+  # GitHub user ids are listed here too (175831 = kamcio2603). Add an id to all four filters.
   serviceAccountName: issue-agent-listener
   triggers:
     - bindings:
@@ -24,8 +26,8 @@ spec:
         - params:
             - name: filter
               value: body.action == 'opened' && (body.issue.author_association in
-                ['OWNER', 'MEMBER', 'COLLABORATOR'] || body.issue.user.login ==
-                'klaudiuszai[bot]') && !body.issue.labels.exists(l,
+                ['OWNER', 'MEMBER', 'COLLABORATOR'] || int(body.issue.user.id) in [175831]
+                || body.issue.user.login == 'klaudiuszai[bot]') && !body.issue.labels.exists(l,
                 l.name in ['manual', 'requirements'])
           ref:
             kind: ClusterInterceptor
@@ -51,8 +53,8 @@ spec:
         - params:
             - name: filter
               value: body.action == 'created' && body.pull_request.state == 'open'
-                && body.sender.type != 'Bot' && body.comment.author_association in
-                ['OWNER', 'MEMBER', 'COLLABORATOR']
+                && body.sender.type != 'Bot' && (body.comment.author_association in
+                ['OWNER', 'MEMBER', 'COLLABORATOR'] || int(body.comment.user.id) in [175831])
           ref:
             kind: ClusterInterceptor
             name: cel
@@ -77,8 +79,8 @@ spec:
         - params:
             - name: filter
               value: body.action == 'submitted' && body.pull_request.state == 'open'
-                && body.sender.type != 'Bot' && body.review.author_association in
-                ['OWNER', 'MEMBER', 'COLLABORATOR'] && body.review.body != null && body.review.body
+                && body.sender.type != 'Bot' && (body.review.author_association in
+                ['OWNER', 'MEMBER', 'COLLABORATOR'] || int(body.review.user.id) in [175831]) && body.review.body != null && body.review.body
                 != ''
           ref:
             kind: ClusterInterceptor
@@ -105,7 +107,8 @@ spec:
             - name: filter
               value: body.action == 'created' && body.issue.state == 'open'
                 && !has(body.issue.pull_request) && body.sender.type != 'Bot'
-                && body.comment.author_association in ['OWNER', 'MEMBER', 'COLLABORATOR']
+                && (body.comment.author_association in ['OWNER', 'MEMBER', 'COLLABORATOR']
+                || int(body.comment.user.id) in [175831])
                 && body.comment.body.startsWith('@ai')
           ref:
             kind: ClusterInterceptor
