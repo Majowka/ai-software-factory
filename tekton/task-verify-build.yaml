@@ -281,6 +281,7 @@ spec:
               fi
             fi
             verdict=0
+            if [ "$review_fixes" -gt 0 ]; then verdict=3; fi  # a fix after review remarks counts as unreviewed until a review runs
             if [ "$review_round" -le "$SELF_REVIEW_ROUNDS" ] && [ "$SELF_REVIEW_ROUNDS" -gt 0 ] && [ "$(date +%s)" -lt "$deadline" ]; then
               review_round=$((review_round + 1))
               self_review "$review_round"; verdict=$?
@@ -320,7 +321,7 @@ spec:
               if [ "$verdict" -eq 2 ]; then cp "$OUT/verify-note.md" "$OUT/verify-failed"; fi
             fi
             if [ "$verdict" -eq 3 ]; then
-              printf '\n:warning: **The self-review did not finish** (no result within %s minutes). Review the code before merging.\n' \
+              printf '\n:warning: **The self-review did not finish** (no result within %s minutes, or no review after the last fix round). Review the code before merging.\n' \
                 "${SELF_REVIEW_MINUTES:-6}" >> "$OUT/verify-note.md"
               touch "$OUT/no-auto-merge"
             fi
