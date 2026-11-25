@@ -487,6 +487,12 @@ enables auto-merge and posts the summary on the issue. The commit message and th
 `/config/pr-meta.sh` validates it and falls back to `feat: implement issue #<n>`. When the agent adds
 `scope: partial`, the body says `Refs #<issue>` instead, so a partial change does not close the issue.
 
+The PR description comes from `/config/pr-body.sh`: the issue link, the agent's `.agent-summary.md`
+(sections *What changed and why*, *Testing*, *Known limitations*), the verify result with the
+regression-test check, the self-review verdict, the plan and the engines that ran each task
+(`/workspace/out/engines.txt`, written by `agent-run.sh`). Each part is capped so the body stays under
+GitHub's 65536-character limit; if building it fails, the body falls back to `Closes #<issue>`.
+
 The other two pipelines differ in what they read and where they write:
 
 - `tekton/pipeline-issue-comment-agent.yaml`: `prepare` fetches the whole issue thread through the

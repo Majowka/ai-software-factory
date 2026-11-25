@@ -48,6 +48,49 @@ data:
       case "$scope" in partial*) PR_KEYWORD="Refs" ;; *) PR_KEYWORD="Closes" ;; esac
       echo "pr-meta: title='$PR_TITLE' keyword=$PR_KEYWORD"
     }
+  # Description of the pull request opened by `publish` (GitHub showed only "Closes #N" before). Usage, after pr_meta
+  # (PR_KEYWORD): source /config/pr-body.sh; pr_body <issue> > <file>. Reads the agent's summary from summary.agent.md
+  # (publish copies it there before putting the verify note in front of summary.md for the issue reply).
+  # Sections: issue link, the agent's summary (what changed and why, testing, known limitations), the pipeline's build
+  # verification and regression-test check, the self-review verdict, the plan, the engines used. Each part is capped
+  # so the body stays below GitHub's 65536-character limit.
+  pr-body.sh: |
+    pr_body() {
+      local issue="$1" out=/workspace/out part
+      # Cut at a byte limit; iconv drops a multi-byte character cut in half (when the image has it)
+      cap() { if command -v iconv >/dev/null 2>&1; then head -c "$1" | iconv -f utf-8 -t utf-8 -c; else head -c "$1"; fi; }
+      printf '%s #%s\n\n' "${PR_KEYWORD:-Closes}" "$issue"
+      if [ "${PR_KEYWORD:-Closes}" = "Refs" ]; then
+        printf '> [!NOTE]\n> The agent marked this change as partial: it covers only part of the issue, so the issue stays open.\n\n'
+      fi
+      if [ -s "$out/summary.agent.md" ]; then
+        cap 20000 < "$out/summary.agent.md"; printf '\n\n'
+      else
+        printf '_The agent left no summary; see the diff and the issue._\n\n'
+      fi
+      printf '### Verification (pipeline)\n\n'
+      if [ -s "$out/verify-note.md" ]; then
+        cap 15000 < "$out/verify-note.md"; printf '\n'
+      else
+        printf 'Build verification did not run (no verify command for this repository).\n'
+      fi
+      if [ -s "$out/self-review.md" ] && ! grep -q '<summary>Self-review</summary>' "$out/verify-note.md" 2>/dev/null; then
+        part="$(head -n 3 "$out/self-review.md" | grep -ioE 'VERDICT:[[:space:]]*(ok|fix)' | head -n 1 || true)"
+        printf '\n### Self-review\n\n**%s**\n\n<details><summary>Self-review</summary>\n\n' "${part:-no verdict}"
+        cap 15000 < "$out/self-review.md"
+        printf '\n</details>\n'
+      elif [ ! -s "$out/self-review.md" ] && [ -s "$out/verify-note.md" ] && ! grep -q 'self-review' "$out/verify-note.md"; then
+        printf '\n### Self-review\n\nNo self-review ran for this change.\n'
+      fi
+      if [ -s "$out/plan.md" ]; then
+        printf '\n<details><summary>Plan</summary>\n\n'; cap 6000 < "$out/plan.md"; printf '\n</details>\n'
+      fi
+      if [ -s "$out/engines.txt" ]; then
+        printf '\n---\n_Opened by the AI factory. Agents: %s._\n' "$(sort -u "$out/engines.txt" | paste -sd ',' | sed 's/,/, /g')"
+      else
+        printf '\n---\n_Opened by the AI factory._\n'
+      fi
+    }
   # Which engine runs which agent task. Change it here and apply the ConfigMap; the next run picks it up.
   # A label on the issue / PR overrides it for that issue: engine:claude, engine:opencode, engine-implement:opencode, ...
   # Tasks: PLAN (plan steps of all three event pipelines), IMPLEMENT (agent steps), FIX (build-fix attempts in
@@ -116,6 +159,7 @@ data:
       OPENCODE_CONFIG=/config/opencode.json timeout "$limit" opencode run ${model:+-m "$model"} ${variant:+--variant "$variant"} \
         "$prompt" 2>&1 | tee -a "$log"
       rc=${PIPESTATUS[0]}
+      used="opencode${model:+ ${model}}"
     }
     case "$engine" in
       opencode)
@@ -131,6 +175,7 @@ data:
           timeout "$limit" claude -p "$prompt" --model "$model" --settings /config/claude-settings.json \
             --output-format text 2>&1 | tee -a "$log" "$out"
           rc=${PIPESTATUS[0]}
+          used="claude ${model}"
           # Usage / rate limit of the subscription, overloaded API, refused token: the run goes on with OpenCode.
           limit_re='usage limit|rate[ _-]?limit|limit reached|hit your limit|limit will reset|API Error: (401|403|429|529)|overloaded|authentication_error|invalid (api key|bearer token)|OAuth token (has )?(expired|revoked)|credit balance'
           if [ "$rc" -ne 124 ] && { [ "$rc" -ne 0 ] || [ "$(wc -c < "$out")" -lt 500 ]; } && grep -qiE "$limit_re" "$out"; then
@@ -143,6 +188,10 @@ data:
         echo "Unknown engine '${engine}' for task ${task} (routing.env)" | tee -a "$log"; rc=2 ;;
     esac
     [ "$rc" -eq 0 ] || echo "${engine} exited with ${rc} (timeout or error)" | tee -a "$log"
+    # Engine that actually ran each task (after a fallback too), for the pull request description
+    if [ -n "${used:-}" ] && [ -d /workspace/out ]; then
+      printf '%s %s\n' "$(printf '%s' "$task" | tr '[:upper:]_' '[:lower:]-')" "$used" >> /workspace/out/engines.txt 2>/dev/null || true
+    fi
     exit "$rc"
   # Puts skills and subagents (fetched by fetch-skills, OpenCode layout) where both engines look for them: agent-home.sh [skills dir]
   agent-home.sh: |
