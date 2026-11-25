@@ -336,7 +336,7 @@ The factory runs no model of its own. Agent tasks go to one of two hosted engine
 
 | Engine | Models | Authentication | Secret |
 |---|---|---|---|
-| `opencode` | OpenCode Go models, `opencode-go/<model-id>` (default `opencode-go/kimi-k3`) | API key | `opencode-go` |
+| `opencode` | OpenCode Go models, `opencode-go/<model-id>` (default `opencode-go/deepseek-v4.1-flash`) | API key | `opencode-go` |
 | `claude` | Claude models, an alias such as `sonnet` or `opus`, or a full model id | OAuth token from `claude setup-token` | `claude-code-oauth` |
 
 Which engine and model handle which task is set in `routing.env` (section 6.1). Both subscriptions have
@@ -375,7 +375,7 @@ AGENT_ENGINE_PLAN=opencode
 AGENT_ENGINE_IMPLEMENT=claude
 AGENT_ENGINE_FIX=claude
 AGENT_ENGINE_REQUIREMENTS=opencode
-OPENCODE_MODEL=opencode-go/kimi-k3      # per task: OPENCODE_MODEL_<TASK>
+OPENCODE_MODEL=opencode-go/deepseek-v4.1-flash # per task: OPENCODE_MODEL_<TASK>
 CLAUDE_MODEL=sonnet                     # per task: CLAUDE_MODEL_<TASK>
 CLAUDE_MODEL_PLAN=opus
 ```
