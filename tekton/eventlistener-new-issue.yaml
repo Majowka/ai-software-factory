@@ -25,6 +25,7 @@ spec:
             - name: filter
               value: body.action == 'opened' && !body.issue.labels.exists(l,
                 l.name in ['manual', 'requirements'])
+                && body.repository.full_name in ['Majowka/ai-software-factory']
           ref:
             kind: ClusterInterceptor
             name: cel
@@ -49,7 +50,8 @@ spec:
         - params:
             - name: filter
               value: body.action == 'created' && body.pull_request.state == 'open'
-                && body.sender.type != 'Bot'
+                && body.sender.type != 'Bot' && body.pull_request.user.type == 'Bot'
+                && body.pull_request.head.ref.startsWith('issue-')
           ref:
             kind: ClusterInterceptor
             name: cel
@@ -74,8 +76,9 @@ spec:
         - params:
             - name: filter
               value: body.action == 'submitted' && body.pull_request.state == 'open'
-                && body.sender.type != 'Bot' && body.review.body != null && body.review.body
-                != ''
+                && body.sender.type != 'Bot' && body.pull_request.user.type == 'Bot'
+                && body.pull_request.head.ref.startsWith('issue-')
+                && body.review.body != null && body.review.body != ''
           ref:
             kind: ClusterInterceptor
             name: cel

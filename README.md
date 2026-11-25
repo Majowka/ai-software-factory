@@ -523,10 +523,10 @@ The `new-issue` EventListener has four triggers. Each verifies the webhook signa
 
 | Trigger | GitHub event | CEL filter (all conditions) | Template, pipeline |
 |---|---|---|---|
-| `new-issue` | `issues` | action `opened`, issue **without** the `manual` or `requirements` label | `new-issue`, `issue-agent` |
+| `new-issue` | `issues` | action `opened`, issue **without** the `manual` or `requirements` label, repository on the automatic list (only `Majowka/ai-software-factory`; other repositories start runs with `@ai` comments only) | `new-issue`, `issue-agent` |
 | `issue-comment` | `issue_comment` | action `created`, issue open, **not a pull request**, not a bot, **body starts with `@ai`** | `issue-comment`, `issue-comment-agent` |
-| `pr-review-comment` | `pull_request_review_comment` | action `created`, PR open, not a bot | `pr-comment`, `pr-comment-agent` |
-| `pr-review` | `pull_request_review` | action `submitted`, PR open, not a bot, non-empty body | `pr-comment`, `pr-comment-agent` |
+| `pr-review-comment` | `pull_request_review_comment` | action `created`, PR open, not a bot, **PR opened by the factory** (author is a bot, branch `issue-*`) | `pr-comment`, `pr-comment-agent` |
+| `pr-review` | `pull_request_review` | action `submitted`, PR open, not a bot, non-empty body, **PR opened by the factory** (author is a bot, branch `issue-*`) | `pr-comment`, `pr-comment-agent` |
 
 Each `PipelineRun` gets its own volumes (`volumeClaimTemplate`): 1 GiB for the skills workspace and
 10 GiB for the work workspace (the clone and the Maven cache). The only Tekton timeouts are
