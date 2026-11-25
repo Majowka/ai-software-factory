@@ -128,7 +128,8 @@ data:
     # (deepseek-v4.1-flash) took 9-11 parallel tasks without 429 and answered "Rate limit exceeded" from 13 on
     # (2026-11-25). OpenCode retries a 429 by itself (it only shows in its own log), so the run gets slow, not red.
     LLM_SLOTS_OPENCODE=8
-    LLM_SLOTS_CLAUDE=2
+    # Claude Max 5x: the limit is usage per 5 h window, not parallel calls; Claude falls back to OpenCode when it hits it.
+    LLM_SLOTS_CLAUDE=3
     # On HTTP 429 / overload from the provider: how many times a task runs again, and the first wait in seconds (doubles)
     LLM_RATE_RETRIES=4
     LLM_RATE_BACKOFF=30

@@ -722,7 +722,7 @@ not finished) and starts the oldest waiting ones, until `MAX_ACTIVE` (6) are act
 stay pending; to start one by hand: `kubectl patch pipelinerun <name> -n <namespace> --type merge -p '{"spec":{"status":null}}'`.
 
 **LLM calls.** Every agent task goes through `agent-run.sh`, which first takes a slot of its engine (`llm-slot.sh`):
-at most `LLM_SLOTS_OPENCODE` (8) tasks talk to OpenCode and `LLM_SLOTS_CLAUDE` (2) to Claude Code at the same time,
+at most `LLM_SLOTS_OPENCODE` (8) tasks talk to OpenCode and `LLM_SLOTS_CLAUDE` (3) to Claude Code at the same time,
 across all runs. The others wait in arrival order (FIFO) and say so in their log every minute. Slots and the queue
 are `Lease` objects in the namespace (`llm-slot-<engine>-<i>`, `llm-q-<engine>-...`, Role `llm-slots` for the
 `pipeline` service account); a step renews its lease every 20 s, so a slot of a pod that died comes free after 90 s.
