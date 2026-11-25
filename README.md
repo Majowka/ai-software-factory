@@ -110,7 +110,7 @@ official logos.
 │   ├── triggertemplate-*.yaml           create the PipelineRuns
 │   ├── eventlistener-new-issue.yaml     the single EventListener with four triggers and their filters
 │   ├── cronjob-requirements-scan.yaml   hourly scan of `requirements` issues (section 6.9)
-│   ├── cronjob-run-pruner.yaml          removes finished runs and their workspace PVCs (section 6.11)
+│   ├── cronjob-run-pruner.yaml          deletes finished runs with their pods and PVCs (section 6.11)
 │   ├── resourcequota-agents.yaml        optional cap on parallel runs
 │   └── serviceaccount-*, role*-*        service accounts and RBAC of the listener, the scan and the pruner
 ├── deploy/
@@ -693,11 +693,11 @@ PVC only together with its PipelineRun, and plain Tekton never deletes PipelineR
 their volumes pile up until the nodes run out of disk (on k3s, `local-path` keeps the data on the node's own disk
 and does not enforce the requested size, so the `storage` request does not limit what a run writes).
 
-The `run-pruner` CronJob (`tekton/cronjob-run-pruner.yaml`, every 15 minutes, no AI) does two things:
-
-1. deletes the PVCs of runs that finished more than `PVC_KEEP_HOURS` (2) ago, which frees the disk while the run,
-   its pods and logs stay visible;
-2. deletes runs that finished more than `RUN_KEEP_HOURS` (12) ago, except the `KEEP_LAST` (20) newest finished ones.
+The `run-pruner` CronJob (`tekton/cronjob-run-pruner.yaml`, every 15 minutes, no AI) deletes the runs that finished
+more than `RUN_KEEP_HOURS` (3) ago, except the `KEEP_LAST` (10) newest finished ones, with background propagation, so
+their TaskRuns, pods, logs and PVCs go too. Deleting only the PVCs is not enough: the pods of the finished TaskRuns
+still name them, so the `kubernetes.io/pvc-protection` finalizer keeps them (and the data on the node) in
+`Terminating` until the pods are gone.
 
 Runs still in progress (no `completionTime`) are never touched. `DRY_RUN=true` only prints what would be deleted.
 Run it on demand with `kubectl create job --from=cronjob/run-pruner prune-now -n <namespace>`.

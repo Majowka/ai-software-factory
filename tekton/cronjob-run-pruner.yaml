@@ -1,11 +1,10 @@
-# Every 15 minutes: removes what finished PipelineRuns leave behind, so the nodes do not run out of disk.
-# Every run gets its own `work` PVC from a volumeClaimTemplate, and that PVC (and the pods with their logs) is only
-# removed together with the PipelineRun. Nothing in plain Tekton prunes runs, so without this they pile up for ever.
-#   1. PVCs of runs that finished more than PVC_KEEP_HOURS ago are deleted. This frees the disk (local-path keeps the
-#      data on the node's own disk), while the run, its pods and its logs stay visible.
-#   2. Runs that finished more than RUN_KEEP_HOURS ago are deleted (with their TaskRuns, pods and any PVC left),
-#      except the KEEP_LAST most recently finished ones.
-# Runs that have not finished (no completionTime) are never touched.
+# Every 15 minutes: deletes finished PipelineRuns, so the nodes do not run out of disk.
+# Every run gets its own `work` PVC from a volumeClaimTemplate, and Tekton removes it only together with the
+# PipelineRun. Nothing in plain Tekton prunes runs, so without this they and their volumes pile up for ever.
+# Deleting only the PVC does not help: the pods of the finished TaskRuns still name it, and the pvc-protection
+# finalizer keeps it (and the local-path data on the node) until those pods are gone. So the whole run goes, with
+# its TaskRuns, pods, logs and PVCs (background propagation), once it finished more than RUN_KEEP_HOURS ago,
+# except the KEEP_LAST most recently finished runs. Runs that have not finished (no completionTime) are never touched.
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -32,12 +31,10 @@ spec:
                   cpu: 10m
                   memory: 64Mi
               env:
-                - name: PVC_KEEP_HOURS
-                  value: "2"
                 - name: RUN_KEEP_HOURS
-                  value: "12"
+                  value: "3"
                 - name: KEEP_LAST
-                  value: "20"
+                  value: "10"
                 # Print what would be deleted without deleting anything
                 - name: DRY_RUN
                   value: "false"
@@ -72,9 +69,7 @@ spec:
                 }
 
                 runs_path="/apis/tekton.dev/v1/namespaces/${NAMESPACE}/pipelineruns"
-                pvcs_path="/api/v1/namespaces/${NAMESPACE}/persistentvolumeclaims"
                 api GET "$runs_path" --fail > /tmp/runs.json
-                api GET "$pvcs_path" --fail > /tmp/pvcs.json
                 now="$(date +%s)"
                 failed=0
 
@@ -82,17 +77,9 @@ spec:
                 jq --argjson now "$now" '[.items[] | select(.status.completionTime != null)
                   | {name: .metadata.name, age: ($now - (.status.completionTime | fromdateiso8601))}] | sort_by(.age)' \
                   /tmp/runs.json > /tmp/finished.json
-                echo "runs: $(jq '.items | length' /tmp/runs.json) ($(jq length /tmp/finished.json) finished), PVCs: $(jq '.items | length' /tmp/pvcs.json)"
+                echo "runs: $(jq '.items | length' /tmp/runs.json) ($(jq length /tmp/finished.json) finished)"
 
-                # 1. PVCs owned by a run that finished more than PVC_KEEP_HOURS ago
-                jq -r --slurpfile finished /tmp/finished.json --argjson keep "$((PVC_KEEP_HOURS * 3600))" '
-                  ($finished[0] | map(select(.age > $keep) | {(.name): true}) | add // {}) as $old
-                  | .items[] | select(.metadata.deletionTimestamp == null)
-                  | select(any(.metadata.ownerReferences[]?; .kind == "PipelineRun" and $old[.name]))
-                  | .metadata.name' /tmp/pvcs.json > /tmp/old-pvcs.txt
-                while read -r pvc; do delete PersistentVolumeClaim "$pvcs_path" "$pvc"; done < /tmp/old-pvcs.txt
-
-                # 2. Runs that finished more than RUN_KEEP_HOURS ago, apart from the KEEP_LAST newest finished ones
+                # Runs that finished more than RUN_KEEP_HOURS ago, apart from the KEEP_LAST newest finished ones
                 jq -r --argjson keep "$((RUN_KEEP_HOURS * 3600))" --argjson last "$KEEP_LAST" \
                   '.[$last:][] | select(.age > $keep) | .name' /tmp/finished.json > /tmp/old-runs.txt
                 while read -r run; do delete PipelineRun "$runs_path" "$run"; done < /tmp/old-runs.txt
