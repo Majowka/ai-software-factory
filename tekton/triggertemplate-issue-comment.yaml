@@ -46,6 +46,8 @@ spec:
           name: issue-comment-agent
         taskRunTemplate:
           serviceAccountName: pipeline
+          podTemplate:
+            priorityClassName: ai-factory
         timeouts:
           pipeline: 3h15m0s
           tasks: 3h0m0s

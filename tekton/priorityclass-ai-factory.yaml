@@ -1,0 +1,10 @@
+# Pods of the factory runs go before other pending pods with a lower priority (e.g. self-hosted CI runners) when the
+# scheduler finds room. preemptionPolicy Never: they never evict running pods, they only jump the scheduling queue.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: ai-factory
+value: 1000
+preemptionPolicy: Never
+globalDefault: false
+description: AI factory run pods (scheduled before lower-priority pending pods, no preemption)

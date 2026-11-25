@@ -37,6 +37,8 @@ spec:
           name: pr-review-agent
         taskRunTemplate:
           serviceAccountName: pipeline
+          podTemplate:
+            priorityClassName: ai-factory
         timeouts:
           pipeline: 1h15m0s
           tasks: 1h0m0s
