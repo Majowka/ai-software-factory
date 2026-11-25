@@ -1,0 +1,8 @@
+# OpenShift: OpenShift Pipelines creates the `pipeline` service account; the webhook is exposed by a Route.
+# kubectl apply -k deploy/openshift   (or oc apply -k)
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../agents
+  - ../../tekton
+  - route-new-issue.yaml

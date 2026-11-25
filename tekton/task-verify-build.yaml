@@ -20,12 +20,12 @@ spec:
     - name: work
       mountPath: /workspace
   volumes:
-    - name: config                 # only for opencode.json, used by the fix attempts
+    - name: config                 # agent-run.sh and engine configs, used by the fix attempts
       configMap:
         name: agent-config
   steps:
     - name: verify
-      image: quay.io/pminkows/opencode:latest
+      image: ghcr.io/majowka/factory-agent:latest
       workingDir: /workspace
       volumeMounts:
         - name: config
@@ -45,8 +45,18 @@ spec:
           value: $(params.max-fix-attempts)
         - name: HOME
           value: /workspace/home
-        - name: OPENCODE_CONFIG
-          value: /config/opencode.json
+        - name: OPENCODE_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: opencode-go
+              key: api-key
+              optional: true
+        - name: CLAUDE_CODE_OAUTH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: claude-code-oauth
+              key: token
+              optional: true
       # Build and test the working tree after the agent step. When the build fails, the agent gets the log and fixes it
       # (up to MAX_FIX_ATTEMPTS times, within VERIFY_BUDGET_MINUTES). It never fails the step: the outcome is written to
       # /workspace/out/verify-note.md (always) and /workspace/out/verify-failed (only when the build stays red).
@@ -96,8 +106,7 @@ spec:
 
         Last lines of the output:
         $(tail -n 150 "$LOG")"
-          timeout 15m opencode run "$PROMPT" 2>&1 | tee -a /workspace/opencode.log \
-            || echo "opencode exited with $? (timeout or error); continuing"
+          bash /config/agent-run.sh fix 15m /workspace/agent.log "$PROMPT" || echo "Continuing"
           rm -f .agent-summary.md
         done
 

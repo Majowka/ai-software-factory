@@ -1,0 +1,10 @@
+# k3s / upstream Kubernetes with upstream Tekton Pipelines and Triggers. See deploy/k3s/README.md.
+# kubectl apply -k deploy/k3s
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - serviceaccount-pipeline.yaml
+  - ../../agents
+  - ../../tekton
+  - ingress-new-issue.yaml

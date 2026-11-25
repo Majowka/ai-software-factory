@@ -17,10 +17,74 @@ data:
       -H "Authorization: Bearer ${header}.${payload}.${signature}" \
       -H "Accept: application/vnd.github+json" \
       "https://api.github.com/app/installations/${GITHUB_APP_INSTALLATION_ID}/access_tokens" | jq -er .token
+  # Which engine runs which agent task. Change it here and apply the ConfigMap; the next run picks it up.
+  # A label on the issue / PR overrides it for that issue: engine:claude, engine:opencode, engine-implement:opencode, ...
+  # Tasks: PLAN (plan steps of all three event pipelines), IMPLEMENT (agent steps), FIX (build-fix attempts in
+  # verify-build), REQUIREMENTS (requirements-agent analysis). Values: opencode | claude.
+  routing.env: |
+    AGENT_ENGINE_DEFAULT=opencode
+    AGENT_ENGINE_PLAN=opencode
+    AGENT_ENGINE_IMPLEMENT=claude
+    AGENT_ENGINE_FIX=claude
+    AGENT_ENGINE_REQUIREMENTS=opencode
+    # Models per engine. OpenCode: provider/model (OpenCode Go: opencode-go/<model-id>, list with
+    # curl -H "Authorization: Bearer $OPENCODE_API_KEY" https://opencode.ai/inference/go/v1/models).
+    # Claude Code: an alias (sonnet, opus, haiku) or a full model id. Per-task overrides: OPENCODE_MODEL_<TASK>, CLAUDE_MODEL_<TASK>.
+    OPENCODE_MODEL=opencode-go/kimi-k3
+    CLAUDE_MODEL=sonnet
+    CLAUDE_MODEL_PLAN=opus
+  # Runs one agent task with the engine chosen in routing.env: agent-run.sh <task> <timeout> <log file> <prompt>.
+  # Returns the engine's exit code (124 on timeout). Credentials come from the environment of the step:
+  # OPENCODE_API_KEY (secret opencode-go) and CLAUDE_CODE_OAUTH_TOKEN (secret claude-code-oauth).
+  agent-run.sh: |
+    #!/usr/bin/env bash
+    set -uo pipefail
+    task="$(printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_')"; limit="$2"; log="$3"; prompt="$4"
+    set -a; source /config/routing.env; set +a
+    pick() { local v="${1}_${task}"; if [ -n "${!v:-}" ]; then printf '%s' "${!v}"; else v="$1"; printf '%s' "${!v:-$2}"; fi; }
+    engine="$(pick AGENT_ENGINE "${AGENT_ENGINE_DEFAULT:-opencode}")"
+    # GitHub labels of the issue / PR (written by the prepare steps) win over routing.env:
+    # engine-<task>:<engine> for one task (e.g. engine-implement:opencode), engine:<engine> for all tasks.
+    if [ -s /workspace/agent-labels ]; then
+      t="$(printf '%s' "$task" | tr '[:upper:]_' '[:lower:]-')"
+      label="$(grep -xE "engine-${t}:(opencode|claude)" /workspace/agent-labels | head -n1 || true)"
+      [ -n "$label" ] || label="$(grep -xE 'engine:(opencode|claude)' /workspace/agent-labels | head -n1 || true)"
+      if [ -n "$label" ]; then engine="${label#*:}"; echo "Engine from label ${label}" | tee -a "$log"; fi
+    fi
+    mkdir -p "$(dirname "$log")"
+    case "$engine" in
+      opencode)
+        model="$(pick OPENCODE_MODEL '')"
+        echo "=== ${task}: opencode ${model} ===" | tee -a "$log"
+        OPENCODE_CONFIG=/config/opencode.json timeout "$limit" opencode run ${model:+-m "$model"} "$prompt" 2>&1 | tee -a "$log"
+        rc=${PIPESTATUS[0]} ;;
+      claude)
+        model="$(pick CLAUDE_MODEL sonnet)"
+        echo "=== ${task}: claude ${model} ===" | tee -a "$log"
+        timeout "$limit" claude -p "$prompt" --model "$model" --settings /config/claude-settings.json \
+          --output-format text 2>&1 | tee -a "$log"
+        rc=${PIPESTATUS[0]} ;;
+      *)
+        echo "Unknown engine '${engine}' for task ${task} (routing.env)" | tee -a "$log"; rc=2 ;;
+    esac
+    [ "$rc" -eq 0 ] || echo "${engine} exited with ${rc} (timeout or error)" | tee -a "$log"
+    exit "$rc"
+  # Puts skills and subagents (fetched by fetch-skills, OpenCode layout) where both engines look for them: agent-home.sh [skills dir]
+  agent-home.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+    src="${1:-/skills/opencode}"
+    mkdir -p "$HOME/.config/opencode" "$HOME/.claude/skills" /workspace/out
+    if [ -d "$src" ]; then
+      cp -R "$src/." "$HOME/.config/opencode/"
+      # Claude Code reads the same SKILL.md format. OpenCode subagents (agents/*.md) use another frontmatter and are not copied.
+      if [ -d "$src/skills" ]; then cp -R "$src/skills/." "$HOME/.claude/skills/"; fi
+    fi
+  # OpenCode permissions for every agent task: no commit, no push, no gh, no web. The model comes from routing.env.
   opencode.json: |
     {
       "$schema": "https://opencode.ai/config.json",
-      "model": "qwen38-flash/qwen38_flash",
+      "model": "opencode-go/kimi-k3",
       "permission": {
         "edit": "allow",
         "skill": "allow",
@@ -38,23 +102,30 @@ data:
         "todowrite": false
       },
       "provider": {
-        "qwen38-flash": {
-          "npm": "@ai-sdk/openai-compatible",
-          "name": "Qwen3.8 Flash",
+        "opencode-go": {
           "options": {
-            "baseURL": "http://qwen38-flash.ai.svc.cluster.local:8000/v1",
-            "apiKey": "none"
-          },
-          "models": {
-            "qwen38_flash": {
-              "name": "Qwen3.8 Flash",
-              "limit": {
-                "context": 131072,
-                "output": 8192
-              }
-            }
+            "apiKey": "{env:OPENCODE_API_KEY}"
           }
         }
+      }
+    }
+  # Claude Code permissions, the same rules as opencode.json. Deny rules win over allow rules; in -p mode anything
+  # not allowed is refused instead of prompting.
+  claude-settings.json: |
+    {
+      "permissions": {
+        "allow": ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "Skill", "Task", "TodoWrite"],
+        "deny": [
+          "Bash(git commit:*)",
+          "Bash(git push:*)",
+          "Bash(gh:*)",
+          "WebFetch",
+          "WebSearch"
+        ]
+      },
+      "env": {
+        "DISABLE_AUTOUPDATER": "1",
+        "DISABLE_TELEMETRY": "1"
       }
     }
   # Helpers shared by the requirements scan (CronJob) and the requirements-agent pipeline. Source it; it needs GH_TOKEN and REPO_FULL_NAME.
@@ -76,88 +147,4 @@ data:
     req_children() {
       gh issue list --repo "$REPO_FULL_NAME" --label "req-$1" --state all --limit 200 --json number,title,state,body \
         | jq --arg n "$1" '[.[] | (.body | capture("<!-- requirements:" + $n + ":(?<id>[a-z0-9-]+) -->")?) as $m | select($m) | {id: $m.id, number, title, state}]'
-    }
-  # Used by the requirements-agent analyze step: the agent only reads the repository and writes /workspace/out/issues.json, no gh at all.
-  opencode-requirements.json: |
-    {
-      "$schema": "https://opencode.ai/config.json",
-      "model": "qwen38-flash/qwen38_flash",
-      "permission": {
-        "edit": "allow",
-        "skill": "allow",
-        "task": "allow",
-        "webfetch": "deny",
-        "external_directory": "allow",
-        "bash": {
-          "*": "allow",
-          "git commit*": "deny",
-          "git push*": "deny",
-          "gh *": "deny"
-        }
-      },
-      "tools": {
-        "todowrite": false
-      },
-      "provider": {
-        "qwen38-flash": {
-          "npm": "@ai-sdk/openai-compatible",
-          "name": "Qwen3.8 Flash",
-          "options": {
-            "baseURL": "http://qwen38-flash.ai.svc.cluster.local:8000/v1",
-            "apiKey": "none"
-          },
-          "models": {
-            "qwen38_flash": {
-              "name": "Qwen3.8 Flash",
-              "limit": {
-                "context": 131072,
-                "output": 16384
-              }
-            }
-          }
-        }
-      }
-    }
-  # Used by the plan steps only: same as opencode.json, but the agent may post its plan with `gh issue comment` / `gh pr comment`.
-  opencode-plan.json: |
-    {
-      "$schema": "https://opencode.ai/config.json",
-      "model": "qwen38-flash/qwen38_flash",
-      "permission": {
-        "edit": "allow",
-        "skill": "allow",
-        "task": "allow",
-        "webfetch": "deny",
-        "external_directory": "allow",
-        "bash": {
-          "*": "allow",
-          "git commit*": "deny",
-          "git push*": "deny",
-          "gh *": "deny",
-          "gh issue comment*": "allow",
-          "gh pr comment*": "allow"
-        }
-      },
-      "tools": {
-        "todowrite": false
-      },
-      "provider": {
-        "qwen38-flash": {
-          "npm": "@ai-sdk/openai-compatible",
-          "name": "Qwen3.8 Flash",
-          "options": {
-            "baseURL": "http://qwen38-flash.ai.svc.cluster.local:8000/v1",
-            "apiKey": "none"
-          },
-          "models": {
-            "qwen38_flash": {
-              "name": "Qwen3.8 Flash",
-              "limit": {
-                "context": 131072,
-                "output": 8192
-              }
-            }
-          }
-        }
-      }
     }

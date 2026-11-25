@@ -29,7 +29,7 @@ spec:
         name: agent-config
   steps:
     - name: create
-      image: quay.io/pminkows/opencode:latest
+      image: ghcr.io/majowka/factory-agent:latest
       volumeMounts:
         - name: config
           mountPath: /config
@@ -132,6 +132,12 @@ spec:
         gh label create "req-${ISSUE_NUMBER}" --repo "$REPO_FULL_NAME" --color 5319e7 \
           --description "Tasks of requirements issue #${ISSUE_NUMBER}" 2>/dev/null || true
 
+        # Engine labels of the requirements issue (engine:..., engine-<task>:...) are copied to its tasks
+        engine_labels=()
+        while read -r l; do
+          if [ -n "$l" ]; then engine_labels+=(--label "$l"); fi
+        done < <(gh issue view "$ISSUE_NUMBER" --repo "$REPO_FULL_NAME" --json labels -q '.labels[].name | select(startswith("engine"))' || true)
+
         while read -r task; do
           [ -n "$task" ] || continue
           id="$(jq -r .id <<<"$task")"
@@ -144,7 +150,7 @@ spec:
             if [ -n "$deps" ]; then printf ' Depends on %s, already merged.' "$deps"; fi
             printf '\n'
           } > /tmp/task.md
-          url="$(gh issue create --repo "$REPO_FULL_NAME" --title "$title" --body-file /tmp/task.md --label "req-${ISSUE_NUMBER}")"
+          url="$(gh issue create --repo "$REPO_FULL_NAME" --title "$title" --body-file /tmp/task.md --label "req-${ISSUE_NUMBER}" ${engine_labels[@]+"${engine_labels[@]}"})"
           number="${url##*/}"
           children="$(jq -c --arg id "$id" --argjson number "$number" --arg title "$title" '. + [{id: $id, number: $number, title: $title, state: "OPEN"}]' <<<"$children")"
           echo "Created #${number} (${id}): ${title}"

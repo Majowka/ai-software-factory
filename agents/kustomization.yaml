@@ -1,0 +1,6 @@
+# Agent configuration (agent-config) and the requirements skill ConfigMap.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - configmap-agent-config.yaml
+  - skills
