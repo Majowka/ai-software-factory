@@ -25,7 +25,7 @@ spec:
             - name: filter
               value: body.action == 'opened' && (body.issue.author_association in
                 ['OWNER', 'MEMBER', 'COLLABORATOR'] || body.issue.user.login ==
-                'ai-software-factory-agent[bot]') && !body.issue.labels.exists(l,
+                'klaudiuszai[bot]') && !body.issue.labels.exists(l,
                 l.name in ['manual', 'requirements'])
           ref:
             kind: ClusterInterceptor

@@ -48,7 +48,7 @@ Lista zadań dla gałęzi `claude/project-thread-cvdyq6`. Kolejność = kolejno�
 - [x] Tunel `k3s-ai-factory` i VPC Service `ai-factory-el` założone przez API CF; token tunelu w Infisical (`infra-k3s` / `vrtx-cluster`).
 - [ ] Token deployu Workera: dodać Connectivity Directory: Bind.
 - [ ] Po deployu Workera: `FACTORY_REPO_IDS`, `FACTORY_ROUTE_ENABLED=true`; Secrety `cloudflared-tunnel` i `github-webhook-secret` (= sekret webhooka App) w `ai-factory`.
-- [ ] Login bota w CEL i `GIT_AUTHOR_*` → `klaudiuszai[bot]`.
+- [x] Login bota w CEL i `GIT_AUTHOR_*` → `klaudiuszai[bot]`.
 
 ## 5. Dokumentacja
 

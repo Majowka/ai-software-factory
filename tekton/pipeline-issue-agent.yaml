@@ -413,13 +413,13 @@ spec:
               - name: HOME
                 value: /workspace/home
               - name: GIT_AUTHOR_NAME
-                value: ai-software-factory-agent[bot]
+                value: klaudiuszai[bot]
               - name: GIT_AUTHOR_EMAIL
-                value: 5642464+ai-software-factory-agent[bot]@users.noreply.github.com
+                value: 290278935+klaudiuszai[bot]@users.noreply.github.com
               - name: GIT_COMMITTER_NAME
-                value: ai-software-factory-agent[bot]
+                value: klaudiuszai[bot]
               - name: GIT_COMMITTER_EMAIL
-                value: 5642464+ai-software-factory-agent[bot]@users.noreply.github.com
+                value: 290278935+klaudiuszai[bot]@users.noreply.github.com
             script: |
               #!/usr/bin/env bash
               set -euo pipefail

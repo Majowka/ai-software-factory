@@ -229,10 +229,11 @@ installation tokens, so no personal access token is needed.
 
 ### 2.4 Commit identity
 
-The pipelines set the commit author to `ai-software-factory-agent[bot]` with an email like
-`5642464+ai-software-factory-agent[bot]@users.noreply.github.com`. Replace the name and the
-number in the `GIT_AUTHOR_*` and `GIT_COMMITTER_*` variables of the `publish` steps with your
-app's slug and bot user id:
+The pipelines set the commit author to our GitHub App, `klaudiuszai[bot]`, with the email
+`290278935+klaudiuszai[bot]@users.noreply.github.com`. The `new-issue` CEL filter also accepts issues
+opened by this bot. For another app, replace the name and the number in the `GIT_AUTHOR_*` and
+`GIT_COMMITTER_*` variables of the `publish` steps and the login in `tekton/eventlistener-new-issue.yaml`
+with your app's slug and bot user id:
 
 ```bash
 gh api "/users/<app-slug>%5Bbot%5D" --jq .id
