@@ -229,6 +229,163 @@ data:
     # Its own run: together with the other shards, tests/unit/bridge shadows the repository's bridge package
     shard unit-bridge tests/unit/bridge/ tests/unit/test_issue_6052_bridge_logs_and_tasks.py tests/unit/test_mirror_helper.py
     rm -f test*.db
+  # Automated review (`@ai review`, pr-review-agent). REVIEW_APPROVE_REPOS: space-separated owner/repo list where the review
+  # may APPROVE a pull request (verdict approve, no blocker or major remark, no failed check). Empty by default: with
+  # branch protection that counts the App's approval, the factory could otherwise unblock the merge of its own code.
+  # Blockers always request changes; everything else is a comment.
+  review.env: |
+    REVIEW_APPROVE_REPOS=""
+  # Posts the review of pr-review-agent (publish step): review-publish.sh. Reads /workspace/out/review.md (report) and
+  # /workspace/out/review.json (verdict and findings of the code-review skill), pr.diff, head-sha, ci-failures.md.
+  # One GitHub review: inline comments on the diff lines of the findings (the others go to the body), REQUEST_CHANGES with
+  # a blocker, APPROVE only where review.env allows it, else COMMENT. Falls back to a comment / no inline comments when
+  # GitHub refuses (no verdict on the App's own PR, a line outside the diff). Then supersedes the earlier factory reviews
+  # of the PR: dismisses their verdict, folds their body and hides their inline comments as outdated. Needs GH_TOKEN.
+  review-publish.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+    w="${REVIEW_WORKDIR:-/workspace}"
+    cfg="${REVIEW_CONFIG:-/config/review.env}"
+    REVIEW_APPROVE_REPOS=""
+    # shellcheck disable=SC1090
+    [ -f "$cfg" ] && . "$cfg"
+    HEAD="$(cat "$w/head-sha")"
+    ENGINE="$(cat "$w/review-engine" 2>/dev/null || true)"; ENGINE="${ENGINE:-unknown}"
+    MARKER='<!-- factory:review -->'
+
+    # Lines of the head version a comment can sit on: added and context lines of the hunks of pr.diff ("path<TAB>line")
+    awk '
+      /^diff --git / { path = ""; inhunk = 0; next }
+      !inhunk && /^\+\+\+ / { p = substr($0, 5); if (p == "/dev/null") path = ""; else { sub(/^b\//, "", p); path = p }; next }
+      !inhunk && /^@@ / {
+        if (match($0, /^@@ -[0-9]+(,[0-9]+)? \+[0-9]+(,[0-9]+)? @@/)) {
+          split(substr($0, 4, RLENGTH - 6), parts, " ")
+          o = substr(parts[1], 2); n = substr(parts[2], 2)
+          oldleft = (index(o, ",") ? substr(o, index(o, ",") + 1) : 1) + 0
+          newline = (index(n, ",") ? substr(n, 1, index(n, ",") - 1) : n) + 0
+          newleft = (index(n, ",") ? substr(n, index(n, ",") + 1) : 1) + 0
+          inhunk = (oldleft > 0 || newleft > 0)
+        }
+        next
+      }
+      inhunk {
+        c = substr($0, 1, 1)
+        if (c == "\\") next
+        if (c == "-") oldleft--
+        else { if (path != "") print path "\t" newline; newline++; newleft--; if (c != "+") oldleft-- }
+        if (oldleft <= 0 && newleft <= 0) inhunk = 0
+      }' "$w/pr.diff" | jq -R 'split("\t") | {(.[0] + ":" + .[1]): true}' | jq -s 'add // {}' > "$w/diff-lines.json"
+
+    # Structured findings of the agent. Missing or invalid: the report is posted as it is, as a comment.
+    if jq -e '(.findings | type == "array") and (.verdict | type == "string")' "$w/out/review.json" >/dev/null 2>&1; then
+      jq --slurpfile lines "$w/diff-lines.json" '
+        {verdict: (.verdict | ascii_downcase | gsub("[ -]"; "_")),
+         findings: [.findings[] | select(type == "object" and (.body // .message | type == "string"))
+           | {severity: ((.severity // "minor") | ascii_downcase | if IN("blocker", "major", "minor") then . else "minor" end),
+              path: ((.path // .file // "") | tostring | sub("^(\\./|b/)"; "")),
+              line: ((.line // 0) | tonumber? // 0),
+              body: (.body // .message)}
+           | .inline = ($lines[0][(.path + ":" + (.line | tostring))] == true)]}' "$w/out/review.json" > "$w/findings.json"
+      STRUCTURED=1
+    else
+      echo "No valid /workspace/out/review.json: posting the report without inline comments"
+      echo '{"verdict":"comment","findings":[]}' > "$w/findings.json"
+      STRUCTURED=0
+    fi
+    BLOCKERS="$(jq '[.findings[] | select(.severity == "blocker")] | length' "$w/findings.json")"
+    MAJORS="$(jq '[.findings[] | select(.severity == "major")] | length' "$w/findings.json")"
+    VERDICT="$(jq -r .verdict "$w/findings.json")"
+    INLINE="$(jq '[.findings[] | select(.inline)] | length' "$w/findings.json")"
+    echo "Findings: $(jq '.findings | length' "$w/findings.json") (blocker ${BLOCKERS}, major ${MAJORS}), ${INLINE} on diff lines, verdict ${VERDICT}"
+
+    # Event: blockers request changes; approve only where the repository allows it, with no blocker or major remark and no failed check
+    EVENT=COMMENT
+    if [ "$BLOCKERS" -gt 0 ]; then
+      EVENT=REQUEST_CHANGES
+    elif [ "$VERDICT" = "approve" ] && [ "$MAJORS" -eq 0 ] && [ ! -s "$w/ci-failures.md" ] \
+      && printf ' %s ' $REVIEW_APPROVE_REPOS | grep -qiF " ${REPO_FULL_NAME} "; then
+      EVENT=APPROVE
+    fi
+
+    # Body: the report without its Remarks section (they come from findings.json), then the remarks not on a diff line
+    build_body() { # $1 event, $2 1 = inline comments are posted
+      local event="$1" inline="$2" effect
+      case "$event" in
+        REQUEST_CHANGES) effect="This review **requests changes**: it found ${BLOCKERS} blocker(s)." ;;
+        APPROVE) effect="This review **approves** the pull request (enabled for this repository)." ;;
+        *) if [ "$BLOCKERS" -gt 0 ]; then effect="It found ${BLOCKERS} blocker(s), but GitHub did not accept a review requesting changes here (for example on a pull request of the factory itself), so it is a comment."
+           else effect="This review neither approves nor blocks the pull request."; fi ;;
+      esac
+      printf '%s\n## Automated review\n\n' "$MARKER"
+      printf '_Requested by @%s. Commit %s, reviewed by %s. Read-only: the factory changed nothing on this branch._ %s\n\n' \
+        "$COMMENT_AUTHOR" "$HEAD" "$ENGINE" "$effect"
+      if [ "$STRUCTURED" = 1 ]; then
+        awk '/^#+[[:space:]]+Remarks[[:space:]]*$/ { skip = 1; next } skip && /^#+[[:space:]]/ { skip = 0 } !skip' "$w/out/review.md" | head -c 50000
+        printf '\n### Remarks\n'
+        jq -r --argjson inline "$inline" '
+          .findings as $f
+          | ($f | map(select(.inline and $inline == 1)) | length) as $n
+          | ($f | map(select((.inline and $inline == 1) | not))) as $rest
+          | (if $n > 0 then "\($n) remark(s) are inline comments on the diff.\n" else "" end)
+            + (if ($rest | length) > 0 then
+                 ($rest | to_entries | map("\(.key + 1). **\(.value.severity)** `\(.value.path):\(.value.line)`: \(.value.body)") | join("\n")) + "\n"
+               elif $n == 0 then "_No remarks._\n" else "" end)' "$w/findings.json" | head -c 15000
+      else
+        head -c 60000 "$w/out/review.md"
+      fi
+    }
+    comments_json() {
+      jq '[.findings[] | select(.inline) | {path, line, side: "RIGHT", body: "**\(.severity)**: \(.body)"}]' "$w/findings.json"
+    }
+    post_review() { # $1 event, $2 inline 1/0
+      build_body "$1" "$2" > "$w/review-body.md"
+      if [ "$2" = 1 ]; then comments_json; else echo '[]'; fi > "$w/review-comments.json"
+      jq -n --arg sha "$HEAD" --arg event "$1" --rawfile body "$w/review-body.md" --slurpfile c "$w/review-comments.json" \
+        '{commit_id: $sha, event: $event, body: $body} + (if ($c[0] | length) > 0 then {comments: $c[0]} else {} end)' \
+        | gh api -X POST "repos/${REPO_FULL_NAME}/pulls/${PR_NUMBER}/reviews" --input - > "$w/review-posted.json"
+    }
+
+    # Earlier reviews of the factory on this pull request, replaced once the new one is posted
+    gh api --paginate "repos/${REPO_FULL_NAME}/pulls/${PR_NUMBER}/reviews?per_page=100" \
+      --jq ".[] | select(.user.type == \"Bot\" and (.body | contains(\"${MARKER}\"))) | {id, state, body}" | jq -s . > "$w/old-reviews.json" \
+      || echo '[]' > "$w/old-reviews.json"
+
+    # GitHub refuses to approve or request changes on a pull request of the App itself (factory PRs), and a line it does
+    # not accept fails the whole review: fall back to a comment, then to a review without inline comments.
+    POSTED=""
+    for attempt in "${EVENT} 1" "COMMENT 1" "${EVENT} 0" "COMMENT 0"; do
+      case " ${POSTED_TRIED:-} " in *" ${attempt/ /:} "*) continue ;; esac
+      POSTED_TRIED="${POSTED_TRIED:-} ${attempt/ /:}"
+      if post_review ${attempt}; then POSTED="$attempt"; break; fi
+      echo "Review refused (event ${attempt% *}, inline comments ${attempt#* }); trying the next fallback"
+    done
+    [ -n "$POSTED" ] || { echo "GitHub refused every form of the review"; exit 1; }
+    EVENT="${POSTED% *}"
+    URL="$(jq -r .html_url "$w/review-posted.json")"
+    NEW_ID="$(jq -r .id "$w/review-posted.json")"
+    echo "Posted ${EVENT} review: ${URL}"
+
+    # Supersede the older reviews: dismiss a verdict, fold the body, hide its inline comments as outdated
+    jq -c --argjson new "$NEW_ID" '.[] | select(.id != $new)' "$w/old-reviews.json" | while IFS= read -r old; do
+      id="$(jq -r .id <<<"$old")"; state="$(jq -r .state <<<"$old")"
+      if [ "$state" = CHANGES_REQUESTED ] || [ "$state" = APPROVED ]; then
+        gh api -X PUT "repos/${REPO_FULL_NAME}/pulls/${PR_NUMBER}/reviews/${id}/dismissals" \
+          -f message="Superseded by a newer automated review: ${URL}" -f event=DISMISS >/dev/null \
+          || echo "Could not dismiss review ${id}"
+      fi
+      jq -r --arg url "$URL" --arg m "$MARKER" \
+        '"<!-- factory:review-superseded -->\n_Superseded by [a newer automated review](\($url))._\n\n<details><summary>Previous review</summary>\n\n" + (.body | gsub($m; "")) + "\n</details>\n"' \
+        <<<"$old" > "$w/old-body.md"
+      jq -n --rawfile body "$w/old-body.md" '{body: $body}' \
+        | gh api -X PUT "repos/${REPO_FULL_NAME}/pulls/${PR_NUMBER}/reviews/${id}" --input - >/dev/null \
+        || echo "Could not update review ${id}"
+      gh api --paginate "repos/${REPO_FULL_NAME}/pulls/${PR_NUMBER}/reviews/${id}/comments?per_page=100" --jq '.[].node_id' 2>/dev/null \
+        | while IFS= read -r node; do
+            gh api graphql -f query='mutation($id: ID!) { minimizeComment(input: {subjectId: $id, classifier: OUTDATED}) { clientMutationId } }' \
+              -f id="$node" >/dev/null || echo "Could not hide comment ${node}"
+          done
+      echo "Superseded review ${id} (${state})"
+    done
   # Failed CI checks of one commit with the tail of each log, as Markdown: ci-failures.sh <owner/repo> <sha> <output file>.
   # Needs GH_TOKEN of the GitHub App with Checks: read (check runs), Actions: read (job logs of GitHub Actions) and Commit statuses: read.
   # Missing permissions only make the report shorter: the script never fails the step. An empty file means nothing failed.
