@@ -124,8 +124,10 @@ data:
     CLAUDE_MODEL=sonnet
     CLAUDE_MODEL_PLAN=opus
     # How many agent tasks may talk to one engine at the same time (all runs together); the rest wait in a FIFO queue
-    # (llm-slot.sh). 0 = no limit. More parallel calls than the provider allows end in HTTP 429.
-    LLM_SLOTS_OPENCODE=3
+    # (llm-slot.sh). 0 = no limit. More parallel calls than the provider allows end in HTTP 429: OpenCode Go
+    # (deepseek-v4.1-flash) took 9-11 parallel tasks without 429 and answered "Rate limit exceeded" from 13 on
+    # (2026-11-25). OpenCode retries a 429 by itself (it only shows in its own log), so the run gets slow, not red.
+    LLM_SLOTS_OPENCODE=8
     LLM_SLOTS_CLAUDE=2
     # On HTTP 429 / overload from the provider: how many times a task runs again, and the first wait in seconds (doubles)
     LLM_RATE_RETRIES=4

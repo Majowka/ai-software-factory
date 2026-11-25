@@ -722,14 +722,15 @@ not finished) and starts the oldest waiting ones, until `MAX_ACTIVE` (6) are act
 stay pending; to start one by hand: `kubectl patch pipelinerun <name> -n <namespace> --type merge -p '{"spec":{"status":null}}'`.
 
 **LLM calls.** Every agent task goes through `agent-run.sh`, which first takes a slot of its engine (`llm-slot.sh`):
-at most `LLM_SLOTS_OPENCODE` (3) tasks talk to OpenCode and `LLM_SLOTS_CLAUDE` (2) to Claude Code at the same time,
+at most `LLM_SLOTS_OPENCODE` (8) tasks talk to OpenCode and `LLM_SLOTS_CLAUDE` (2) to Claude Code at the same time,
 across all runs. The others wait in arrival order (FIFO) and say so in their log every minute. Slots and the queue
 are `Lease` objects in the namespace (`llm-slot-<engine>-<i>`, `llm-q-<engine>-...`, Role `llm-slots` for the
 `pipeline` service account); a step renews its lease every 20 s, so a slot of a pod that died comes free after 90 s.
 Waiting does not count against the task's own time limit. When the API cannot be used, the task runs without a slot.
 A Claude task that falls back to OpenCode gives its Claude slot back and queues for an OpenCode one.
 
-When OpenCode still fails on the provider's rate limit (HTTP 429, too many requests, overloaded), `agent-run.sh` runs
+OpenCode retries a 429 by itself (it shows only in `$HOME/.local/share/opencode/log/`), which made tasks of
+busy runs spend half their time waiting. When OpenCode still exits on the provider's rate limit (HTTP 429, too many requests, overloaded), `agent-run.sh` runs
 the task again up to `LLM_RATE_RETRIES` (4) times, waiting `LLM_RATE_BACKOFF` (30) seconds, doubled every time, plus
 jitter, as long as the task's time limit allows. All these values are in `routing.env`.
 
