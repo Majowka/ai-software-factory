@@ -296,9 +296,10 @@ spec:
               fi
               # The base of THIS pull request (the event only knows the default branch of the repository)
               echo "$PR_BASE" > /workspace/base-branch
-              # `@ai fix` (optionally `@ai fix ci`) with nothing else: fix the failing CI of the head commit, like ci-fix,
-              # but on request and on any pull request of the repository, without the automatic attempt counter
-              REQUEST="$(printf '%s' "$COMMENT_BODY" | tr '\r\n\t' '   ' | sed -E 's/ +/ /g; s/^ //; s/ $//' | tr 'A-Z' 'a-z')"
+              # First line `@ai fix` (optionally `@ai fix ci`): fix the failing CI of the head commit, like ci-fix, but on request
+              # and on any pull request of the repository, without the automatic attempt counter. Only the first line counts:
+              # clients add signatures below the command; further lines reach the agent as notes.
+              REQUEST="$(printf '%s\n' "$COMMENT_BODY" | head -n 1 | tr '\r\t' '  ' | sed -E 's/ +/ /g; s/^ //; s/ $//' | tr 'A-Z' 'a-z')"
               if [ "$MODE" = "comment" ] && { [ "$REQUEST" = "@ai fix" ] || [ "$REQUEST" = "@ai fix ci" ]; }; then
                 # The checks may still be running when someone asks: wait for them before reading the logs
                 CI_WAIT_SECONDS=900 bash /config/ci-failures.sh "$REPO_FULL_NAME" "$PR_HEAD" /workspace/ci-failures.md
@@ -551,7 +552,13 @@ spec:
               if [ "$MODE" = "ci-fix" ] || [ -f /workspace/ci-fix-request ]; then
                 TASK=ci-fix
                 ASKED=""
-                if [ -f /workspace/ci-fix-request ]; then ASKED=" and ${COMMENT_AUTHOR} asked you to fix them"; fi
+                if [ -f /workspace/ci-fix-request ]; then
+                  ASKED=" and ${COMMENT_AUTHOR} asked you to fix them with this comment (lines after the first are notes; ignore signatures):
+              ----- COMMENT -----
+              ${COMMENT_BODY}
+              -------------------
+              "
+                fi
                 PROMPT="You are working on the pull request below, on its head branch '${BRANCH}' (base branch '${BASE_BRANCH}'), following the repository's AGENTS.md.
               The CI checks of its head commit failed${ASKED}. Their log tails are in the section 'Failing CI checks of the head commit' at the end (full report: /workspace/ci-failures.md).
 

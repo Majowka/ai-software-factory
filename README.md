@@ -766,8 +766,8 @@ usually means a wrong secret, and a timeout means GitHub cannot reach the URL.
   (the trigger skips pull requests). `@ai review` starts `pr-review-agent` (read-only); any other
   `@ai ...` on a pull request starts `pr-comment-agent`, which pushes to the PR branch. On pull requests
   not opened by the factory nothing runs without an explicit `@ai` from someone with write access.
-- `@ai fix` (or `@ai fix ci`) with nothing else waits up to 15 minutes for running checks, then fixes the
-  failed ones; with no failed checks it only replies. The agent pushes a new commit of the bot and never
+- A comment whose first line is `@ai fix` (or `@ai fix ci`) waits up to 15 minutes for running checks, then fixes the
+  failed ones (further lines are notes for the agent); with no failed checks it only replies. The agent pushes a new commit of the bot and never
   force-pushes: when someone pushed to the branch during the run, the push is rejected and the reply says so.
 - Pull requests from forks and pull requests whose head is the default branch are refused with a comment
   (the GitHub App cannot push to a fork).
