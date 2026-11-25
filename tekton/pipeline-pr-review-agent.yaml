@@ -234,7 +234,7 @@ spec:
               Pipeline context: you run non-interactively with no GitHub credentials. Write the report to /workspace/out/review.md and the findings to /workspace/out/review.json; the pipeline posts them as one review. Do not modify, commit or push repository files and do not run gh."
 
               bash /config/agent-run.sh review 30m /workspace/review.log "$PROMPT" || echo "Agent ended with an error; using what it wrote"
-              sed -nE 's/^=== REVIEW: (.*) ===$/\1/p' /workspace/review.log | head -n 1 > /workspace/review-engine || true
+              sed -nE 's/^=== REVIEW: (.*) ===$/\1/p' /workspace/review.log | tail -n 1 > /workspace/review-engine || true
               # The review must not change the checkout (it is thrown away anyway, nothing is pushed)
               git status --short | head -n 20
               test -s /workspace/out/review.md || { echo "The agent wrote no review"; exit 1; }
