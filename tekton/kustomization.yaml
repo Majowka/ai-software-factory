@@ -14,6 +14,7 @@ resources:
   - rolebinding-requirements-scheduler.yaml
   - serviceaccount-issue-agent-listener.yaml
   - serviceaccount-requirements-scheduler.yaml
+  - task-authorize-author.yaml
   - task-create-issues.yaml
   - task-fetch-skills.yaml
   - task-report-failure.yaml
