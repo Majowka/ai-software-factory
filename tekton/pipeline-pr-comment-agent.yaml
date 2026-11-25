@@ -553,6 +553,9 @@ spec:
           value: $(params.verify-command)
         - name: max-fix-attempts
           value: $(params.max-fix-attempts)
+        # HEAD is the pull request branch, not the base the bug was on
+        - name: regression-test
+          value: "off"
     - name: publish
       runAfter:
         - verify

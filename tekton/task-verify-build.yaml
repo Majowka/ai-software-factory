@@ -24,6 +24,12 @@ spec:
     - name: max-fix-attempts
       type: string
       default: "3"
+    - name: regression-test
+      type: string
+      default: auto
+      description: >-
+        auto: for an issue labelled as a bug (regression-test.sh in agent-config), a green build also needs a new test that
+        fails on the base commit and passes with the change. off: no such check (pr-comment-agent, where HEAD is not the base).
     - name: self-review-rounds
       type: string
       default: "2"
@@ -61,6 +67,8 @@ spec:
           value: $(params.max-fix-attempts)
         - name: SELF_REVIEW_ROUNDS
           value: $(params.self-review-rounds)
+        - name: REGRESSION_TEST
+          value: $(params.regression-test)
         - name: HOME
           value: /workspace/home
         - name: OPENCODE_API_KEY
@@ -92,7 +100,10 @@ spec:
         MAX_FIX_ATTEMPTS="${MAX_FIX_ATTEMPTS:-3}"
         SELF_REVIEW_ROUNDS="${SELF_REVIEW_ROUNDS:-2}"
         BUDGET_MINUTES="${VERIFY_BUDGET_MINUTES:-75}"
-        rm -f "$OUT/verify-note.md" "$OUT/verify-failed" "$OUT/self-review.md"
+        rm -f "$OUT/verify-note.md" "$OUT/verify-failed" "$OUT/self-review.md" "$OUT/regression-check.md"
+        # The agent names its regression test here; never committed
+        take_regression_file() { if [ -f .agent-regression-test.txt ]; then mv .agent-regression-test.txt "$OUT/regression-test.txt"; fi; }
+        take_regression_file
 
         if [ -f /workspace/skip ]; then echo "Nothing to do"; exit 0; fi
         if [ -z "$(git status --porcelain -uall -- . ':(exclude)**/target/**')" ]; then
@@ -161,7 +172,55 @@ spec:
           return 0
         }
 
+        # Bug issues: the new test must fail on the base commit and pass with the change. Returns 0 when that holds (or
+        # the check does not apply), 1 otherwise with the reason in $OUT/regression-check.md.
+        source /config/regression-test.sh
+        regression_needed=false
+        if [ "${REGRESSION_TEST:-auto}" = "auto" ] && is_bug; then regression_needed=true; echo "Bug issue: a regression test is required"; fi
+        regression_check() {
+          local why="" rcmd="" f base=/workspace/regression-base
+          rm -f "$OUT/regression-check.md"
+          git add -A -- . ':(exclude)**/target/**'
+          local tests; tests="$(git diff --cached --name-only --diff-filter=AM HEAD | while IFS= read -r f; do if is_test_path "$f"; then echo "$f"; fi; done)"
+          if [ -f "$OUT/regression-test.txt" ]; then
+            rcmd="$(sed -nE 's/^[[:space:]]*command:[[:space:]]*//p' "$OUT/regression-test.txt" | head -n 1 | tr -d '\r')"
+          fi
+          if [ -z "$tests" ]; then
+            why="The change adds or modifies no test file."
+          elif [ -z "$rcmd" ]; then
+            why="There is no .agent-regression-test.txt with a 'command: ...' line that runs the new test(s)."
+          else
+            echo "=== Regression test: ${rcmd} ==="
+            echo "Test files of the change:"; printf '  %s\n' $tests
+            if ! timeout 15m bash -c "$rcmd" > /workspace/regression-after.log 2>&1; then
+              why="The regression test command fails with the change applied. Last lines:
+        $(tail -n 60 /workspace/regression-after.log)"
+            else
+              # Base commit plus only the new and changed test files
+              git worktree remove --force "$base" 2>/dev/null || true
+              git worktree add -q --detach "$base" HEAD
+              while IFS= read -r f; do mkdir -p "$base/$(dirname "$f")"; cp "$f" "$base/$f"; done <<<"$tests"
+              if (cd "$base" && timeout 15m bash -c "$rcmd") > /workspace/regression-base.log 2>&1; then
+                why="The regression test passes on the base commit too (the code without your fix, with your test files copied in), so it does not reproduce the bug. Make it exercise the failing path through the real code. Last lines on the base commit:
+        $(tail -n 40 /workspace/regression-base.log)"
+              else
+                echo "Regression test fails on the base commit and passes with the change"
+                tail -n 15 /workspace/regression-base.log
+              fi
+              git worktree remove --force "$base" 2>/dev/null || true
+            fi
+          fi
+          if [ -n "$why" ]; then
+            printf '%s\n' "$why" > "$OUT/regression-check.md"
+            echo "=== Regression test check failed ==="; cat "$OUT/regression-check.md"
+            return 1
+          fi
+          return 0
+        }
+
         deadline=$(( $(date +%s) + BUDGET_MINUTES * 60 ))
+        regression_fixes=0
+        regression_ok=true
         attempt=0
         review_round=0
         review_fixes=0
@@ -169,6 +228,28 @@ spec:
           echo "=== Verify: ${cmd} (fix attempts used: ${attempt}/${MAX_FIX_ATTEMPTS}) ==="
           if timeout 20m bash -c "$cmd" > "$LOG" 2>&1; then
             tail -n 20 "$LOG"
+            if [ "$regression_needed" = true ]; then
+              regression_ok=true
+              if ! regression_check; then
+                regression_ok=false
+                if [ "$regression_fixes" -lt 2 ] && [ "$(date +%s)" -lt "$deadline" ]; then
+                  regression_fixes=$((regression_fixes + 1))
+                  echo "=== Asking the agent for a regression test (round ${regression_fixes}/2) ==="
+                  PROMPT="The build passes, but this bug fix lacks a valid regression test. $(cat "$OUT/regression-check.md")
+
+        ${REGRESSION_TEST_RULES}
+
+        Keep the fix itself; do not delete or weaken other tests. The full build must still pass: ${cmd}. The pipeline handles git and GitHub; do not write .agent-summary.md.${script_note}
+
+        The task:
+        $(task_context)"
+                  bash /config/agent-run.sh fix 20m /workspace/agent.log "$PROMPT" || echo "Continuing"
+                  rm -f .agent-summary.md .agent-pr.txt
+                  take_regression_file
+                  continue
+                fi
+              fi
+            fi
             verdict=0
             if [ "$review_round" -le "$SELF_REVIEW_ROUNDS" ] && [ "$SELF_REVIEW_ROUNDS" -gt 0 ] && [ "$(date +%s)" -lt "$deadline" ]; then
               review_round=$((review_round + 1))
@@ -187,6 +268,7 @@ spec:
         $(task_context)"
                 bash /config/agent-run.sh fix 20m /workspace/agent.log "$PROMPT" || echo "Continuing"
                 rm -f .agent-summary.md .agent-pr.txt .agent-review-reply.md
+                take_regression_file
                 continue
               fi
             fi
@@ -206,6 +288,19 @@ spec:
               # A blocker that survived the fix rounds keeps the pull request a draft (no auto-merge)
               if [ "$verdict" -eq 2 ]; then cp "$OUT/verify-note.md" "$OUT/verify-failed"; fi
             fi
+            if [ "$regression_needed" = true ]; then
+              if [ "$regression_ok" = true ]; then
+                printf '\n:white_check_mark: Regression test fails on the base commit and passes with the change (`%s`).\n' \
+                  "$(sed -nE 's/^[[:space:]]*command:[[:space:]]*//p' "$OUT/regression-test.txt" | head -n 1)" >> "$OUT/verify-note.md"
+              else
+                {
+                  printf '\n:warning: **No valid regression test** for this bug fix:\n\n<details><summary>Why</summary>\n\n```\n'
+                  cat "$OUT/regression-check.md"
+                  printf '```\n\n</details>\n'
+                } >> "$OUT/verify-note.md"
+                cp "$OUT/verify-note.md" "$OUT/verify-failed"
+              fi
+            fi
             exit 0
           fi
           tail -n 100 "$LOG"
@@ -221,6 +316,7 @@ spec:
         $(tail -n 150 "$LOG")"
           bash /config/agent-run.sh fix 15m /workspace/agent.log "$PROMPT" || echo "Continuing"
           rm -f .agent-summary.md .agent-pr.txt
+          take_regression_file
         done
 
         {
