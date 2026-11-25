@@ -440,6 +440,9 @@ spec:
     - name: verify
       runAfter:
         - handle-issue-comment
+      # Build, fix attempts, regression-test check and self-review rounds: the script budget is 75 minutes and the last
+      # phase may start just before it ends. Without this the TaskRun gets Tekton's default of 1h and is killed mid-run.
+      timeout: 2h30m0s
       taskRef:
         name: verify-build
       workspaces:
