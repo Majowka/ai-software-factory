@@ -32,7 +32,9 @@ spec:
         fails on the base commit and passes with the change. off: no such check (pr-comment-agent, where HEAD is not the base).
     - name: self-review-rounds
       type: string
-      default: "2"
+      # 1: review, fix, build, and a last review that only reports. On mesh-manager (2026-11-25) every review asked for
+      # changes and one review + fix + build round took 25-40 minutes, so a second fix round rarely fits.
+      default: "1"
       description: >-
         How many times a self-review may send the change back for a fix (each fix is followed by the build and another
         review). 0 disables the self-review.
@@ -98,7 +100,7 @@ spec:
         OUT=/workspace/out
         LOG=/workspace/verify.log
         MAX_FIX_ATTEMPTS="${MAX_FIX_ATTEMPTS:-3}"
-        SELF_REVIEW_ROUNDS="${SELF_REVIEW_ROUNDS:-2}"
+        SELF_REVIEW_ROUNDS="${SELF_REVIEW_ROUNDS:-1}"
         BUDGET_MINUTES="${VERIFY_BUDGET_MINUTES:-75}"
         rm -f "$OUT/verify-note.md" "$OUT/verify-failed" "$OUT/self-review.md" "$OUT/regression-check.md"
         # The agent names its regression test here; never committed

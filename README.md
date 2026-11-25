@@ -446,7 +446,7 @@ pipeline are shared `Task` resources (`tekton/task-*.yaml`), referenced with `ta
 The pipelines keep only what differs: the event parameters and the `prepare`, `plan`, `agent` and
 `publish` logic. Two optional parameters control `verify`: `verify-command` (default:
 `mvn -B -ntp verify` when there is a `pom.xml`, `skip` disables it) and `max-fix-attempts`
-(default `3`); the task's `self-review-rounds` (default `2`, `0` disables it) caps the self-review fixes. Two workspaces are volumes that every `PipelineRun` creates for itself: `skills`
+(default `3`); the task's `self-review-rounds` (default `1`, `0` disables it) caps the self-review fixes. Two workspaces are volumes that every `PipelineRun` creates for itself: `skills`
 (the unpacked skills) and `work` (the clone, the plan, the labels and the summary, shared by all tasks
 after `fetch-skills`). Every `PipelineRun` runs under the `pipeline` service account.
 
@@ -581,7 +581,7 @@ With hosted models this also caps how much of your subscription limits parallel 
    `max-fix-attempts` times. A green build then gets a **self-review** (task `REVIEW`): the agent reads
    its own diff against the task, looking for a symptom fixed instead of the root cause, broken error or
    rollback paths and tests that would pass with the bug. Remarks that need a change go back to the agent
-   (task `FIX`) and the build and review run again, up to `self-review-rounds` (2) fix rounds; all of it
+   (task `FIX`) and the build and review run again, up to `self-review-rounds` (1) fix rounds, then a last review that only reports; all of it
    within 75 minutes. The step never fails: it leaves a note with the result, and a blocker the last
    review still reports keeps the pull request a draft.
    **Bug issues** (label `bug`, `type: bug`, `kind/bug`, `defect` or `regression`, see `regression-test.sh` in
