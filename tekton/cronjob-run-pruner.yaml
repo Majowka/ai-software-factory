@@ -13,12 +13,13 @@ metadata:
 spec:
   schedule: "*/15 * * * *"
   concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
   successfulJobsHistoryLimit: 1
   failedJobsHistoryLimit: 3
   jobTemplate:
     spec:
       backoffLimit: 0
-      activeDeadlineSeconds: 600
+      activeDeadlineSeconds: 840
       template:
         spec:
           serviceAccountName: run-pruner
@@ -49,39 +50,67 @@ spec:
               - |
                 #!/usr/bin/env bash
                 set -euo pipefail
-                # The agent image has no kubectl or oc: call the API with the service account token
+                # The agent image has no kubectl or oc: call the API with the service account token.
+                # The API server throttles (HTTP 429, API Priority and Fairness), above all when the nodes are under
+                # pressure, which is exactly when pruning matters: every call is retried with backoff (Retry-After
+                # when given), lists are paged and deletes are spaced out.
                 sa=/var/run/secrets/kubernetes.io/serviceaccount
+                runs_path="/apis/tekton.dev/v1/namespaces/${NAMESPACE}/pipelineruns"
+                # api METHOD PATH OUTFILE [curl args]: prints the final HTTP code (000 = no response)
                 api() {
-                  local method="$1" path="$2"; shift 2
-                  curl -sS --cacert "$sa/ca.crt" -H "Authorization: Bearer $(cat "$sa/token")" \
-                    -H 'Content-Type: application/json' -X "$method" "https://kubernetes.default.svc${path}" "$@"
+                  local method="$1" path="$2" out="$3" code attempt wait; shift 3
+                  for attempt in 1 2 3 4 5 6; do
+                    code="$(curl -sS --connect-timeout 10 --max-time 60 --cacert "$sa/ca.crt" \
+                      -H "Authorization: Bearer $(cat "$sa/token")" -H 'Content-Type: application/json' \
+                      -D /tmp/headers.txt -o "$out" -w '%{http_code}' -X "$method" "https://kubernetes.default.svc${path}" "$@" \
+                      || true)"
+                    case "$code" in
+                      429|500|502|503|504|000|"") ;;
+                      *) echo "$code"; return 0 ;;
+                    esac
+                    wait="$(awk 'tolower($1) == "retry-after:" {print int($2)}' /tmp/headers.txt 2>/dev/null | tail -1)"
+                    [ -n "$wait" ] && [ "$wait" -gt 0 ] || wait=$((5 * attempt))
+                    echo "$method $path: HTTP ${code:-000}, retry $attempt in ${wait}s" >&2
+                    sleep "$wait"
+                  done
+                  echo "${code:-000}"
                 }
                 delete() {
-                  local kind="$1" path="$2" name="$3" code
-                  if [ "$DRY_RUN" = "true" ]; then echo "would delete $kind $name"; return 0; fi
-                  code="$(api DELETE "$path/$name" -o /tmp/response.json -w '%{http_code}' \
+                  local name="$1" code
+                  if [ "$DRY_RUN" = "true" ]; then echo "would delete PipelineRun $name"; return 0; fi
+                  code="$(api DELETE "$runs_path/$name" /tmp/response.json \
                     --data '{"kind":"DeleteOptions","apiVersion":"v1","propagationPolicy":"Background"}')"
                   case "$code" in
-                    200|202) echo "deleted $kind $name" ;;
-                    404) echo "already gone: $kind $name" ;;
-                    *) echo "could not delete $kind $name (HTTP $code): $(jq -r '.message // .' /tmp/response.json)" >&2; failed=1 ;;
+                    200|202) echo "deleted PipelineRun $name" ;;
+                    404) echo "already gone: PipelineRun $name" ;;
+                    *) echo "could not delete PipelineRun $name (HTTP $code): $(jq -r '.message // .' /tmp/response.json 2>/dev/null)" >&2; failed=1 ;;
                   esac
+                  sleep 1
                 }
 
-                runs_path="/apis/tekton.dev/v1/namespaces/${NAMESPACE}/pipelineruns"
-                api GET "$runs_path" --fail > /tmp/runs.json
+                # Finished runs as {name, completion time}, read in pages of 20 (a run carries its whole pipeline spec)
+                : > /tmp/finished.jsonl
+                total=0 cont=""
+                while :; do
+                  code="$(api GET "${runs_path}?limit=20${cont:+&continue=$cont}" /tmp/page.json)"
+                  if [ "$code" != 200 ]; then
+                    echo "could not list PipelineRuns (HTTP $code): $(jq -r '.message // .' /tmp/page.json 2>/dev/null)" >&2
+                    exit 1
+                  fi
+                  total=$((total + $(jq '.items | length' /tmp/page.json)))
+                  jq -c '.items[] | select(.status.completionTime != null)
+                    | {name: .metadata.name, done: (.status.completionTime | fromdateiso8601)}' /tmp/page.json >> /tmp/finished.jsonl
+                  cont="$(jq -r '.metadata.continue // "" | @uri' /tmp/page.json)"
+                  [ -n "$cont" ] || break
+                done
                 now="$(date +%s)"
                 failed=0
-
-                # Finished runs as {name, age in seconds}, newest first
-                jq --argjson now "$now" '[.items[] | select(.status.completionTime != null)
-                  | {name: .metadata.name, age: ($now - (.status.completionTime | fromdateiso8601))}] | sort_by(.age)' \
-                  /tmp/runs.json > /tmp/finished.json
-                echo "runs: $(jq '.items | length' /tmp/runs.json) ($(jq length /tmp/finished.json) finished)"
+                echo "runs: $total ($(wc -l < /tmp/finished.jsonl) finished)"
 
                 # Runs that finished more than RUN_KEEP_HOURS ago, apart from the KEEP_LAST newest finished ones
-                jq -r --argjson keep "$((RUN_KEEP_HOURS * 3600))" --argjson last "$KEEP_LAST" \
-                  '.[$last:][] | select(.age > $keep) | .name' /tmp/finished.json > /tmp/old-runs.txt
-                while read -r run; do delete PipelineRun "$runs_path" "$run"; done < /tmp/old-runs.txt
+                jq -rs --argjson now "$now" --argjson keep "$((RUN_KEEP_HOURS * 3600))" --argjson last "$KEEP_LAST" \
+                  'sort_by(-.done) | .[$last:][] | select($now - .done > $keep) | .name' /tmp/finished.jsonl > /tmp/old-runs.txt
+                echo "to delete: $(wc -l < /tmp/old-runs.txt)"
+                while read -r run; do delete "$run"; done < /tmp/old-runs.txt
 
                 exit "$failed"

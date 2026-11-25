@@ -699,6 +699,9 @@ their TaskRuns, pods, logs and PVCs go too. Deleting only the PVCs is not enough
 still name them, so the `kubernetes.io/pvc-protection` finalizer keeps them (and the data on the node) in
 `Terminating` until the pods are gone.
 
+The API server may throttle the pruner (HTTP 429), most of all when the nodes are under pressure, so every call
+is retried with backoff (honouring `Retry-After`), the run list is read in pages of 20 and deletes are spaced out.
+
 Runs still in progress (no `completionTime`) are never touched. `DRY_RUN=true` only prints what would be deleted.
 Run it on demand with `kubectl create job --from=cronjob/run-pruner prune-now -n <namespace>`.
 
