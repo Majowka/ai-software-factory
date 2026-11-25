@@ -110,8 +110,9 @@ official logos.
 │   ├── triggertemplate-*.yaml           create the PipelineRuns
 │   ├── eventlistener-new-issue.yaml     the single EventListener with four triggers and their filters
 │   ├── cronjob-requirements-scan.yaml   hourly scan of `requirements` issues (section 6.9)
+│   ├── cronjob-run-pruner.yaml          removes finished runs and their workspace PVCs (section 6.11)
 │   ├── resourcequota-agents.yaml        optional cap on parallel runs
-│   └── serviceaccount-*, role*-*        service accounts and RBAC of the listener and the scan
+│   └── serviceaccount-*, role*-*        service accounts and RBAC of the listener, the scan and the pruner
 ├── deploy/
 │   ├── k3s/                             namespace, `pipeline` service account, Traefik Ingress, install notes
 │   └── openshift/                       the Route
@@ -684,6 +685,22 @@ skips the plan, runs the agent as task `CI_FIX` and `publish` posts the reply wi
 stopped. One `PipelineRun` per commit (`pr-ci-fix-<sha>`), so several failed workflows of one commit do
 not start several fixes. To turn it on, the GitHub App needs the permissions above and the Check suite
 event, and the webhook relay must forward `check_suite`.
+
+### 6.11 Cleaning up finished runs
+
+Every run gets its own `work` PVC (and `skills`, where used) from a `volumeClaimTemplate`. Tekton removes such a
+PVC only together with its PipelineRun, and plain Tekton never deletes PipelineRuns, so without cleanup the runs and
+their volumes pile up until the nodes run out of disk (on k3s, `local-path` keeps the data on the node's own disk
+and does not enforce the requested size, so the `storage` request does not limit what a run writes).
+
+The `run-pruner` CronJob (`tekton/cronjob-run-pruner.yaml`, every 15 minutes, no AI) does two things:
+
+1. deletes the PVCs of runs that finished more than `PVC_KEEP_HOURS` (2) ago, which frees the disk while the run,
+   its pods and logs stay visible;
+2. deletes runs that finished more than `RUN_KEEP_HOURS` (12) ago, except the `KEEP_LAST` (20) newest finished ones.
+
+Runs still in progress (no `completionTime`) are never touched. `DRY_RUN=true` only prints what would be deleted.
+Run it on demand with `kubectl create job --from=cronjob/run-pruner prune-now -n <namespace>`.
 
 ## 7. Connect GitHub to the cluster
 

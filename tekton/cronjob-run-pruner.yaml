@@ -1,0 +1,100 @@
+# Every 15 minutes: removes what finished PipelineRuns leave behind, so the nodes do not run out of disk.
+# Every run gets its own `work` PVC from a volumeClaimTemplate, and that PVC (and the pods with their logs) is only
+# removed together with the PipelineRun. Nothing in plain Tekton prunes runs, so without this they pile up for ever.
+#   1. PVCs of runs that finished more than PVC_KEEP_HOURS ago are deleted. This frees the disk (local-path keeps the
+#      data on the node's own disk), while the run, its pods and its logs stay visible.
+#   2. Runs that finished more than RUN_KEEP_HOURS ago are deleted (with their TaskRuns, pods and any PVC left),
+#      except the KEEP_LAST most recently finished ones.
+# Runs that have not finished (no completionTime) are never touched.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: run-pruner
+  namespace: agents
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 600
+      template:
+        spec:
+          serviceAccountName: run-pruner
+          restartPolicy: Never
+          containers:
+            - name: prune
+              image: ghcr.io/majowka/factory-agent:latest
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 64Mi
+              env:
+                - name: PVC_KEEP_HOURS
+                  value: "2"
+                - name: RUN_KEEP_HOURS
+                  value: "12"
+                - name: KEEP_LAST
+                  value: "20"
+                # Print what would be deleted without deleting anything
+                - name: DRY_RUN
+                  value: "false"
+                - name: HOME
+                  value: /tmp
+                - name: NAMESPACE
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.namespace
+              command: [bash, -c]
+              args:
+              - |
+                #!/usr/bin/env bash
+                set -euo pipefail
+                # The agent image has no kubectl or oc: call the API with the service account token
+                sa=/var/run/secrets/kubernetes.io/serviceaccount
+                api() {
+                  local method="$1" path="$2"; shift 2
+                  curl -sS --cacert "$sa/ca.crt" -H "Authorization: Bearer $(cat "$sa/token")" \
+                    -H 'Content-Type: application/json' -X "$method" "https://kubernetes.default.svc${path}" "$@"
+                }
+                delete() {
+                  local kind="$1" path="$2" name="$3" code
+                  if [ "$DRY_RUN" = "true" ]; then echo "would delete $kind $name"; return 0; fi
+                  code="$(api DELETE "$path/$name" -o /tmp/response.json -w '%{http_code}' \
+                    --data '{"kind":"DeleteOptions","apiVersion":"v1","propagationPolicy":"Background"}')"
+                  case "$code" in
+                    200|202) echo "deleted $kind $name" ;;
+                    404) echo "already gone: $kind $name" ;;
+                    *) echo "could not delete $kind $name (HTTP $code): $(jq -r '.message // .' /tmp/response.json)" >&2; failed=1 ;;
+                  esac
+                }
+
+                runs_path="/apis/tekton.dev/v1/namespaces/${NAMESPACE}/pipelineruns"
+                pvcs_path="/api/v1/namespaces/${NAMESPACE}/persistentvolumeclaims"
+                api GET "$runs_path" --fail > /tmp/runs.json
+                api GET "$pvcs_path" --fail > /tmp/pvcs.json
+                now="$(date +%s)"
+                failed=0
+
+                # Finished runs as {name, age in seconds}, newest first
+                jq --argjson now "$now" '[.items[] | select(.status.completionTime != null)
+                  | {name: .metadata.name, age: ($now - (.status.completionTime | fromdateiso8601))}] | sort_by(.age)' \
+                  /tmp/runs.json > /tmp/finished.json
+                echo "runs: $(jq '.items | length' /tmp/runs.json) ($(jq length /tmp/finished.json) finished), PVCs: $(jq '.items | length' /tmp/pvcs.json)"
+
+                # 1. PVCs owned by a run that finished more than PVC_KEEP_HOURS ago
+                jq -r --slurpfile finished /tmp/finished.json --argjson keep "$((PVC_KEEP_HOURS * 3600))" '
+                  ($finished[0] | map(select(.age > $keep) | {(.name): true}) | add // {}) as $old
+                  | .items[] | select(.metadata.deletionTimestamp == null)
+                  | select(any(.metadata.ownerReferences[]?; .kind == "PipelineRun" and $old[.name]))
+                  | .metadata.name' /tmp/pvcs.json > /tmp/old-pvcs.txt
+                while read -r pvc; do delete PersistentVolumeClaim "$pvcs_path" "$pvc"; done < /tmp/old-pvcs.txt
+
+                # 2. Runs that finished more than RUN_KEEP_HOURS ago, apart from the KEEP_LAST newest finished ones
+                jq -r --argjson keep "$((RUN_KEEP_HOURS * 3600))" --argjson last "$KEEP_LAST" \
+                  '.[$last:][] | select(.age > $keep) | .name' /tmp/finished.json > /tmp/old-runs.txt
+                while read -r run; do delete PipelineRun "$runs_path" "$run"; done < /tmp/old-runs.txt
+
+                exit "$failed"
