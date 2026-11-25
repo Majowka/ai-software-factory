@@ -1,0 +1,17 @@
+# The agent steps (service account `pipeline`) keep the per-engine slots and the FIFO queue of llm-slot.sh as Leases.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: llm-slots
+  namespace: agents
+rules:
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - get
+      - list
+      - create
+      - update
+      - delete

@@ -16,6 +16,12 @@ resources:
   - role-run-pruner.yaml
   - rolebinding-run-pruner.yaml
   - cronjob-run-pruner.yaml
+  - deployment-run-dispatcher.yaml
+  - role-run-dispatcher.yaml
+  - rolebinding-run-dispatcher.yaml
+  - serviceaccount-run-dispatcher.yaml
+  - role-llm-slots.yaml
+  - rolebinding-llm-slots.yaml
   - serviceaccount-run-pruner.yaml
   - serviceaccount-issue-agent-listener.yaml
   - serviceaccount-requirements-scheduler.yaml

@@ -22,6 +22,8 @@ spec:
         # Fixed name: a redelivered webhook cannot start a second run for the same issue
         name: issue-agent-$(tt.params.issue-id)
       spec:
+        # Created waiting; run-dispatcher starts it when fewer than MAX_ACTIVE runs are active (FIFO)
+        status: PipelineRunPending
         params:
           - name: repo-url
             value: $(tt.params.repo-url)
