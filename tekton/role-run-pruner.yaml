@@ -11,10 +11,3 @@ rules:
     verbs:
       - list
       - delete
-  - apiGroups:
-      - ""
-    resources:
-      - persistentvolumeclaims
-    verbs:
-      - list
-      - delete
