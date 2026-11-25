@@ -19,10 +19,12 @@ resources:
   - task-fetch-skills.yaml
   - task-report-failure.yaml
   - task-verify-build.yaml
+  - triggerbinding-ci-failure.yaml
   - triggerbinding-issue-comment.yaml
   - triggerbinding-new-issue.yaml
   - triggerbinding-pr-review-comment.yaml
   - triggerbinding-pr-review.yaml
+  - triggertemplate-ci-fix.yaml
   - triggertemplate-issue-comment.yaml
   - triggertemplate-new-issue.yaml
   - triggertemplate-pr-comment.yaml
