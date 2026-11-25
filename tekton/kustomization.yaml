@@ -23,6 +23,7 @@ resources:
   - triggerbinding-ci-failure.yaml
   - triggerbinding-issue-comment.yaml
   - triggerbinding-new-issue.yaml
+  - triggerbinding-pr-conversation-comment.yaml
   - triggerbinding-pr-review-comment.yaml
   - triggerbinding-pr-review-request.yaml
   - triggerbinding-pr-review.yaml

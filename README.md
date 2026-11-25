@@ -38,7 +38,7 @@ Ingress (k3s: Traefik) / Route (OpenShift) ──► EventListener (Tekton Trigg
 |---|---|---|
 | `issue-agent` | a new issue (`issues` / `opened`) | Posts a checklist plan as an issue comment, implements the issue on a new branch, opens a pull request, enables auto-merge and replies with a summary. |
 | `issue-comment-agent` | an issue comment starting with `@ai` | Treats the comment as an instruction. A question gets an answer; a change request gets a plan, a branch and a pull request. |
-| `pr-comment-agent` | a pull request review or review comment | Reads the whole PR conversation, pushes the requested change to the PR branch (or answers a question) and replies on the PR. |
+| `pr-comment-agent` | a review or review comment on a factory pull request; on any other pull request of the repository (also human ones) a PR comment, review or review comment starting with `@ai` | Reads the whole PR conversation and the failing CI logs of the head commit, pushes the requested change to the PR branch as a new commit of the bot (never a force push; or answers a question) and replies on the PR. `@ai fix` alone fixes the failing CI. Pull requests from forks are refused. |
 | `pr-review-agent` | a PR comment starting with `@ai review`, on any open pull request of the repository | Read-only technical review (correctness, security, tests, match with the linked issue) with the `code-review` skill, posted as a PR review of type comment. Never pushes, approves or blocks. Text after `@ai review` sets the focus. |
 | `requirements-agent` | the hourly `requirements-scan` CronJob, for open issues labeled `requirements` | Compares the requirements with the code and creates the task issues in dependency order, at most 3 open at a time (section 6.9). Each task issue then runs through `issue-agent`. |
 
@@ -528,16 +528,17 @@ That service is published over HTTPS by `deploy/k3s/ingress-new-issue.yaml` (Tra
 
 ### 6.6 How events become pipeline runs
 
-The `new-issue` EventListener has six triggers. Each verifies the webhook signature with the
+The `new-issue` EventListener has seven triggers. Each verifies the webhook signature with the
 `github-webhook-secret` secret, filters with CEL, and then maps the payload with a binding.
 
 | Trigger | GitHub event | CEL filter (all conditions) | Template, pipeline |
 |---|---|---|---|
 | `new-issue` | `issues` | action `opened`, issue **without** the `manual` or `requirements` label, repository on the automatic list (only `Majowka/ai-software-factory`; other repositories start runs with `@ai` comments only) | `new-issue`, `issue-agent` |
 | `issue-comment` | `issue_comment` | action `created`, issue open, **not a pull request**, not a bot, **body starts with `@ai`** | `issue-comment`, `issue-comment-agent` |
-| `pr-review-comment` | `pull_request_review_comment` | action `created`, PR open, not a bot, **PR opened by the factory** (author is a bot, branch `issue-*`) | `pr-comment`, `pr-comment-agent` |
-| `pr-review` | `pull_request_review` | action `submitted`, PR open, not a bot, non-empty body, **PR opened by the factory** (author is a bot, branch `issue-*`) | `pr-comment`, `pr-comment-agent` |
-| `pr-review-request` | `issue_comment` | action `created`, open **pull request** (any author, also humans), not a bot, **body starts with `@ai review`** | `pr-review`, `pr-review-agent` |
+| `pr-review-comment` | `pull_request_review_comment` | action `created`, PR open, not a bot, **PR opened by the factory** (author is a bot, branch `issue-*`) **or body starts with `@ai`** | `pr-comment`, `pr-comment-agent` |
+| `pr-review` | `pull_request_review` | action `submitted`, PR open, not a bot, non-empty body, **PR opened by the factory** (author is a bot, branch `issue-*`) **or body starts with `@ai`** | `pr-comment`, `pr-comment-agent` |
+| `pr-conversation-comment` | `issue_comment` | action `created`, open **pull request** (any author), not a bot, **body starts with `@ai`, but not `@ai review`** | `pr-comment`, `pr-comment-agent` |
+| `pr-review-request` | `issue_comment` | action `created`, open **pull request** (any author, also humans), not a bot, **body is `@ai review` (optionally followed by a focus)** | `pr-review`, `pr-review-agent` |
 | `ci-failure` | `check_suite` | action `completed`, conclusion `failure`, `timed_out` or `startup_failure`, belongs to a pull request of the same repository, branch `issue-*` (PR author and attempt limit checked in `prepare`) | `ci-fix`, `pr-comment-agent` (mode `ci-fix`) |
 
 Each `PipelineRun` gets its own volumes (`volumeClaimTemplate`): 1 GiB for the skills workspace and
@@ -762,8 +763,14 @@ usually means a wrong secret, and a timeout means GitHub cannot reach the URL.
 - Code and issue text are sent to the model provider of each engine.
 - OpenCode subagents from the skills artifact are not translated for Claude Code; skills work in both.
 - Comments on pull requests that start with `@ai` are not handled by `issue-comment-agent`
-  (the trigger skips pull requests). Pull requests are handled by the review triggers; only
-  `@ai review` on the PR conversation starts a run (`pr-review-agent`, read-only).
+  (the trigger skips pull requests). `@ai review` starts `pr-review-agent` (read-only); any other
+  `@ai ...` on a pull request starts `pr-comment-agent`, which pushes to the PR branch. On pull requests
+  not opened by the factory nothing runs without an explicit `@ai` from someone with write access.
+- `@ai fix` (or `@ai fix ci`) with nothing else waits up to 15 minutes for running checks, then fixes the
+  failed ones; with no failed checks it only replies. The agent pushes a new commit of the bot and never
+  force-pushes: when someone pushed to the branch during the run, the push is rejected and the reply says so.
+- Pull requests from forks and pull requests whose head is the default branch are refused with a comment
+  (the GitHub App cannot push to a fork).
 
 ## 11. Possible next steps
 
