@@ -54,6 +54,11 @@ spec:
                   value: "3"
                 - name: HOME
                   value: /tmp
+                # The namespace the CronJob runs in; the PipelineRuns are created there too
+                - name: NAMESPACE
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.namespace
               command: [bash, -c]
               args:
               - |
@@ -67,9 +72,9 @@ spec:
                 start_run() {
                   local repo="$1" base="$2" n="$3" mode="$4" key="$5" name
                   name="requirements-${n}-${mode}-${key}"
-                  jq -n --arg name "$name" --arg repo "$repo" --arg base "$base" --arg n "$n" --arg mode "$mode" --arg max "$MAX_OPEN" '{
+                  jq -n --arg ns "$NAMESPACE" --arg name "$name" --arg repo "$repo" --arg base "$base" --arg n "$n" --arg mode "$mode" --arg max "$MAX_OPEN" '{
                     apiVersion: "tekton.dev/v1", kind: "PipelineRun",
-                    metadata: {name: $name, namespace: "agents"},
+                    metadata: {name: $name, namespace: $ns},
                     spec: {
                       pipelineRef: {name: "requirements-agent"},
                       taskRunTemplate: {serviceAccountName: "pipeline"},
@@ -88,7 +93,7 @@ spec:
                   local sa=/var/run/secrets/kubernetes.io/serviceaccount code
                   code="$(curl -s -o /tmp/response.json -w '%{http_code}' --cacert "$sa/ca.crt" \
                     -H "Authorization: Bearer $(cat "$sa/token")" -H 'Content-Type: application/json' \
-                    -X POST "https://kubernetes.default.svc/apis/tekton.dev/v1/namespaces/agents/pipelineruns" --data-binary @/tmp/pipelinerun.json)"
+                    -X POST "https://kubernetes.default.svc/apis/tekton.dev/v1/namespaces/${NAMESPACE}/pipelineruns" --data-binary @/tmp/pipelinerun.json)"
                   case "$code" in
                     201) echo "started: $name" ;;
                     409) echo "already started: $name" ;;
