@@ -578,7 +578,7 @@ With hosted models this also caps how much of your subscription limits parallel 
    repository's `AGENTS.md`. It writes a short summary to `.agent-summary.md`. It has 3 hours.
 6. **`verify`** (its own task): builds and tests the result (the script is in the `verify-build` Task). If
    the build fails, the agent (task `FIX`) gets the end of the log and fixes the code, up to
-   `max-fix-attempts` times. A green build then gets a **self-review** (task `REVIEW`): the agent reads
+   `max-fix-attempts` times. A green build then gets a **self-review** (task `REVIEW`, at most 6 minutes and 15 tool calls, no test runs): the agent reads
    its own diff against the task, looking for a symptom fixed instead of the root cause, broken error or
    rollback paths and tests that would pass with the bug. Remarks that need a change go back to the agent
    (task `FIX`) and the build and review run again, up to `self-review-rounds` (1) fix rounds, then a last review that only reports; all of it
