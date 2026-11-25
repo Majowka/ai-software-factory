@@ -1,0 +1,31 @@
+name: agent-image
+
+on:
+  push:
+    branches: [master]
+    paths: [agents/Dockerfile, .github/workflows/agent-image.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: agents
+          file: agents/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/majowka/factory-agent:latest
+            ghcr.io/majowka/factory-agent:${{ github.sha }}

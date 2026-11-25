@@ -25,7 +25,7 @@ spec:
                 name: agent-config
           containers:
             - name: scan
-              image: quay.io/pminkows/opencode:latest
+              image: ghcr.io/majowka/factory-agent:latest
               volumeMounts:
                 - name: config
                   mountPath: /config

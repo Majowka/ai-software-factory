@@ -90,9 +90,8 @@ drawings, not the official logos.
 ```
 .
 ├── agents/                              the agent: images and shared configuration
-│   ├── Dockerfile.opencode              reference Dockerfile of the agent image (the pipelines pull it from Quay)
-│   ├── Dockerfile                       same tooling with Claude Code (optional, not used by the pipelines)
-│   ├── configmap-agent-config.yaml      OpenCode config (model, permissions), the GitHub App token script and the requirements helpers
+│   ├── Dockerfile                       the agent image: OpenCode and Claude Code, gh, JDK, Maven (built by .github/workflows/agent-image.yml)
+│   ├── configmap-agent-config.yaml      engine routing per task, agent-run.sh, OpenCode and Claude Code permissions, the GitHub App token script and the requirements helpers
 │   └── skills/                          skills delivered as a ConfigMap (requirements-breakdown), built with `oc apply -k agents/skills`
 ├── tekton/                              pipelines and everything that triggers them
 │   ├── pipeline-*.yaml                  the three Tekton pipelines
@@ -277,8 +276,19 @@ oc create secret generic github-app -n agents \
   --from-file=private-key.pem=./<app-private-key>.pem
 ```
 
-`secrets/secret-claude-github-secrets.yaml` (`ANTHROPIC_API_KEY`, `GH_TOKEN`) is only needed if you
-run a Claude Code based variant. The OpenCode pipelines do not use it.
+**Model credentials.** Each agent task runs on one of two engines (section 6.1); create the secret of
+every engine you route tasks to:
+
+- `secrets/secret-opencode-go.yaml` (`opencode-go`, key `api-key`): the OpenCode Go API key, used by the
+  `opencode` engine as `OPENCODE_API_KEY`.
+- `secrets/secret-claude-code-oauth.yaml` (`claude-code-oauth`, key `token`): a long-lived Claude Code
+  OAuth token from `claude setup-token` (one year, uses the Claude subscription), used by the `claude`
+  engine as `CLAUDE_CODE_OAUTH_TOKEN`.
+
+```bash
+kubectl create secret generic opencode-go -n agents --from-literal=api-key=<OPENCODE_GO_API_KEY>
+kubectl create secret generic claude-code-oauth -n agents --from-literal=token=<CLAUDE_CODE_OAUTH_TOKEN>
+```
 
 The default agent image and skills artifact are pulled from `quay.io/pminkows`. If you host your
 own copies in private Quay repositories, create an image pull secret and link it:
@@ -293,12 +303,15 @@ oc secrets link pipeline quay-pull --for=pull -n agents
 
 ### 4.1 Agent image
 
-The pipelines pull a ready-made agent image from Quay, `quay.io/pminkows/opencode:latest`, so you
-do not have to build anything to follow this guide. It runs in the `prepare`, `plan`, `agent` and
-`publish` steps. `agents/Dockerfile.opencode` is included for reference, to show what the image
-contains: OpenCode, the GitHub CLI, a JDK, Maven, `skaffold` and `kubectl`.
+The pipelines use `ghcr.io/majowka/factory-agent:latest`, built from `agents/Dockerfile` by the
+`agent-image` GitHub Actions workflow on every change to the Dockerfile (or by hand with
+*Run workflow*). It runs in the `prepare`, `plan`, `agent` and `publish` steps and contains both agent
+engines, OpenCode and Claude Code, plus the GitHub CLI, a JDK, Maven, `skaffold` and `kubectl`.
+If the GHCR package is private, give the `pipeline` service account an image pull secret for `ghcr.io`.
 
 ```dockerfile
+# Agent image for the pipelines: OpenCode and Claude Code, gh, JDK, Maven, skaffold and kubectl.
+# Built and pushed to ghcr.io/majowka/factory-agent by .github/workflows/agent-image.yml.
 FROM registry.access.redhat.com/ubi9/nodejs-22
 
 USER 0
@@ -306,9 +319,10 @@ USER 0
 RUN dnf install -y git jq tar gzip \
     && dnf clean all
 
-RUN npm install -g opencode-ai
+# Both agent engines; agent-run.sh (ConfigMap agent-config) picks one per task
+RUN npm install -g opencode-ai @anthropic-ai/claude-code
 
-# GitHub CLI
+# GitHub CLI z oficjalnego archiwum
 ARG GH_VERSION=2.83.2
 RUN curl -fsSL \
     "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" \
@@ -317,14 +331,14 @@ RUN curl -fsSL \
     && cp /tmp/gh_${GH_VERSION}_linux_amd64/bin/gh /usr/local/bin/gh \
     && rm -rf /tmp/gh*
 
-# Skaffold (build and deploy an application to Kubernetes)
+# Skaffold (build i deployment aplikacji na Kubernetes)
 ARG SKAFFOLD_VERSION=2.25.0
 RUN curl -fsSL \
     "https://storage.googleapis.com/skaffold/releases/v${SKAFFOLD_VERSION}/skaffold-linux-amd64" \
     -o /usr/local/bin/skaffold \
     && chmod +x /usr/local/bin/skaffold
 
-# kubectl (used by skaffold when it deploys)
+# kubectl (z niego korzysta skaffold przy deploymencie)
 ARG KUBECTL_VERSION=1.37.2
 RUN curl -fsSL \
     "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
@@ -338,7 +352,7 @@ RUN mkdir -p /opt/java \
     | tar -xz -C /opt/java --strip-components=1
 ENV JAVA_HOME=/opt/java
 
-# Maven
+# Maven z Maven Central
 ARG MAVEN_VERSION=3.9.11
 RUN mkdir -p /opt/maven \
     && curl -fsSL \
@@ -350,16 +364,13 @@ ENV PATH="${JAVA_HOME}/bin:${MAVEN_HOME}/bin:${PATH}"
 USER 1001
 ```
 
-`agents/Dockerfile` is a variant with Claude Code (`npm install -g @anthropic-ai/claude-code`)
-instead of OpenCode, and without the JDK and Maven. It is optional and not used by the pipelines.
-
 **Only if you need a different configuration** (another JDK, extra CLIs, another toolchain), adapt
 the Dockerfile, build and push your own image, and point the pipelines at it:
 
 ```bash
-podman build -f agents/Dockerfile.opencode -t quay.io/<org>/opencode:<tag> agents/
-podman push quay.io/<org>/opencode:<tag>
-sed -i 's#quay.io/pminkows/opencode:latest#quay.io/<org>/opencode:<tag>#g' tekton/pipeline-*.yaml
+podman build -f agents/Dockerfile -t <registry>/<org>/factory-agent:<tag> agents/
+podman push <registry>/<org>/factory-agent:<tag>
+sed -i 's#ghcr.io/majowka/factory-agent:latest#<registry>/<org>/factory-agent:<tag>#g' tekton/*.yaml
 ```
 
 `skaffold` and `kubectl` are in the image so that an agent can deploy an application to
@@ -386,100 +397,57 @@ oras push quay.io/<org>/<skills-repo>:<version> skills.tar.gz
 
 ## 5. The AI model
 
-The factory no longer runs its own model: vLLM, the GPU nodes and the `ai` namespace were removed.
-The agent uses a hosted model API instead. The provider, model and API key secret are set in the
-agent configuration (section 6.1). This part is being reworked; see `docs/k3s-migration-todo.md`.
+The factory runs no model of its own. Agent tasks go to one of two hosted engines:
+
+- **OpenCode** with an **OpenCode Go** subscription (`opencode-go/<model>`), authenticated with an API key;
+- **Claude Code** with a Claude subscription, authenticated with a long-lived OAuth token (`claude setup-token`).
+
+Which engine handles which task is set in `routing.env` (section 6.1). Both need outbound HTTPS from
+the `agents` namespace (`opencode.ai`, `api.anthropic.com`).
 
 ## 6. Tekton: pipelines, triggers and the listener
 
 ### 6.1 Agent configuration (ConfigMap)
 
-`agents/configmap-agent-config.yaml` is shared by all pipelines and mounted at `/config`. It has
-three files: the script that mints GitHub App installation tokens and two OpenCode configs. The
-model, its endpoint and the **permissions** of the agent are defined here.
+`agents/configmap-agent-config.yaml` is shared by all pipelines and mounted at `/config`:
 
-```yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: agent-config
-  namespace: agents
-data:
-  # Prints a GitHub App installation token (valid 1h). Run it right before every step that talks to GitHub.
-  gh-app-token.sh: |
-    #!/usr/bin/env bash
-    set -euo pipefail
-    b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
-    now="$(date +%s)"
-    header="$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)"
-    payload="$(printf '{"iat":%s,"exp":%s,"iss":"%s"}' "$((now - 60))" "$((now + 540))" "$GITHUB_APP_ID" | b64url)"
-    signature="$(printf '%s.%s' "$header" "$payload" | openssl dgst -sha256 -sign <(printf '%s\n' "$GITHUB_APP_PRIVATE_KEY") | b64url)"
-    curl -fsS -X POST \
-      -H "Authorization: Bearer ${header}.${payload}.${signature}" \
-      -H "Accept: application/vnd.github+json" \
-      "https://api.github.com/app/installations/${GITHUB_APP_INSTALLATION_ID}/access_tokens" | jq -er .token
-  opencode.json: |
-    {
-      "$schema": "https://opencode.ai/config.json",
-      "model": "qwen38-flash/qwen38_flash",
-      "permission": {
-        "edit": "allow",
-        "skill": "allow",
-        "task": "allow",
-        "webfetch": "deny",
-        "external_directory": "allow",
-        "bash": {
-          "*": "allow",
-          "git commit*": "deny",
-          "git push*": "deny",
-          "gh *": "deny"
-        }
-      },
-      "tools": {
-        "todowrite": false
-      },
-      "provider": {
-        "qwen38-flash": {
-          "npm": "@ai-sdk/openai-compatible",
-          "name": "Qwen3.8 Flash",
-          "options": {
-            "baseURL": "http://qwen38-flash.ai.svc.cluster.local:8000/v1",
-            "apiKey": "none"
-          },
-          "models": {
-            "qwen38_flash": {
-              "name": "Qwen3.8 Flash",
-              "limit": {
-                "context": 131072,
-                "output": 8192
-              }
-            }
-          }
-        }
-      }
-    }
-  # Used by the plan steps only: same as opencode.json, but the agent may post its plan with `gh issue comment` / `gh pr comment`.
-  opencode-plan.json: |
-    {
-      ...
-      "permission": {
-        ...
-        "bash": {
-          "*": "allow",
-          "git commit*": "deny",
-          "git push*": "deny",
-          "gh *": "deny",
-          "gh issue comment*": "allow",
-          "gh pr comment*": "allow"
-        }
-      },
-      ...
-    }
-```
+| Key | Purpose |
+|---|---|
+| `routing.env` | Which engine (`opencode` or `claude`) runs which task, and the model of each engine. |
+| `agent-run.sh` | Runs one task with the engine from `routing.env`: `agent-run.sh <task> <timeout> <log> <prompt>`. |
+| `agent-home.sh` | Installs the fetched skills for both engines (`~/.config/opencode`, `~/.claude/skills`). |
+| `opencode.json` | OpenCode permissions and the OpenCode Go provider (key from `OPENCODE_API_KEY`). |
+| `claude-settings.json` | Claude Code permissions, the same rules as `opencode.json`. |
+| `gh-app-token.sh` | Mints a GitHub App installation token (valid 1h). |
+| `requirements-lib.sh` | Helpers of the requirements scan and the requirements agent. |
+
+**Routing.** Every agent call in the pipelines names its task:
+
+| Task | Where | Default engine |
+|---|---|---|
+| `PLAN` | `plan` step of the three event pipelines | `opencode` |
+| `IMPLEMENT` | `agent` step of the three event pipelines | `claude` |
+| `FIX` | build-fix attempts in `verify-build` | `claude` |
+| `REQUIREMENTS` | `analyze` step of the requirements agent | `opencode` |
 
 ```bash
-oc apply -f agents/configmap-agent-config.yaml
+AGENT_ENGINE_DEFAULT=opencode
+AGENT_ENGINE_PLAN=opencode
+AGENT_ENGINE_IMPLEMENT=claude
+AGENT_ENGINE_FIX=claude
+AGENT_ENGINE_REQUIREMENTS=opencode
+OPENCODE_MODEL=opencode-go/kimi-k3      # per task: OPENCODE_MODEL_<TASK>
+CLAUDE_MODEL=sonnet                     # per task: CLAUDE_MODEL_<TASK>
 ```
+
+To move a task to the other engine, change its line and `kubectl apply -f agents/configmap-agent-config.yaml`;
+the next run uses it. List the OpenCode Go models with
+`curl -H "Authorization: Bearer $OPENCODE_API_KEY" https://opencode.ai/inference/go/v1/models`.
+
+**Permissions.** In both engines the agent may edit files and run shell commands, but `git commit`,
+`git push`, `gh` and web access are denied. No agent step has GitHub credentials: the `plan` steps
+write `/workspace/out/plan.md` and the script posts it; the `publish` steps commit and open the pull
+request.
 
 ### 6.2 Listener service account and RBAC
 

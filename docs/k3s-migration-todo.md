@@ -4,9 +4,9 @@ Lista zadań dla gałęzi `claude/project-thread-cvdyq6`. Kolejność = kolejno�
 
 ## Do decyzji
 
-- [ ] **Silnik agenta**: (A) zostaje OpenCode, zmienia się tylko provider (OpenCode Go i/lub Anthropic) — zalecane, mały zakres; (B) Claude Code CLI zamiast OpenCode — średni zakres (kroki Tekton, uprawnienia, obraz).
+- [x] **Silnik agenta**: oba, OpenCode (OpenCode Go) i Claude Code (OAuth), z wyborem per zadanie.
 - [ ] Publiczne wejście dla webhooka GitHuba na k3s (Traefik ma tylko prywatne IP): BunkerWeb, Tailscale Funnel lub inny reverse proxy.
-- [ ] Rejestr obrazu agenta (dziś `quay.io/pminkows/opencode:latest`): własny tag na Quay/GHCR.
+- [x] Rejestr obrazu agenta: `ghcr.io/majowka/factory-agent` (pakiet GHCR może wymagać pull secretu, jeśli prywatny).
 
 ## 1. Usunięcie vLLM / GPU
 
@@ -14,18 +14,19 @@ Lista zadań dla gałęzi `claude/project-thread-cvdyq6`. Kolejność = kolejno�
 - [x] Usunąć `secrets/secret-hf-token.yaml`.
 - [x] README: usunąć sekcje o GPU, NFD, NVIDIA GPU Operator, modelu i namespace `ai`.
 
-## 2. Zewnętrzny model (wariant A — OpenCode)
+## 2. Dwa silniki z routingiem per zadanie (decyzja: OpenCode + OpenCode Go i Claude Code z OAuth)
 
-- [ ] `agents/configmap-agent-config.yaml`: w `opencode.json`, `opencode-requirements.json`, `opencode-plan.json` zamienić `model` i `provider` (zamiast `qwen38-flash.ai.svc.cluster.local`) na OpenCode Go / `anthropic` — nazwy providera i ID modeli potwierdzić w dokumentacji OpenCode Go.
-- [ ] Secret z kluczem API (`OPENCODE_API_KEY` / `ANTHROPIC_API_KEY`), bez wartości w repo.
-- [ ] Podpiąć klucz przez `env` w krokach agenta: `pipeline-issue-agent.yaml`, `pipeline-issue-comment-agent.yaml`, `pipeline-pr-comment-agent.yaml`, `pipeline-requirements-agent.yaml`, `task-verify-build.yaml`.
-
-## 2b. Wariant B — Claude Code CLI (tylko jeśli wybrany)
-
-- [ ] `agents/Dockerfile`: dodać JDK i Maven (jak w `Dockerfile.opencode`), zbudować i wypchnąć obraz.
-- [ ] Zamienić 8 wywołań `opencode run` na `claude -p` w 5 plikach Tekton.
-- [ ] Przenieść uprawnienia z `opencode*.json` do `settings.json` Claude Code (`permissions.allow/deny`), skille do `~/.claude/skills`.
-- [ ] Uwierzytelnianie kluczem API (`ANTHROPIC_API_KEY`), nie subskrypcją.
+- [x] `routing.env` w `agent-config`: silnik i model dla zadań PLAN, IMPLEMENT, FIX, REQUIREMENTS.
+- [x] `agent-run.sh`: jedno wejście dla obu silników (`opencode run` / `claude -p`), wołane we wszystkich 8 miejscach.
+- [x] `opencode.json` z providerem `opencode-go` (klucz z `OPENCODE_API_KEY`); usunięte `opencode-plan.json` i `opencode-requirements.json`.
+- [x] `claude-settings.json` z tymi samymi zakazami (git commit/push, gh, web).
+- [x] Kroki `plan` nie dostają już tokenu GitHub: plan publikuje skrypt, nie agent (działa tak samo dla obu silników).
+- [x] Skille instalowane dla obu silników (`agent-home.sh`); subagenci OpenCode tylko dla OpenCode.
+- [x] Jeden obraz `agents/Dockerfile` z OpenCode i Claude Code, build do `ghcr.io/majowka/factory-agent` przez GitHub Actions.
+- [x] Szkielety sekretów `opencode-go` i `claude-code-oauth`.
+- [ ] Sprawdzić na żywo: `{env:OPENCODE_API_KEY}` w `opencode.json`, lista modeli OpenCode Go, `claude -p` z tokenem OAuth.
+- [ ] Opcjonalnie: wybór silnika per issue etykietą (np. `engine:claude`), nadpisujący `routing.env`.
+- [ ] Opcjonalnie: subagenci OpenCode przetłumaczeni na format Claude Code.
 
 ## 3. Manifesty pod k3s
 

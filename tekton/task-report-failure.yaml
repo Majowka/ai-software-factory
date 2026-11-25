@@ -31,7 +31,7 @@ spec:
         name: agent-config
   steps:
     - name: comment
-      image: quay.io/pminkows/opencode:latest
+      image: ghcr.io/majowka/factory-agent:latest
       volumeMounts:
         - name: config
           mountPath: /config

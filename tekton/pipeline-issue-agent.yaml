@@ -155,7 +155,7 @@ spec:
         steps:
           # Clone and branch. Holds the GitHub App key, the agent step does not.
           - name: prepare
-            image: quay.io/pminkows/opencode:latest
+            image: ghcr.io/majowka/factory-agent:latest
             workingDir: /workspace
             volumeMounts:
               - name: config
@@ -193,9 +193,8 @@ spec:
               #!/usr/bin/env bash
               set -euo pipefail
 
-              mkdir -p "$HOME/.config/opencode" /workspace/out
-              # Skills and agents fetched by the fetch-skills task
-              cp -R /skills/opencode/. "$HOME/.config/opencode/"
+              # Skills and agents fetched by the fetch-skills task, installed for both engines
+              bash /config/agent-home.sh /skills/opencode
               printf '# Issue #%s: %s\n\n%s\n' "$ISSUE_NUMBER" "$ISSUE_TITLE" "$ISSUE_BODY" > /workspace/issue.txt
 
               GH_TOKEN="$(bash /config/gh-app-token.sh)"
@@ -214,9 +213,9 @@ spec:
               echo "$BRANCH" > /workspace/branch
 
           # Planning: the agent analyzes the repo, writes the checklist to /workspace/out/plan.md and posts it on the issue
-          # itself (only `gh issue comment` is allowed in opencode-plan.json). It gets the short-lived token from prepare, not the App key.
+          # itself (the script posts it with `gh issue comment`; the agent has no GitHub credentials). It gets the short-lived token from prepare, not the App key.
           - name: plan
-            image: quay.io/pminkows/opencode:latest
+            image: ghcr.io/majowka/factory-agent:latest
             workingDir: /workspace
             volumeMounts:
               - name: config
@@ -236,8 +235,18 @@ spec:
                 value: $(params.issue)
               - name: HOME
                 value: /workspace/home
-              - name: OPENCODE_CONFIG
-                value: /config/opencode-plan.json
+              - name: OPENCODE_API_KEY
+                valueFrom:
+                  secretKeyRef:
+                    name: opencode-go
+                    key: api-key
+                    optional: true
+              - name: CLAUDE_CODE_OAUTH_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: claude-code-oauth
+                    key: token
+                    optional: true
             script: |
               #!/usr/bin/env bash
               set -euo pipefail
@@ -245,29 +254,30 @@ spec:
               # The repo is cloned by the prepare step: a workingDir of /workspace/repo would be created as root by Tekton and could not be cloned into
               cd /workspace/repo
 
-              GH_TOKEN="$(cat /workspace/gh-token)"
-              export GH_TOKEN
+              # The short-lived token stays in this script: the agent gets no GitHub credentials, the script posts the plan
+              PLAN_GH_TOKEN="$(cat /workspace/gh-token)"
               rm -f /workspace/gh-token
 
               PLAN_PROMPT="Analyze this repository and write an implementation plan for the GitHub issue below. Do not implement anything yet.
 
               1. Write the plan to /workspace/out/plan.md. The first line is '### Implementation plan', followed by a GitHub markdown checklist: one '- [ ] ' line per concrete step, in the order you will carry the steps out (code changes, tests, build verification), 3 to 10 lines, no other text.
-              2. Post it as a comment on the issue with: gh issue comment ${ISSUE_NUMBER} --repo ${REPO_FULL_NAME} --body-file /workspace/out/plan.md
-              This is the only gh command you may run. Do not modify any file in the repository and do not write .agent-summary.md.
+              The pipeline posts the plan for you: do not run gh. Do not modify any file in the repository and do not write .agent-summary.md.
 
               $(cat /workspace/issue.txt)"
 
-              echo "=== Planning ==="
-              timeout 15m opencode run "$PLAN_PROMPT" 2>&1 | tee /workspace/plan.log \
-                || echo "opencode exited with $? (timeout or error); continuing without a plan"
+              bash /config/agent-run.sh plan 15m /workspace/plan.log "$PLAN_PROMPT" || echo "Continuing without a plan"
+              if [ -s /workspace/out/plan.md ]; then
+                GH_TOKEN="$PLAN_GH_TOKEN" gh issue comment "$ISSUE_NUMBER" --repo "$REPO_FULL_NAME" --body-file /workspace/out/plan.md \
+                  || echo "Could not post the plan"
+              fi
 
               # Planning must not leave changes behind
               git reset -q --hard
               git clean -qfd
 
-          # Agent run. No GitHub credentials in this step; committing, pushing and gh are denied in opencode.json.
+          # Agent run. No GitHub credentials in this step; committing, pushing and gh are denied in opencode.json and claude-settings.json.
           - name: agent
-            image: quay.io/pminkows/opencode:latest
+            image: ghcr.io/majowka/factory-agent:latest
             workingDir: /workspace
             volumeMounts:
               - name: config
@@ -283,8 +293,18 @@ spec:
             env:
               - name: HOME
                 value: /workspace/home
-              - name: OPENCODE_CONFIG
-                value: /config/opencode.json
+              - name: OPENCODE_API_KEY
+                valueFrom:
+                  secretKeyRef:
+                    name: opencode-go
+                    key: api-key
+                    optional: true
+              - name: CLAUDE_CODE_OAUTH_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: claude-code-oauth
+                    key: token
+                    optional: true
             script: |
               #!/usr/bin/env bash
               set -euo pipefail
@@ -304,9 +324,7 @@ spec:
               $(cat /workspace/out/plan.md)"
               fi
 
-              echo "=== Running opencode ==="
-              timeout 3h opencode run "$PROMPT" 2>&1 | tee /workspace/opencode.log \
-                || echo "opencode exited with $? (timeout or error); continuing"
+              bash /config/agent-run.sh implement 3h /workspace/agent.log "$PROMPT" || echo "Continuing"
 
               if [ -z "$(git status --porcelain -uall -- . ':(exclude)**/target/**')" ]; then
                 echo "No changes generated"
@@ -360,7 +378,7 @@ spec:
         steps:
           # Commit, push, PR and issue comment. Mints a fresh token: the agent run may outlast the 1h token lifetime.
           - name: publish
-            image: quay.io/pminkows/opencode:latest
+            image: ghcr.io/majowka/factory-agent:latest
             workingDir: /workspace
             volumeMounts:
               - name: config

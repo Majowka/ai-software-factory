@@ -67,7 +67,7 @@ spec:
         steps:
           # Clone and context for the agent. Holds the GitHub App key, the agent step does not. Nothing to do in `release` mode.
           - name: prepare
-            image: quay.io/pminkows/opencode:latest
+            image: ghcr.io/majowka/factory-agent:latest
             workingDir: /workspace
             volumeMounts:
               - name: config
@@ -110,8 +110,12 @@ spec:
               if [ "$MODE" = release ]; then echo "release mode: no analysis"; exit 0; fi
               source /config/requirements-lib.sh
 
-              mkdir -p "$HOME/.config/opencode/skills/requirements-breakdown" /workspace/out
-              cp /requirements-skill/SKILL.md "$HOME/.config/opencode/skills/requirements-breakdown/SKILL.md"
+              # The skill for both engines
+              for d in "$HOME/.config/opencode/skills" "$HOME/.claude/skills"; do
+                mkdir -p "$d/requirements-breakdown"
+                cp /requirements-skill/SKILL.md "$d/requirements-breakdown/SKILL.md"
+              done
+              mkdir -p /workspace/out
 
               GH_TOKEN="$(bash /config/gh-app-token.sh)"
               export GH_TOKEN
@@ -134,9 +138,9 @@ spec:
 
               git clone --branch "$BASE_BRANCH" -- "$REPO_URL" /workspace/repo
 
-          # Analysis. No GitHub credentials in this step and gh is denied in opencode-requirements.json.
+          # Analysis. No GitHub credentials in this step and gh is denied in opencode.json and claude-settings.json.
           - name: analyze
-            image: quay.io/pminkows/opencode:latest
+            image: ghcr.io/majowka/factory-agent:latest
             workingDir: /workspace
             volumeMounts:
               - name: config
@@ -154,8 +158,18 @@ spec:
                 value: $(params.mode)
               - name: HOME
                 value: /workspace/home
-              - name: OPENCODE_CONFIG
-                value: /config/opencode-requirements.json
+              - name: OPENCODE_API_KEY
+                valueFrom:
+                  secretKeyRef:
+                    name: opencode-go
+                    key: api-key
+                    optional: true
+              - name: CLAUDE_CODE_OAUTH_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: claude-code-oauth
+                    key: token
+                    optional: true
             script: |
               #!/usr/bin/env bash
               set -euo pipefail
@@ -175,9 +189,7 @@ spec:
               Existing tasks:
               $(cat /workspace/out/existing-tasks.json)"
 
-              echo "=== Analyzing requirements ==="
-              timeout 40m opencode run "$PROMPT" 2>&1 | tee /workspace/opencode.log \
-                || echo "opencode exited with $? (timeout or error)"
+              bash /config/agent-run.sh requirements 40m /workspace/agent.log "$PROMPT" || true
 
               # Analysis must not leave changes behind
               git reset -q --hard
