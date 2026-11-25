@@ -1,0 +1,19 @@
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: pr-review-request
+  namespace: agents
+spec:
+  params:
+    - name: repo-url
+      value: $(body.repository.clone_url)
+    - name: repo-full-name
+      value: $(body.repository.full_name)
+    - name: pr-number
+      value: $(body.issue.number)
+    - name: comment-id
+      value: $(body.comment.id)
+    - name: comment-author
+      value: $(body.comment.user.login)
+    - name: comment-body
+      value: $(body.comment.body)

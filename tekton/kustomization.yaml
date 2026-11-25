@@ -8,6 +8,7 @@ resources:
   - pipeline-issue-agent.yaml
   - pipeline-issue-comment-agent.yaml
   - pipeline-pr-comment-agent.yaml
+  - pipeline-pr-review-agent.yaml
   - pipeline-requirements-agent.yaml
   - role-requirements-scheduler.yaml
   - rolebinding-issue-agent-listener.yaml
@@ -23,10 +24,12 @@ resources:
   - triggerbinding-issue-comment.yaml
   - triggerbinding-new-issue.yaml
   - triggerbinding-pr-review-comment.yaml
+  - triggerbinding-pr-review-request.yaml
   - triggerbinding-pr-review.yaml
   - triggertemplate-ci-fix.yaml
   - triggertemplate-issue-comment.yaml
   - triggertemplate-new-issue.yaml
   - triggertemplate-pr-comment.yaml
+  - triggertemplate-pr-review.yaml
   # Optional cap on parallel runs (4 pods, see the file):
   # - resourcequota-agents.yaml

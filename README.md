@@ -39,6 +39,7 @@ Ingress (k3s: Traefik) / Route (OpenShift) ──► EventListener (Tekton Trigg
 | `issue-agent` | a new issue (`issues` / `opened`) | Posts a checklist plan as an issue comment, implements the issue on a new branch, opens a pull request, enables auto-merge and replies with a summary. |
 | `issue-comment-agent` | an issue comment starting with `@ai` | Treats the comment as an instruction. A question gets an answer; a change request gets a plan, a branch and a pull request. |
 | `pr-comment-agent` | a pull request review or review comment | Reads the whole PR conversation, pushes the requested change to the PR branch (or answers a question) and replies on the PR. |
+| `pr-review-agent` | a PR comment starting with `@ai review`, on any open pull request of the repository | Read-only technical review (correctness, security, tests, match with the linked issue) with the `code-review` skill, posted as a PR review of type comment. Never pushes, approves or blocks. Text after `@ai review` sets the focus. |
 | `requirements-agent` | the hourly `requirements-scan` CronJob, for open issues labeled `requirements` | Compares the requirements with the code and creates the task issues in dependency order, at most 3 open at a time (section 6.9). Each task issue then runs through `issue-agent`. |
 
 Every pipeline starts with the `authorize` task, which goes on only when the author has `write`,
@@ -524,7 +525,7 @@ That service is published over HTTPS by `deploy/k3s/ingress-new-issue.yaml` (Tra
 
 ### 6.6 How events become pipeline runs
 
-The `new-issue` EventListener has five triggers. Each verifies the webhook signature with the
+The `new-issue` EventListener has six triggers. Each verifies the webhook signature with the
 `github-webhook-secret` secret, filters with CEL, and then maps the payload with a binding.
 
 | Trigger | GitHub event | CEL filter (all conditions) | Template, pipeline |
@@ -533,6 +534,7 @@ The `new-issue` EventListener has five triggers. Each verifies the webhook signa
 | `issue-comment` | `issue_comment` | action `created`, issue open, **not a pull request**, not a bot, **body starts with `@ai`** | `issue-comment`, `issue-comment-agent` |
 | `pr-review-comment` | `pull_request_review_comment` | action `created`, PR open, not a bot, **PR opened by the factory** (author is a bot, branch `issue-*`) | `pr-comment`, `pr-comment-agent` |
 | `pr-review` | `pull_request_review` | action `submitted`, PR open, not a bot, non-empty body, **PR opened by the factory** (author is a bot, branch `issue-*`) | `pr-comment`, `pr-comment-agent` |
+| `pr-review-request` | `issue_comment` | action `created`, open **pull request** (any author, also humans), not a bot, **body starts with `@ai review`** | `pr-review`, `pr-review-agent` |
 | `ci-failure` | `check_suite` | action `completed`, conclusion `failure`, `timed_out` or `startup_failure`, belongs to a pull request of the same repository, branch `issue-*` (PR author and attempt limit checked in `prepare`) | `ci-fix`, `pr-comment-agent` (mode `ci-fix`) |
 
 Each `PipelineRun` gets its own volumes (`volumeClaimTemplate`): 1 GiB for the skills workspace and
@@ -746,15 +748,15 @@ usually means a wrong secret, and a timeout means GitHub cannot reach the URL.
 - Code and issue text are sent to the model provider of each engine.
 - OpenCode subagents from the skills artifact are not translated for Claude Code; skills work in both.
 - Comments on pull requests that start with `@ai` are not handled by `issue-comment-agent`
-  (the trigger skips pull requests). Pull requests are handled by the review triggers.
+  (the trigger skips pull requests). Pull requests are handled by the review triggers; only
+  `@ai review` on the PR conversation starts a run (`pr-review-agent`, read-only).
 
 ## 11. Possible next steps
 
 Ideas for features and architecture changes, none of them implemented yet.
 
-- **Reviewer agent.** A second agent reviews the pull request before the human does, on the engine that did
-  not write the code. Splitting the roles (planner, implementer, reviewer) usually helps more than a bigger
-  model.
+- **Automatic reviewer agent.** `@ai review` exists (`pr-review-agent`, task `REVIEW` in `routing.env`); the
+  next step is to start it on every pull request the factory opens, on the engine that did not write the code.
 - **Automatic routing.** A triage step chooses the engine and model per issue (simple issues to a cheaper
   model, hard ones to a stronger one) and sets the `engine` label, instead of a human. A fallback to the other
   engine when one hits its usage limit.
