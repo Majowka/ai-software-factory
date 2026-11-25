@@ -239,7 +239,7 @@ data:
   # /workspace/out/review.json (verdict and findings of the code-review skill), pr.diff, head-sha, ci-failures.md.
   # One GitHub review: inline comments on the diff lines of the findings (the others go to the body), REQUEST_CHANGES with
   # a blocker, APPROVE only where review.env allows it and all checks are green right now, else COMMENT. Falls back to a comment / no inline comments when
-  # GitHub refuses (no verdict on the App's own PR, a line outside the diff). Then supersedes the earlier factory reviews
+  # GitHub refuses (no verdict on the App's own PR, a line outside the diff), as a last resort to a plain PR comment. Then supersedes the earlier factory reviews
   # of the PR: dismisses their verdict, folds their body and hides their inline comments as outdated. Needs GH_TOKEN.
   review-publish.sh: |
     #!/usr/bin/env bash
@@ -360,11 +360,6 @@ data:
         | gh api -X POST "repos/${REPO_FULL_NAME}/pulls/${PR_NUMBER}/reviews" --input - > "$w/review-posted.json"
     }
 
-    # Earlier reviews of the factory on this pull request, replaced once the new one is posted
-    gh api --paginate "repos/${REPO_FULL_NAME}/pulls/${PR_NUMBER}/reviews?per_page=100" \
-      --jq ".[] | select(.user.type == \"Bot\" and (.body | contains(\"${MARKER}\"))) | {id, state, body}" | jq -s . > "$w/old-reviews.json" \
-      || echo '[]' > "$w/old-reviews.json"
-
     # GitHub refuses to approve or request changes on a pull request of the App itself (factory PRs), and a line it does
     # not accept fails the whole review: fall back to a comment, then to a review without inline comments.
     POSTED=""
@@ -374,14 +369,27 @@ data:
       if post_review ${attempt}; then POSTED="$attempt"; break; fi
       echo "Review refused (event ${attempt% *}, inline comments ${attempt#* }); trying the next fallback"
     done
-    [ -n "$POSTED" ] || { echo "GitHub refused every form of the review"; exit 1; }
+    if [ -z "$POSTED" ]; then
+      # Last resort: the report as a plain PR comment. Older reviews stay as they are.
+      echo "GitHub refused every form of the review; posting the report as a PR comment"
+      build_body COMMENT 0 > "$w/review-body.md"
+      jq -n --rawfile body "$w/review-body.md" '{body: $body}' \
+        | gh api -X POST "repos/${REPO_FULL_NAME}/issues/${PR_NUMBER}/comments" --input - --jq .html_url
+      exit 0
+    fi
     EVENT="${POSTED% *}"
     URL="$(jq -r .html_url "$w/review-posted.json")"
     NEW_ID="$(jq -r .id "$w/review-posted.json")"
     echo "Posted ${EVENT} review: ${URL}"
 
+    # Earlier reviews of the factory on this pull request, listed after posting so that an overlapping run is seen too
+    gh api --paginate "repos/${REPO_FULL_NAME}/pulls/${PR_NUMBER}/reviews?per_page=100" \
+      --jq ".[] | select(.user.type == \"Bot\" and (.body | contains(\"${MARKER}\"))) | {id, state, body}" \
+      | jq -s --argjson new "$NEW_ID" '[.[] | select(.id < $new)]' > "$w/old-reviews.json" \
+      || { echo "Could not list earlier reviews; nothing superseded"; echo '[]' > "$w/old-reviews.json"; }
+
     # Supersede the older reviews: dismiss a verdict, fold the body, hide its inline comments as outdated
-    jq -c --argjson new "$NEW_ID" '.[] | select(.id != $new)' "$w/old-reviews.json" | while IFS= read -r old; do
+    jq -c '.[]' "$w/old-reviews.json" | while IFS= read -r old; do
       id="$(jq -r .id <<<"$old")"; state="$(jq -r .state <<<"$old")"
       if [ "$state" = CHANGES_REQUESTED ] || [ "$state" = APPROVED ]; then
         # Keep the marker of a review whose verdict could not be dismissed (e.g. branch protection restricts dismissals),
@@ -390,17 +398,21 @@ data:
           -f message="Superseded by a newer automated review: ${URL}" -f event=DISMISS >/dev/null \
           || { echo "Could not dismiss review ${id}; left as it is"; continue; }
       fi
+      # Hide its inline comments first; the body keeps the marker until that worked, so a later run retries the rest
+      done_ok=1
+      nodes="$(gh api --paginate "repos/${REPO_FULL_NAME}/pulls/${PR_NUMBER}/reviews/${id}/comments?per_page=100" --jq '.[].node_id')" \
+        || { nodes=""; done_ok=0; echo "Could not list the comments of review ${id}"; }
+      for node in $nodes; do
+        gh api graphql -f query='mutation($id: ID!) { minimizeComment(input: {subjectId: $id, classifier: OUTDATED}) { clientMutationId } }' \
+          -f id="$node" >/dev/null || { done_ok=0; echo "Could not hide comment ${node}"; }
+      done
+      if [ "$done_ok" != 1 ]; then echo "Review ${id} only partly superseded; the next run retries"; continue; fi
       jq -r --arg url "$URL" --arg m "$MARKER" \
         '"<!-- factory:review-superseded -->\n_Superseded by [a newer automated review](\($url))._\n\n<details><summary>Previous review</summary>\n\n" + (.body | gsub($m; "")) + "\n</details>\n"' \
         <<<"$old" > "$w/old-body.md"
       jq -n --rawfile body "$w/old-body.md" '{body: $body}' \
         | gh api -X PUT "repos/${REPO_FULL_NAME}/pulls/${PR_NUMBER}/reviews/${id}" --input - >/dev/null \
-        || echo "Could not update review ${id}"
-      gh api --paginate "repos/${REPO_FULL_NAME}/pulls/${PR_NUMBER}/reviews/${id}/comments?per_page=100" --jq '.[].node_id' 2>/dev/null \
-        | while IFS= read -r node; do
-            gh api graphql -f query='mutation($id: ID!) { minimizeComment(input: {subjectId: $id, classifier: OUTDATED}) { clientMutationId } }' \
-              -f id="$node" >/dev/null || echo "Could not hide comment ${node}"
-          done
+        || { echo "Could not update review ${id}"; continue; }
       echo "Superseded review ${id} (${state})"
     done
   # Failed CI checks of one commit with the tail of each log, as Markdown: ci-failures.sh <owner/repo> <sha> <output file>.
