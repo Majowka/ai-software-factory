@@ -51,7 +51,17 @@ spec:
     - name: skills
     - name: work
   tasks:
+    - name: authorize
+      taskRef:
+        name: authorize-author
+      params:
+        - name: repo-full-name
+          value: $(params.repo-full-name)
+        - name: author
+          value: $(params.comment-author)
     - name: print-event
+      runAfter:
+        - authorize
       params:
         - name: event-type
           value: $(params.event-type)
@@ -664,6 +674,10 @@ spec:
       when:
         - input: $(tasks.status)
           operator: in
+          values:
+            - Failed
+        - input: $(tasks.authorize.status)
+          operator: notin
           values:
             - Failed
       taskRef:

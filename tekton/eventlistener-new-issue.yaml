@@ -23,10 +23,9 @@ spec:
             name: github
         - params:
             - name: filter
-              value: body.action == 'opened' && (body.issue.author_association in
-                ['OWNER', 'MEMBER', 'COLLABORATOR'] || body.issue.user.login ==
-                'klaudiuszai[bot]') && !body.issue.labels.exists(l,
+              value: body.action == 'opened' && !body.issue.labels.exists(l,
                 l.name in ['manual', 'requirements'])
+                && body.repository.full_name in ['Majowka/ai-software-factory']
           ref:
             kind: ClusterInterceptor
             name: cel
@@ -51,8 +50,8 @@ spec:
         - params:
             - name: filter
               value: body.action == 'created' && body.pull_request.state == 'open'
-                && body.sender.type != 'Bot' && body.comment.author_association in
-                ['OWNER', 'MEMBER', 'COLLABORATOR']
+                && body.sender.type != 'Bot' && body.pull_request.user.type == 'Bot'
+                && body.pull_request.head.ref.startsWith('issue-')
           ref:
             kind: ClusterInterceptor
             name: cel
@@ -77,9 +76,9 @@ spec:
         - params:
             - name: filter
               value: body.action == 'submitted' && body.pull_request.state == 'open'
-                && body.sender.type != 'Bot' && body.review.author_association in
-                ['OWNER', 'MEMBER', 'COLLABORATOR'] && body.review.body != null && body.review.body
-                != ''
+                && body.sender.type != 'Bot' && body.pull_request.user.type == 'Bot'
+                && body.pull_request.head.ref.startsWith('issue-')
+                && body.review.body != null && body.review.body != ''
           ref:
             kind: ClusterInterceptor
             name: cel
@@ -105,7 +104,6 @@ spec:
             - name: filter
               value: body.action == 'created' && body.issue.state == 'open'
                 && !has(body.issue.pull_request) && body.sender.type != 'Bot'
-                && body.comment.author_association in ['OWNER', 'MEMBER', 'COLLABORATOR']
                 && body.comment.body.startsWith('@ai')
           ref:
             kind: ClusterInterceptor
@@ -135,7 +133,7 @@ spec:
             - name: filter
               value: body.action == 'completed' && body.check_suite.conclusion in
                 ['failure', 'timed_out', 'startup_failure'] && size(body.check_suite.pull_requests)
-                > 0
+                > 0 && body.check_suite.head_branch.startsWith('issue-')
           ref:
             kind: ClusterInterceptor
             name: cel

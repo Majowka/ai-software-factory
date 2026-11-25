@@ -41,9 +41,11 @@ Ingress (k3s: Traefik) / Route (OpenShift) ──► EventListener (Tekton Trigg
 | `pr-comment-agent` | a pull request review or review comment | Reads the whole PR conversation, pushes the requested change to the PR branch (or answers a question) and replies on the PR. |
 | `requirements-agent` | the hourly `requirements-scan` CronJob, for open issues labeled `requirements` | Compares the requirements with the code and creates the task issues in dependency order, at most 3 open at a time (section 6.9). Each task issue then runs through `issue-agent`. |
 
-Every trigger only accepts events from users whose `author_association` is `OWNER`, `MEMBER` or
-`COLLABORATOR`. New issues are also accepted from the GitHub App itself (the task issues that the
-requirements agent creates), and are skipped when labeled `manual` or `requirements`. Comment and review
+Every pipeline starts with the `authorize` task, which goes on only when the author has `write`,
+`maintain` or `admin` permission on the repository (read through the GitHub App API), or is the GitHub
+App itself (the task issues that the requirements agent creates). The webhook's `author_association`
+is not used: it says `NONE` for org members whose membership is private. A rejected run ends there
+without commenting. New issues are skipped when labeled `manual` or `requirements`. Comment and review
 triggers ignore bots. Forks and closed issues or pull requests are skipped, so an issue opened by a
 stranger on a public repository does nothing.
 
@@ -338,7 +340,7 @@ The factory runs no model of its own. Agent tasks go to one of two hosted engine
 
 | Engine | Models | Authentication | Secret |
 |---|---|---|---|
-| `opencode` | OpenCode Go models, `opencode-go/<model-id>` (default `opencode-go/kimi-k3`) | API key | `opencode-go` |
+| `opencode` | OpenCode Go models, `opencode-go/<model-id>` (default `opencode-go/deepseek-v4.1-flash`) | API key | `opencode-go` |
 | `claude` | Claude models, an alias such as `sonnet` or `opus`, or a full model id | OAuth token from `claude setup-token` | `claude-code-oauth` |
 
 Which engine and model handle which task is set in `routing.env` (section 6.1). Both subscriptions have
@@ -380,7 +382,7 @@ AGENT_ENGINE_IMPLEMENT=claude
 AGENT_ENGINE_FIX=claude
 AGENT_ENGINE_CI_FIX=claude
 AGENT_ENGINE_REQUIREMENTS=opencode
-OPENCODE_MODEL=opencode-go/kimi-k3      # per task: OPENCODE_MODEL_<TASK>
+OPENCODE_MODEL=opencode-go/deepseek-v4.1-flash # per task: OPENCODE_MODEL_<TASK>
 CLAUDE_MODEL=sonnet                     # per task: CLAUDE_MODEL_<TASK>
 CLAUDE_MODEL_PLAN=opus
 ```
@@ -527,11 +529,11 @@ The `new-issue` EventListener has five triggers. Each verifies the webhook signa
 
 | Trigger | GitHub event | CEL filter (all conditions) | Template, pipeline |
 |---|---|---|---|
-| `new-issue` | `issues` | action `opened`, author OWNER, MEMBER or COLLABORATOR (or the GitHub App bot), issue **without** the `manual` or `requirements` label | `new-issue`, `issue-agent` |
-| `issue-comment` | `issue_comment` | action `created`, issue open, **not a pull request**, not a bot, author OWNER, MEMBER or COLLABORATOR, **body starts with `@ai`** | `issue-comment`, `issue-comment-agent` |
-| `pr-review-comment` | `pull_request_review_comment` | action `created`, PR open, not a bot, author OWNER, MEMBER or COLLABORATOR | `pr-comment`, `pr-comment-agent` |
-| `pr-review` | `pull_request_review` | action `submitted`, PR open, not a bot, author OWNER, MEMBER or COLLABORATOR, non-empty body | `pr-comment`, `pr-comment-agent` |
-| `ci-failure` | `check_suite` | action `completed`, conclusion `failure`, `timed_out` or `startup_failure`, belongs to a pull request of the same repository | `ci-fix`, `pr-comment-agent` (mode `ci-fix`) |
+| `new-issue` | `issues` | action `opened`, issue **without** the `manual` or `requirements` label, repository on the automatic list (only `Majowka/ai-software-factory`; other repositories start runs with `@ai` comments only) | `new-issue`, `issue-agent` |
+| `issue-comment` | `issue_comment` | action `created`, issue open, **not a pull request**, not a bot, **body starts with `@ai`** | `issue-comment`, `issue-comment-agent` |
+| `pr-review-comment` | `pull_request_review_comment` | action `created`, PR open, not a bot, **PR opened by the factory** (author is a bot, branch `issue-*`) | `pr-comment`, `pr-comment-agent` |
+| `pr-review` | `pull_request_review` | action `submitted`, PR open, not a bot, non-empty body, **PR opened by the factory** (author is a bot, branch `issue-*`) | `pr-comment`, `pr-comment-agent` |
+| `ci-failure` | `check_suite` | action `completed`, conclusion `failure`, `timed_out` or `startup_failure`, belongs to a pull request of the same repository, branch `issue-*` (PR author and attempt limit checked in `prepare`) | `ci-fix`, `pr-comment-agent` (mode `ci-fix`) |
 
 Each `PipelineRun` gets its own volumes (`volumeClaimTemplate`): 1 GiB for the skills workspace and
 10 GiB for the work workspace (the clone and the Maven cache). The only Tekton timeouts are
@@ -594,10 +596,10 @@ With hosted models this also caps how much of your subscription limits parallel 
   `CLAUDE_CODE_OAUTH_TOKEN`). The agent has a broad `bash` permission, so treat them as readable by the
   agent: a prompt injection in an issue could try to leak them. Keep them scoped to this use, watch the
   usage, and rotate them if in doubt.
-- Only `OWNER`, `MEMBER` and `COLLABORATOR` accounts (and the GitHub App, for the task issues of
-  the requirements agent) can start a run, and only they can set the `engine` labels. Bot events are
+- Only accounts with `write` permission or more on the repository (and the GitHub App, for the task
+  issues of the requirements agent) get past the `authorize` task, and only they can set the `engine` labels. Bot events are
   ignored in the comment and review flows, and pull requests from forks are rejected. The App's own
-  login is part of the `new-issue` filter: change it if your App has another name.
+  login is the `bot-login` parameter of `task-authorize-author.yaml`: change it if your App has another name.
 - Issue and comment text is untrusted input that reaches the model, and with hosted engines code and
   issue text leave the cluster to the provider of the engine. Keep the pods free of cluster credentials,
   and consider a `NetworkPolicy` that limits egress to GitHub, the model providers and your Maven
@@ -709,7 +711,7 @@ usually means a wrong secret, and a timeout means GitHub cannot reach the URL.
 
 | Symptom | Check |
 |---|---|
-| No `PipelineRun` is created | Webhook deliveries on GitHub; `kubectl logs deployment/el-new-issue -n agents`; the sender's `author_association` and the CEL filter. |
+| No `PipelineRun` is created | Webhook deliveries on GitHub; `kubectl logs deployment/el-new-issue -n agents`; the CEL filter. A run that stops at `authorize` shows the author's permission in that task's log. |
 | GitHub shows a timeout for every delivery | The Ingress host is not reachable from the internet: DNS, the published Traefik entry point, TLS. |
 | `fetch-skills` fails | `skills-artifact` reference and registry access; the artifact must contain a `.tar.gz`. |
 | Pods fail with `ImagePullBackOff` | The agent image tag exists (only `master` builds push `latest`), and the GHCR package is public or the `pipeline` service account has a pull secret (section 3). |

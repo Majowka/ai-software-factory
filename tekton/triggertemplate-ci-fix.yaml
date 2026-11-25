@@ -40,10 +40,11 @@ spec:
             value: ''
           - name: branch
             value: $(tt.params.branch)
+          # The authorize task checks this login: the run acts for the factory bot, prepare checks that the PR is the bot's
           - name: comment-author
-            value: $(tt.params.check-app)
+            value: klaudiuszai[bot]
           - name: comment-body
-            value: 'CI failed on commit $(tt.params.head-sha)'
+            value: 'CI ($(tt.params.check-app)) failed on commit $(tt.params.head-sha)'
           - name: base-branch
             value: $(tt.params.base-branch)
         pipelineRef:
