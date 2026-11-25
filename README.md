@@ -39,7 +39,7 @@ Ingress (k3s: Traefik) / Route (OpenShift) ──► EventListener (Tekton Trigg
 | `issue-agent` | a new issue (`issues` / `opened`) | Posts a checklist plan as an issue comment, implements the issue on a new branch, opens a pull request, enables auto-merge and replies with a summary. |
 | `issue-comment-agent` | an issue comment starting with `@ai` | Treats the comment as an instruction. A question gets an answer; a change request gets a plan, a branch and a pull request. |
 | `pr-comment-agent` | a review or review comment on a factory pull request; on any other pull request of the repository (also human ones) a PR comment, review or review comment starting with `@ai` | Reads the whole PR conversation and the failing CI logs of the head commit, pushes the requested change to the PR branch as a new commit of the bot (never a force push; or answers a question) and replies on the PR. `@ai fix` alone fixes the failing CI. Pull requests from forks are refused. |
-| `pr-review-agent` | a PR comment starting with `@ai review`, on any open pull request of the repository | Read-only technical review (correctness, security, tests, match with the linked issue) with the `code-review` skill, posted as a PR review of type comment. Never pushes, approves or blocks. Text after `@ai review` sets the focus. |
+| `pr-review-agent` | a PR comment starting with `@ai review`, on any open pull request of the repository | Read-only technical review (correctness, security, tests, match with the linked issue) with the `code-review` skill, posted as one PR review: remarks on diff lines as inline comments, **request changes** when there is a blocker, otherwise a comment. **Approve** only in repositories listed in `REVIEW_APPROVE_REPOS` (`review.env` in `agent-config`, empty by default), with no blocker or major remark and every check of the commit green when the review is posted. A new review supersedes the previous one of the factory (its verdict dismissed, its inline comments hidden as outdated). Never pushes. Text after `@ai review` sets the focus. |
 | `requirements-agent` | the hourly `requirements-scan` CronJob, for open issues labeled `requirements` | Compares the requirements with the code and creates the task issues in dependency order, at most 3 open at a time (section 6.9). Each task issue then runs through `issue-agent`. |
 
 Every pipeline starts with the `authorize` task, which goes on only when the author has `write`,
@@ -99,7 +99,7 @@ official logos.
 .
 ├── agents/                              the agent: image and shared configuration
 │   ├── Dockerfile                       the agent image: OpenCode and Claude Code, gh, JDK, Maven (built by .github/workflows/agent-image.yml)
-│   ├── configmap-agent-config.yaml      engine routing, agent-run.sh, OpenCode and Claude Code permissions, GitHub App token script, requirements helpers
+│   ├── configmap-agent-config.yaml      engine routing, agent-run.sh, OpenCode and Claude Code permissions, GitHub App token script, review publishing, requirements helpers
 │   ├── kustomization.yaml               agent-config and the skills ConfigMap
 │   └── skills/                          skills delivered as a ConfigMap (requirements-breakdown)
 ├── tekton/                              pipelines and everything that triggers them (common to all platforms)
