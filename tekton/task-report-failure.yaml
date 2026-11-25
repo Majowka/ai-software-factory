@@ -78,5 +78,12 @@ spec:
         printf ':x: **The agent run failed.** %s\n\nPipeline run `%s` in namespace `%s`. Logs: `tkn pipelinerun logs %s -n %s`\n\nUsual causes: the model endpoint was not available, the run hit its timeout, or the agent produced no changes. %s\n' \
           "$WHAT" "$PIPELINERUN" "$PIPELINERUN_NAMESPACE" "$PIPELINERUN" "$PIPELINERUN_NAMESPACE" "$RETRY_HINT" > /tmp/failure.md
 
-        if [ "$TARGET" = "pr" ]; then comment=(gh pr comment); else comment=(gh issue comment); fi
-        "${comment[@]}" "$NUMBER" --repo "$REPO_FULL_NAME" --body-file /tmp/failure.md || echo "Could not post the failure comment"
+        # REST, not `gh issue/pr comment` (GraphQL, which failed with "Something went wrong" on 2026-11-25); a PR is an
+        # issue for this endpoint. Three tries, so a passing GitHub error does not leave the failure silent.
+        for try in 1 2 3; do
+          if gh api -X POST "repos/${REPO_FULL_NAME}/issues/${NUMBER}/comments" -F body=@/tmp/failure.md --silent; then
+            echo "Failure comment posted"; exit 0
+          fi
+          sleep $((try * 10))
+        done
+        echo "Could not post the failure comment"

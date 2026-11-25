@@ -21,7 +21,8 @@ data:
     header="$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)"
     payload="$(printf '{"iat":%s,"exp":%s,"iss":"%s"}' "$((now - 60))" "$((now + 540))" "$GITHUB_APP_ID" | b64url)"
     signature="$(printf '%s.%s' "$header" "$payload" | openssl dgst -sha256 -sign <(pem_normalize "$GITHUB_APP_PRIVATE_KEY") | b64url)"
-    curl -fsS -X POST \
+    # Retries: a GitHub 5xx while minting the token failed whole runs (2026-11-25)
+    curl -fsS --retry 4 --retry-all-errors --retry-delay 5 -X POST \
       -H "Authorization: Bearer ${header}.${payload}.${signature}" \
       -H "Accept: application/vnd.github+json" \
       "https://api.github.com/app/installations/${GITHUB_APP_INSTALLATION_ID}/access_tokens" | jq -er .token
@@ -196,13 +197,16 @@ data:
     # tests/integration, real-integration-*) are left to the repository's CI. Runs in the repository root.
     set -euo pipefail
 
-    echo "=== bridge-go: go test ==="
+    echo "=== bridge-go: go test ==="; start=$SECONDS
     (cd bridge-go && CGO_ENABLED=0 go test -count=1 -timeout 300s ./...)
+    echo "=== bridge-go: done in $((SECONDS - start))s ==="
 
     echo "=== backend: dependencies (uv, Python 3.13) ==="
     venv="${HOME}/.cache/verify-venv/mesh-manager"
     uv venv -q --allow-existing -p 3.13 "$venv"
+    start=$SECONDS
     VIRTUAL_ENV="$venv" uv pip install -q -r backend/requirements_ci.txt
+    echo "=== backend: dependencies done in $((SECONDS - start))s ==="
 
     cd backend
     # No CI markers and no database URL: conftest.py then uses SQLite instead of the CI Postgres service
@@ -211,7 +215,12 @@ data:
     shard() {
       echo "=== backend: ${1} ==="; shift
       rm -f test*.db
-      "$venv/bin/python" -m pytest -q --no-header -p no:cacheprovider --timeout=120 --maxfail=5 "$@"
+      local rc=0 start=$SECONDS
+      "$venv/bin/python" -m pytest -q --no-header -p no:cacheprovider --timeout=120 --maxfail=5 "$@" || rc=$?
+      echo "=== backend: shard done in $((SECONDS - start))s (exit ${rc}) ==="
+      # 5 = no tests collected: a branch older than these test paths, not a failure of the change
+      if [ "$rc" -eq 5 ]; then echo "warning: no tests collected"; rc=0; fi
+      return "$rc"
     }
     shard unit-core \
       tests/core/ tests/unit/core/ tests/unit/models/ tests/unit/middleware/ tests/unit/schemas/ tests/unit/scripts/ \
