@@ -23,6 +23,8 @@ spec:
         # Fixed name: a redelivered webhook cannot start a second run for the same review or review comment
         name: pr-comment-agent-$(tt.params.event-id)
       spec:
+        # Created waiting; run-dispatcher starts it when fewer than MAX_ACTIVE runs are active (FIFO)
+        status: PipelineRunPending
         params:
           - name: event-type
             value: $(tt.params.event-type)

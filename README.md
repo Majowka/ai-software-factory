@@ -711,6 +711,28 @@ is retried with backoff (honouring `Retry-After`), the run list is read in pages
 Runs still in progress (no `completionTime`) are never touched. `DRY_RUN=true` only prints what would be deleted.
 Run it on demand with `kubectl create job --from=cronjob/run-pruner prune-now -n <namespace>`.
 
+### 6.12 Queues: runs and LLM calls
+
+Two queues keep the factory from starting more work than the cluster and the model providers take.
+
+**Runs.** The trigger templates and the requirements scan create every PipelineRun with `status: PipelineRunPending`.
+Tekton does not start such a run: no pods, no PVCs, and its timeouts do not tick yet. The `run-dispatcher` Deployment
+(`tekton/deployment-run-dispatcher.yaml`, no AI) checks every `POLL_SECONDS` (10) how many runs are active (started,
+not finished) and starts the oldest waiting ones, until `MAX_ACTIVE` (6) are active. Without the dispatcher, new runs
+stay pending; to start one by hand: `kubectl patch pipelinerun <name> -n <namespace> --type merge -p '{"spec":{"status":null}}'`.
+
+**LLM calls.** Every agent task goes through `agent-run.sh`, which first takes a slot of its engine (`llm-slot.sh`):
+at most `LLM_SLOTS_OPENCODE` (3) tasks talk to OpenCode and `LLM_SLOTS_CLAUDE` (2) to Claude Code at the same time,
+across all runs. The others wait in arrival order (FIFO) and say so in their log every minute. Slots and the queue
+are `Lease` objects in the namespace (`llm-slot-<engine>-<i>`, `llm-q-<engine>-...`, Role `llm-slots` for the
+`pipeline` service account); a step renews its lease every 20 s, so a slot of a pod that died comes free after 90 s.
+Waiting does not count against the task's own time limit. When the API cannot be used, the task runs without a slot.
+A Claude task that falls back to OpenCode gives its Claude slot back and queues for an OpenCode one.
+
+When OpenCode still fails on the provider's rate limit (HTTP 429, too many requests, overloaded), `agent-run.sh` runs
+the task again up to `LLM_RATE_RETRIES` (4) times, waiting `LLM_RATE_BACKOFF` (30) seconds, doubled every time, plus
+jitter, as long as the task's time limit allows. All these values are in `routing.env`.
+
 ## 7. Connect GitHub to the cluster
 
 The public URL of the listener is the host of the Ingress (k3s) or the Route (OpenShift):

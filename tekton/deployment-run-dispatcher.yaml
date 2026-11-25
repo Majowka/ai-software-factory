@@ -1,0 +1,92 @@
+# Starts waiting PipelineRuns in arrival order (FIFO), at most MAX_ACTIVE at a time.
+# The trigger templates and the requirements scan create every run with `status: PipelineRunPending`; Tekton does not
+# start such a run (no pods, no PVCs, and its timeouts do not tick yet). Every POLL_SECONDS this loop counts the active
+# runs (started, not finished) and clears `spec.status` on the oldest waiting runs until MAX_ACTIVE are active.
+# Without it, runs stay pending: to start one by hand,
+#   kubectl -n <ns> patch pipelinerun <name> --type merge -p '{"spec":{"status":null}}'
+# Agent steps that talk to an LLM are capped per engine as well (llm-slot.sh, LLM_SLOTS_* in routing.env).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: run-dispatcher
+  namespace: agents
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: run-dispatcher
+  template:
+    metadata:
+      labels:
+        app: run-dispatcher
+    spec:
+      serviceAccountName: run-dispatcher
+      containers:
+        - name: dispatch
+          image: ghcr.io/majowka/factory-agent:latest
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          env:
+            - name: MAX_ACTIVE
+              value: "6"
+            - name: POLL_SECONDS
+              value: "10"
+            - name: HOME
+              value: /tmp
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          command: [bash, -c]
+          args:
+          - |
+            #!/usr/bin/env bash
+            set -uo pipefail
+            # The agent image has no kubectl or oc: call the API with the service account token.
+            sa=/var/run/secrets/kubernetes.io/serviceaccount
+            runs_path="/apis/tekton.dev/v1/namespaces/${NAMESPACE}/pipelineruns"
+            # api METHOD PATH OUTFILE [curl args]: prints the HTTP code (000 = no response)
+            api() {
+              local method="$1" path="$2" out="$3"; shift 3
+              curl -sS --connect-timeout 10 --max-time 60 --cacert "$sa/ca.crt" \
+                -H "Authorization: Bearer $(cat "$sa/token")" -o "$out" -w '%{http_code}' -X "$method" \
+                "https://kubernetes.default.svc${path}" "$@" 2>/dev/null || echo 000
+            }
+            echo "run-dispatcher: at most ${MAX_ACTIVE} active runs, FIFO"
+            last=""
+            while :; do
+              sleep "$POLL_SECONDS"
+              # Only what is needed from each run (a run carries its whole pipeline spec), read in pages
+              : > /tmp/runs.jsonl; cont=""; ok=1
+              while :; do
+                code="$(api GET "${runs_path}?limit=50${cont:+&continue=$cont}" /tmp/page.json)"
+                if [ "$code" != 200 ]; then echo "could not list PipelineRuns (HTTP $code)" >&2; ok=0; break; fi
+                jq -c '.items[] | {name: .metadata.name, created: .metadata.creationTimestamp,
+                  pending: (.spec.status == "PipelineRunPending"), done: (.status.completionTime != null)}' \
+                  /tmp/page.json >> /tmp/runs.jsonl
+                cont="$(jq -r '.metadata.continue // "" | @uri' /tmp/page.json)"
+                [ -n "$cont" ] || break
+              done
+              [ "$ok" = 1 ] || continue
+              active="$(jq -s '[.[] | select((.pending | not) and (.done | not))] | length' /tmp/runs.jsonl)"
+              jq -rs 'map(select(.pending and (.done | not))) | sort_by(.created, .name) | .[].name' /tmp/runs.jsonl > /tmp/waiting.txt
+              waiting="$(wc -l < /tmp/waiting.txt)"
+              state="active ${active}/${MAX_ACTIVE}, waiting ${waiting}"
+              [ "$state" = "$last" ] || { echo "$(date -u +%FT%TZ) ${state}"; last="$state"; }
+              free=$((MAX_ACTIVE - active))
+              while [ "$free" -gt 0 ] && read -r run; do
+                code="$(api PATCH "${runs_path}/${run}" /tmp/patch.json \
+                  -H 'Content-Type: application/merge-patch+json' --data '{"spec":{"status":null}}')"
+                if [ "$code" = 200 ]; then
+                  echo "$(date -u +%FT%TZ) started ${run}"; free=$((free - 1))
+                else
+                  echo "could not start ${run} (HTTP ${code}): $(jq -r '.message // .' /tmp/patch.json 2>/dev/null)" >&2
+                fi
+              done < /tmp/waiting.txt
+            done

@@ -23,6 +23,8 @@ spec:
         # Tekton refuses the duplicates and the first run waits for the remaining checks before it reads the logs.
         name: pr-ci-fix-$(tt.params.head-sha)
       spec:
+        # Created waiting; run-dispatcher starts it when fewer than MAX_ACTIVE runs are active (FIFO)
+        status: PipelineRunPending
         params:
           - name: mode
             value: ci-fix
