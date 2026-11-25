@@ -1,4 +1,5 @@
-# Agent image for the pipelines: OpenCode and Claude Code, gh, JDK, Maven, Python 3.13 + uv, Go, skaffold and kubectl.
+# Agent image for the pipelines: OpenCode and Claude Code, gh, JDK, Maven, Python 3.13 + uv, Go, language servers,
+# skaffold and kubectl.
 # One image for every repository the factory works on (Java/Maven, Python, Go, Node).
 # Built and pushed to ghcr.io/majowka/factory-agent by .github/workflows/agent-image.yml.
 
@@ -74,5 +75,19 @@ ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python \
 RUN uv python install "${PYTHON_VERSION}" --default \
     && chmod -R a+rX /opt/uv \
     && python3 --version && uv --version && go version
+
+# Language servers, so OpenCode's lsp tool can jump to definitions and references instead of grepping:
+# pyright (Python), gopls (Go), typescript-language-server (TS/JS; uses the tsserver from the project's node_modules).
+# OpenCode finds them on PATH; downloads at run time are off (OPENCODE_DISABLE_LSP_DOWNLOAD).
+ARG PYRIGHT_VERSION=1.1.414
+ARG TS_LANGUAGE_SERVER_VERSION=6.1.0
+ARG GOPLS_VERSION=0.24.0
+RUN npm install -g "pyright@${PYRIGHT_VERSION}" "typescript-language-server@${TS_LANGUAGE_SERVER_VERSION}" \
+    && npm cache clean --force \
+    && GOBIN=/usr/local/bin GOPATH=/tmp/gopath GOCACHE=/tmp/gocache go install "golang.org/x/tools/gopls@v${GOPLS_VERSION}" \
+    && rm -rf /tmp/gopath /tmp/gocache \
+    && command -v pyright-langserver && gopls version && typescript-language-server --version
+ENV OPENCODE_EXPERIMENTAL_LSP_TOOL=true \
+    OPENCODE_DISABLE_LSP_DOWNLOAD=true
 
 USER 1001
