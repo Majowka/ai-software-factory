@@ -139,6 +139,50 @@ data:
         "DISABLE_TELEMETRY": "1"
       }
     }
+  # Per-repository verify scripts, used by verify-build when the pipeline gives no verify-command.
+  # Key: verify--<owner>--<repo>.sh, lowercase. Run with bash in the repository root; exit 0 means green.
+  # A repository without a script keeps the default: `mvn -B -ntp verify` when there is a pom.xml, otherwise nothing.
+  verify--majowka--mesh-manager.sh: |
+    #!/usr/bin/env bash
+    # Majowka/mesh-manager: unit tests of the Go bridge and of the backend, the same shards as CI (unit-core, unit-api,
+    # unit-services, unit-bridge in .github/workflows/ci-backend.yml). Nothing here needs Postgres/Timescale, Redis or
+    # MQTT: the backend tests fall back to SQLite. Integration tests (bridge-go -tags integration, backend
+    # tests/integration, real-integration-*) are left to the repository's CI. Runs in the repository root.
+    set -euo pipefail
+
+    echo "=== bridge-go: go test ==="
+    (cd bridge-go && CGO_ENABLED=0 go test -count=1 -timeout 300s ./...)
+
+    echo "=== backend: dependencies (uv, Python 3.13) ==="
+    venv="${HOME}/.cache/verify-venv/mesh-manager"
+    uv venv -q --allow-existing -p 3.13 "$venv"
+    VIRTUAL_ENV="$venv" uv pip install -q -r backend/requirements_ci.txt
+
+    cd backend
+    # No CI markers and no database URL: conftest.py then uses SQLite instead of the CI Postgres service
+    unset CI GITHUB_ACTIONS POSTGRES_AVAILABLE DATABASE_URL DATABASE_URL_SYNC
+    export TESTING=1 SKIP_ENV_VALIDATION=1 BCRYPT_ROUNDS=4
+    shard() {
+      echo "=== backend: ${1} ==="; shift
+      rm -f test*.db
+      "$venv/bin/python" -m pytest -q --no-header -p no:cacheprovider --timeout=120 --maxfail=5 "$@"
+    }
+    shard unit-core \
+      tests/core/ tests/unit/core/ tests/unit/models/ tests/unit/middleware/ tests/unit/schemas/ tests/unit/scripts/ \
+      tests/regression/ tests/unit/test_celery_schedule_guard.py tests/unit/test_compose_celery_module_guard.py \
+      tests/unit/test_compose_uat_db_pool.py tests/unit/test_main_smoke.py tests/unit/test_pagination_gh4091.py \
+      tests/unit/test_pytest_configuration.py tests/unit/test_release_please_extra_files_guard.py \
+      tests/unit/test_root_docker_compose_config.py tests/unit/test_security_logging_rate_limit.py \
+      tests/unit/test_security_blocks.py tests/unit/test_alembic_single_head.py \
+      tests/unit/test_add_alert_type_column_migration.py tests/unit/test_add_system_logs_timestamps_migration.py \
+      tests/unit/test_drop_v1_update_tables_migration.py tests/unit/test_gh3171_mqtt_username_partial_unique_migration.py \
+      tests/unit/test_gh4193_backfill_cancelled_commands_migration.py \
+      tests/unit/test_rename_bridge_logs_metadata_migration.py tests/unit/test_nginx_v2_websocket_proxy.py
+    shard unit-api tests/unit/api/ tests/unit/tasks/ tests/unit/test_v2_surface.py
+    shard unit-services tests/services/ tests/unit/services/ tests/unit/test_mosquitto_logging_config.py tests/unit/test_user_service.py
+    # Its own run: together with the other shards, tests/unit/bridge shadows the repository's bridge package
+    shard unit-bridge tests/unit/bridge/ tests/unit/test_issue_6052_bridge_logs_and_tasks.py tests/unit/test_mirror_helper.py
+    rm -f test*.db
   # Failed CI checks of one commit with the tail of each log, as Markdown: ci-failures.sh <owner/repo> <sha> <output file>.
   # Needs GH_TOKEN of the GitHub App with Checks: read (check runs), Actions: read (job logs of GitHub Actions) and Commit statuses: read.
   # Missing permissions only make the report shorter: the script never fails the step. An empty file means nothing failed.
