@@ -441,7 +441,19 @@ CLAUDE_MODEL=sonnet                     # per task: CLAUDE_MODEL_<TASK>
 ```
 
 To move a task to the other engine, change its line and `kubectl apply -f agents/configmap-agent-config.yaml`;
-the next run uses it. List the OpenCode Go models with
+the next run uses it.
+
+**Per issue or pull request: labels.** A label overrides `routing.env` for that issue or PR only:
+
+| Label | Effect |
+|---|---|
+| `engine:claude` / `engine:opencode` | every task of this issue or PR runs on that engine |
+| `engine-<task>:<engine>` | one task only, e.g. `engine-implement:opencode`, `engine-plan:claude` |
+
+The task-specific label wins over `engine:...`, and both win over `routing.env`. The `prepare` steps read
+the labels when the run starts, so a label added later applies to the next run (the next comment). Tasks
+created by the requirements agent inherit the `engine...` labels of their requirements issue. Create the
+labels once in each repository (`gh label create engine:claude`, ...). List the OpenCode Go models with
 `curl -H "Authorization: Bearer $OPENCODE_API_KEY" https://opencode.ai/inference/go/v1/models`.
 
 **Permissions.** In both engines the agent may edit files and run shell commands, but `git commit`,

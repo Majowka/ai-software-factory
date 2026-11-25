@@ -179,6 +179,8 @@ spec:
                     key: private-key.pem
               - name: REPO_URL
                 value: $(params.repo-url)
+              - name: REPO_FULL_NAME
+                value: $(params.repo-full-name)
               - name: ISSUE_NUMBER
                 value: $(params.issue)
               - name: ISSUE_TITLE
@@ -200,6 +202,8 @@ spec:
               GH_TOKEN="$(bash /config/gh-app-token.sh)"
               export GH_TOKEN
               gh auth setup-git
+              # Labels of the issue / PR: engine:<opencode|claude> or engine-<task>:<engine> override routing.env (agent-run.sh)
+              gh issue view "$ISSUE_NUMBER" --repo "$REPO_FULL_NAME" --json labels -q '.labels[].name' > /workspace/agent-labels || true
               # Short-lived token (1h) handed to the plan step; the GitHub App key stays in this step
               ( umask 077; printf '%s' "$GH_TOKEN" > /workspace/gh-token )
 

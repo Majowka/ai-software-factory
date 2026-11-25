@@ -18,6 +18,7 @@ data:
       -H "Accept: application/vnd.github+json" \
       "https://api.github.com/app/installations/${GITHUB_APP_INSTALLATION_ID}/access_tokens" | jq -er .token
   # Which engine runs which agent task. Change it here and apply the ConfigMap; the next run picks it up.
+  # A label on the issue / PR overrides it for that issue: engine:claude, engine:opencode, engine-implement:opencode, ...
   # Tasks: PLAN (plan steps of all three event pipelines), IMPLEMENT (agent steps), FIX (build-fix attempts in
   # verify-build), REQUIREMENTS (requirements-agent analysis). Values: opencode | claude.
   routing.env: |
@@ -42,6 +43,14 @@ data:
     set -a; source /config/routing.env; set +a
     pick() { local v="${1}_${task}"; if [ -n "${!v:-}" ]; then printf '%s' "${!v}"; else v="$1"; printf '%s' "${!v:-$2}"; fi; }
     engine="$(pick AGENT_ENGINE "${AGENT_ENGINE_DEFAULT:-opencode}")"
+    # GitHub labels of the issue / PR (written by the prepare steps) win over routing.env:
+    # engine-<task>:<engine> for one task (e.g. engine-implement:opencode), engine:<engine> for all tasks.
+    if [ -s /workspace/agent-labels ]; then
+      t="$(printf '%s' "$task" | tr '[:upper:]_' '[:lower:]-')"
+      label="$(grep -xE "engine-${t}:(opencode|claude)" /workspace/agent-labels | head -n1 || true)"
+      [ -n "$label" ] || label="$(grep -xE 'engine:(opencode|claude)' /workspace/agent-labels | head -n1 || true)"
+      if [ -n "$label" ]; then engine="${label#*:}"; echo "Engine from label ${label}" | tee -a "$log"; fi
+    fi
     mkdir -p "$(dirname "$log")"
     case "$engine" in
       opencode)

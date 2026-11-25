@@ -25,7 +25,8 @@ Lista zadań dla gałęzi `claude/project-thread-cvdyq6`. Kolejność = kolejno�
 - [x] Jeden obraz `agents/Dockerfile` z OpenCode i Claude Code, build do `ghcr.io/majowka/factory-agent` przez GitHub Actions.
 - [x] Szkielety sekretów `opencode-go` i `claude-code-oauth`.
 - [ ] Sprawdzić na żywo: `{env:OPENCODE_API_KEY}` w `opencode.json`, lista modeli OpenCode Go, `claude -p` z tokenem OAuth.
-- [ ] Opcjonalnie: wybór silnika per issue etykietą (np. `engine:claude`), nadpisujący `routing.env`.
+- [x] Wybór silnika etykietą na issue/PR: `engine:<silnik>` lub `engine-<zadanie>:<silnik>`, nadpisuje `routing.env`; zadania z requirements dziedziczą etykiety.
+- [ ] Założyć etykiety `engine:claude`, `engine:opencode` (i ewentualnie `engine-<zadanie>:...`) w repozytoriach, które obsługuje fabryka.
 - [ ] Opcjonalnie: subagenci OpenCode przetłumaczeni na format Claude Code.
 
 ## 3. Manifesty pod k3s (`deploy/k3s`, `deploy/openshift`, wspólne `agents/` i `tekton/`)

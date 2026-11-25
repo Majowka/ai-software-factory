@@ -217,6 +217,8 @@ spec:
 
               GH_TOKEN="$(bash /config/gh-app-token.sh)"
               export GH_TOKEN
+              # Labels of the issue / PR: engine:<opencode|claude> or engine-<task>:<engine> override routing.env (agent-run.sh)
+              gh pr view "$PR_NUMBER" --repo "$REPO_FULL_NAME" --json labels -q '.labels[].name' > /workspace/agent-labels || true
               gh auth setup-git
 
               # Resolve the head branch from the PR itself (authoritative, also checks that the PR is open and not from a fork).

@@ -211,6 +211,8 @@ spec:
 
               GH_TOKEN="$(bash /config/gh-app-token.sh)"
               export GH_TOKEN
+              # Labels of the issue / PR: engine:<opencode|claude> or engine-<task>:<engine> override routing.env (agent-run.sh)
+              gh issue view "$ISSUE_NUMBER" --repo "$REPO_FULL_NAME" --json labels -q '.labels[].name' > /workspace/agent-labels || true
               gh auth setup-git
 
               # /workspace/skip tells the following steps there is nothing to do
