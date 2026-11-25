@@ -305,12 +305,12 @@ spec:
               set -euo pipefail
 
               # The repo is cloned by the prepare step: a workingDir of /workspace/repo would be created as root by Tekton and could not be cloned into
-              cd /workspace/repo
-
               if [ -f /workspace/skip ]; then
                 echo "Nothing to do"
                 exit 0
               fi
+
+              cd /workspace/repo
 
               # The short-lived token stays in this script: the agent gets no GitHub credentials, the script posts the plan
               PLAN_GH_TOKEN="$(cat /workspace/gh-token)"
@@ -391,12 +391,12 @@ spec:
               set -euo pipefail
 
               # The repo is cloned by the prepare step: a workingDir of /workspace/repo would be created as root by Tekton and could not be cloned into
-              cd /workspace/repo
-
               if [ -f /workspace/skip ]; then
                 echo "Nothing to do"
                 exit 0
               fi
+
+              cd /workspace/repo
 
               BRANCH="$(cat /workspace/branch)"
               PROMPT="You are working on the GitHub issue below, in a fresh clone of the repository on branch '${BRANCH}' (base branch '${BASE_BRANCH}'), following the repository's AGENTS.md.
@@ -529,12 +529,12 @@ spec:
               set -euo pipefail
 
               # The repo is cloned by the prepare step: a workingDir of /workspace/repo would be created as root by Tekton and could not be cloned into
-              cd /workspace/repo
-
               if [ -f /workspace/skip ]; then
                 echo "Nothing to do"
                 exit 0
               fi
+
+              cd /workspace/repo
 
               BRANCH="$(cat /workspace/branch)"
 
