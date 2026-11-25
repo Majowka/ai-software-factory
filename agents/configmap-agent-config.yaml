@@ -238,7 +238,7 @@ data:
   # Posts the review of pr-review-agent (publish step): review-publish.sh. Reads /workspace/out/review.md (report) and
   # /workspace/out/review.json (verdict and findings of the code-review skill), pr.diff, head-sha, ci-failures.md.
   # One GitHub review: inline comments on the diff lines of the findings (the others go to the body), REQUEST_CHANGES with
-  # a blocker, APPROVE only where review.env allows it, else COMMENT. Falls back to a comment / no inline comments when
+  # a blocker, APPROVE only where review.env allows it and all checks are green right now, else COMMENT. Falls back to a comment / no inline comments when
   # GitHub refuses (no verdict on the App's own PR, a line outside the diff). Then supersedes the earlier factory reviews
   # of the PR: dismisses their verdict, folds their body and hides their inline comments as outdated. Needs GH_TOKEN.
   review-publish.sh: |
@@ -277,18 +277,24 @@ data:
       }' "$w/pr.diff" | jq -R 'split("\t") | {(.[0] + ":" + .[1]): true}' | jq -s 'add // {}' > "$w/diff-lines.json"
 
     # Structured findings of the agent. Missing or invalid: the report is posted as it is, as a comment.
-    if jq -e '(.findings | type == "array") and (.verdict | type == "string")' "$w/out/review.json" >/dev/null 2>&1; then
+    # Every finding must be complete: one broken entry (e.g. a blocker without text) would otherwise vanish from the review.
+    if jq -e '(.findings | type == "array") and (.verdict | type == "string")
+        and all(.findings[]; type == "object"
+          and ((.body // .message) | type == "string" and length > 0)
+          and ((.path // .file) | type == "string")
+          and ((.severity // "") | ascii_downcase | IN("blocker", "major", "minor"))
+          and ((.line // 0) | type == "number" or (type == "string" and test("^[0-9]+$"))))' "$w/out/review.json" >/dev/null 2>&1; then
       jq --slurpfile lines "$w/diff-lines.json" '
         {verdict: (.verdict | ascii_downcase | gsub("[ -]"; "_")),
-         findings: [.findings[] | select(type == "object" and (.body // .message | type == "string"))
-           | {severity: ((.severity // "minor") | ascii_downcase | if IN("blocker", "major", "minor") then . else "minor" end),
+         findings: [.findings[]
+           | {severity: (.severity | ascii_downcase),
               path: ((.path // .file // "") | tostring | sub("^(\\./|b/)"; "")),
               line: ((.line // 0) | tonumber? // 0),
               body: (.body // .message)}
            | .inline = ($lines[0][(.path + ":" + (.line | tostring))] == true)]}' "$w/out/review.json" > "$w/findings.json"
       STRUCTURED=1
     else
-      echo "No valid /workspace/out/review.json: posting the report without inline comments"
+      echo "Missing or invalid /workspace/out/review.json: posting the report as it is, without inline comments"
       echo '{"verdict":"comment","findings":[]}' > "$w/findings.json"
       STRUCTURED=0
     fi
@@ -304,7 +310,16 @@ data:
       EVENT=REQUEST_CHANGES
     elif [ "$VERDICT" = "approve" ] && [ "$MAJORS" -eq 0 ] && [ ! -s "$w/ci-failures.md" ] \
       && printf ' %s ' $REVIEW_APPROVE_REPOS | grep -qiF " ${REPO_FULL_NAME} "; then
-      EVENT=APPROVE
+      # ci-failures.md is a snapshot from before the review: ask again now. Approve only when every check of the commit has
+      # completed without failing and the queries worked; anything else (running, failed, API error) stays a comment.
+      if runs="$(gh api --paginate "repos/${REPO_FULL_NAME}/commits/${HEAD}/check-runs?per_page=100" --jq '.check_runs[]' | jq -s .)" \
+        && combined="$(gh api "repos/${REPO_FULL_NAME}/commits/${HEAD}/status" --jq .state)" \
+        && [ "$(jq '[group_by(.name)[] | max_by(.started_at // "") | select(.status != "completed" or (.conclusion | IN("success", "neutral", "skipped") | not))] | length' <<<"$runs")" -eq 0 ] \
+        && { [ "$combined" = success ] || [ "$(gh api "repos/${REPO_FULL_NAME}/commits/${HEAD}/status" --jq '.statuses | length')" = 0 ]; }; then
+        EVENT=APPROVE
+      else
+        echo "Checks of ${HEAD} are not all green (or could not be read): no approval, posting a comment"
+      fi
     fi
 
     # Body: the report without its Remarks section (they come from findings.json), then the remarks not on a diff line
@@ -369,9 +384,11 @@ data:
     jq -c --argjson new "$NEW_ID" '.[] | select(.id != $new)' "$w/old-reviews.json" | while IFS= read -r old; do
       id="$(jq -r .id <<<"$old")"; state="$(jq -r .state <<<"$old")"
       if [ "$state" = CHANGES_REQUESTED ] || [ "$state" = APPROVED ]; then
+        # Keep the marker of a review whose verdict could not be dismissed (e.g. branch protection restricts dismissals),
+        # so the next run finds it and tries again.
         gh api -X PUT "repos/${REPO_FULL_NAME}/pulls/${PR_NUMBER}/reviews/${id}/dismissals" \
           -f message="Superseded by a newer automated review: ${URL}" -f event=DISMISS >/dev/null \
-          || echo "Could not dismiss review ${id}"
+          || { echo "Could not dismiss review ${id}; left as it is"; continue; }
       fi
       jq -r --arg url "$URL" --arg m "$MARKER" \
         '"<!-- factory:review-superseded -->\n_Superseded by [a newer automated review](\($url))._\n\n<details><summary>Previous review</summary>\n\n" + (.body | gsub($m; "")) + "\n</details>\n"' \
