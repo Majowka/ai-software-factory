@@ -182,6 +182,9 @@ spec:
           git read-tree "$snapshot" && git checkout-index -a -f && git clean -qfd -- . ':(exclude)**/target/**'
           if [ ! -s "$OUT/self-review.md" ]; then echo "Self-review wrote nothing (no auto-merge)"; return 3; fi
           cat "$OUT/self-review.md"
+          if ! head -n 3 "$OUT/self-review.md" | grep -qiE '^[[:space:]]*VERDICT:[[:space:]]*(ok|fix)'; then
+            echo "Self-review has no VERDICT line (cut off?); no auto-merge"; return 3
+          fi
           # Only numbered remarks marked [blocker] or [major] count (above the Notes heading); a 'fix' verdict without one is ok
           local remarks; remarks="$(sed '/^[[:space:]#*]*Notes:/,$d' "$OUT/self-review.md" | grep -iE '^[[:space:]]*[0-9]+[.)][[:space:]]*\[(blocker|major)\]' || true)"
           if head -n 3 "$OUT/self-review.md" | grep -qiE '^[[:space:]]*VERDICT:[[:space:]]*fix' && [ -n "$remarks" ]; then

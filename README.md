@@ -587,7 +587,7 @@ With hosted models this also caps how much of your subscription limits parallel 
    rollback paths and tests that would pass with the bug. Only numbered remarks marked `[blocker]` or `[major]`, each tied to a concrete failing case, count; style and other minor points go under `Notes:` and do not trigger a fix. Remarks that need a change go back to the agent
    (task `FIX`) and the build and review run again, up to `self-review-rounds` (1) fix rounds, then a last review that only reports; all of it
    within 75 minutes. The step never fails: it leaves a note with the result, and a blocker the last
-   review still reports keeps the pull request a draft.
+   review still reports keeps the pull request a draft. A self-review cut off without a verdict turns auto-merge off.
    **Bug issues** (label `bug`, `type: bug`, `kind/bug`, `defect` or `regression`, see `regression-test.sh` in
    `agent-config`): the plan and the agent are told to find the root cause and write a regression test first, and
    name the command that runs it in `.agent-regression-test.txt`. On a green build `verify` runs that command with
