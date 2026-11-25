@@ -9,10 +9,18 @@ data:
     #!/usr/bin/env bash
     set -euo pipefail
     b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+    # Rebuild the PEM with 64-character lines: OpenSSL 3 rejects a key stored on one line (spaces or literal \n
+    # instead of line breaks), which is how a secret store may hand it over.
+    pem_normalize() {
+      local kind body
+      kind="$(printf '%s' "$1" | sed -nE 's/.*-----BEGIN ([A-Z ]+)-----.*/\1/p' | head -n 1)"
+      body="$(printf '%s' "$1" | sed -E 's/\\n/ /g; s/-----(BEGIN|END) [A-Z ]+-----//g' | tr -d ' \t\r\n')"
+      printf -- '-----BEGIN %s-----\n%s\n-----END %s-----\n' "$kind" "$(printf '%s' "$body" | fold -w 64)" "$kind"
+    }
     now="$(date +%s)"
     header="$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)"
     payload="$(printf '{"iat":%s,"exp":%s,"iss":"%s"}' "$((now - 60))" "$((now + 540))" "$GITHUB_APP_ID" | b64url)"
-    signature="$(printf '%s.%s' "$header" "$payload" | openssl dgst -sha256 -sign <(printf '%s\n' "$GITHUB_APP_PRIVATE_KEY") | b64url)"
+    signature="$(printf '%s.%s' "$header" "$payload" | openssl dgst -sha256 -sign <(pem_normalize "$GITHUB_APP_PRIVATE_KEY") | b64url)"
     curl -fsS -X POST \
       -H "Authorization: Bearer ${header}.${payload}.${signature}" \
       -H "Accept: application/vnd.github+json" \
