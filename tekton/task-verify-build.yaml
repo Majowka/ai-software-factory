@@ -141,7 +141,7 @@ spec:
         }
 
         # Self-review of the change in the working tree (task REVIEW). Writes $OUT/self-review.md; returns 0 when it
-        # needs no change (or the review produced nothing usable), 1 when it asks for a fix, 2 when that includes a blocker.
+        # needs no change, 1 when it asks for a fix, 2 when that includes a blocker, 3 when it wrote nothing (timeout).
         self_review() {
           local round="$1" diff_file=/workspace/self-review.diff previous=
           # Stage the change (publish commits the same set) and keep a snapshot of it: the reviewer must not change the tree
@@ -180,7 +180,7 @@ spec:
           bash /config/agent-run.sh review "${SELF_REVIEW_MINUTES:-6}m" /workspace/self-review.log "$REVIEW_PROMPT" || echo "Self-review ended with an error; using what it wrote"
           # Drop anything the reviewer changed: back to the snapshot (index and files), untracked leftovers removed
           git read-tree "$snapshot" && git checkout-index -a -f && git clean -qfd -- . ':(exclude)**/target/**'
-          if [ ! -s "$OUT/self-review.md" ]; then echo "Self-review wrote nothing; skipping it"; return 0; fi
+          if [ ! -s "$OUT/self-review.md" ]; then echo "Self-review wrote nothing (no auto-merge)"; return 3; fi
           cat "$OUT/self-review.md"
           # Only numbered remarks marked [blocker] or [major] count (above the Notes heading); a 'fix' verdict without one is ok
           local remarks; remarks="$(sed '/^[[:space:]#*]*Notes:/,$d' "$OUT/self-review.md" | grep -iE '^[[:space:]]*[0-9]+[.)][[:space:]]*\[(blocker|major)\]' || true)"
@@ -281,7 +281,7 @@ spec:
             if [ "$review_round" -le "$SELF_REVIEW_ROUNDS" ] && [ "$SELF_REVIEW_ROUNDS" -gt 0 ] && [ "$(date +%s)" -lt "$deadline" ]; then
               review_round=$((review_round + 1))
               self_review "$review_round"; verdict=$?
-              if [ "$verdict" -ne 0 ] && [ "$review_fixes" -lt "$SELF_REVIEW_ROUNDS" ] && [ "$(date +%s)" -lt "$deadline" ]; then
+              if { [ "$verdict" -eq 1 ] || [ "$verdict" -eq 2 ]; } && [ "$review_fixes" -lt "$SELF_REVIEW_ROUNDS" ] && [ "$(date +%s)" -lt "$deadline" ]; then
                 review_fixes=$((review_fixes + 1))
                 echo "=== Self-review asks for changes, asking the agent to fix them (round ${review_fixes}/${SELF_REVIEW_ROUNDS}) ==="
                 PROMPT="A reviewer checked your change in this repository and found problems. Fix them in the code and tests; the build must still pass: ${cmd}
@@ -315,6 +315,11 @@ spec:
               # Remarks left after the fix rounds: a person merges (no auto-merge); a blocker also keeps the PR a draft
               touch "$OUT/no-auto-merge"
               if [ "$verdict" -eq 2 ]; then cp "$OUT/verify-note.md" "$OUT/verify-failed"; fi
+            fi
+            if [ "$verdict" -eq 3 ]; then
+              printf '\n:warning: **The self-review did not finish** (no result within %s minutes). Review the code before merging.\n' \
+                "${SELF_REVIEW_MINUTES:-6}" >> "$OUT/verify-note.md"
+              touch "$OUT/no-auto-merge"
             fi
             if [ "$regression_needed" = true ]; then
               if [ "$regression_ok" = true ]; then
