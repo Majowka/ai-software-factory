@@ -13,6 +13,10 @@ resources:
   - role-requirements-scheduler.yaml
   - rolebinding-issue-agent-listener.yaml
   - rolebinding-requirements-scheduler.yaml
+  - role-run-pruner.yaml
+  - rolebinding-run-pruner.yaml
+  - cronjob-run-pruner.yaml
+  - serviceaccount-run-pruner.yaml
   - serviceaccount-issue-agent-listener.yaml
   - serviceaccount-requirements-scheduler.yaml
   - task-authorize-author.yaml
