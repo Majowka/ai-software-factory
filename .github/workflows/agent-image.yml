@@ -2,7 +2,6 @@ name: agent-image
 
 on:
   push:
-    branches: [master]
     paths: [agents/Dockerfile, .github/workflows/agent-image.yml]
   workflow_dispatch:
 
@@ -26,6 +25,7 @@ jobs:
           context: agents
           file: agents/Dockerfile
           push: true
+          # latest only from master; every build also gets its commit sha
           tags: |
-            ghcr.io/majowka/factory-agent:latest
             ghcr.io/majowka/factory-agent:${{ github.sha }}
+            ${{ github.ref == 'refs/heads/master' && 'ghcr.io/majowka/factory-agent:latest' || '' }}
