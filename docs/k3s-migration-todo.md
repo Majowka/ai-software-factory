@@ -5,7 +5,7 @@ Lista zadań dla gałęzi `claude/project-thread-cvdyq6`. Kolejność = kolejno�
 ## Do decyzji
 
 - [x] **Silnik agenta**: oba, OpenCode (OpenCode Go) i Claude Code (OAuth), z wyborem per zadanie.
-- [ ] Publiczne wejście dla webhooka GitHuba na k3s (Traefik ma tylko prywatne IP): BunkerWeb, Tailscale Funnel lub inny reverse proxy.
+- [x] Wejście webhooka: App `KlaudiuszAI` (jeden URL dla orga) → Worker `github-openbot-relay`, trasa `factory` (Majowka/infrastructure#1945) → Workers VPC `ai-factory-el` → `cloudflared` w k3s (Majowka/gitops#180). Klaster bez publicznego wejścia.
 - [x] Rejestr obrazu agenta: `ghcr.io/majowka/factory-agent` (pakiet GHCR może wymagać pull secretu, jeśli prywatny).
 
 ## 1. Usunięcie vLLM / GPU
@@ -31,7 +31,7 @@ Lista zadań dla gałęzi `claude/project-thread-cvdyq6`. Kolejność = kolejno�
 
 ## 3. Manifesty pod k3s (`deploy/k3s`, `deploy/openshift`, wspólne `agents/` i `tekton/`)
 
-- [ ] Ustawić host w `deploy/k3s/ingress-new-issue.yaml` i źródło certyfikatu TLS.
+- [x] Ingress niepotrzebny na naszym k3s (webhook przez Workers VPC); `deploy/k3s/ingress-new-issue.yaml` zostaje jako opcja dla innych klastrów.
 
 - [x] `tekton/route-new-issue.yaml` → `Ingress` (Traefik) z TLS (cert-manager lub cert z zewnętrznego proxy).
 - [x] Dodać ServiceAccount `pipeline` (+ RoleBinding), na OpenShift tworzy go operator Pipelines.
@@ -45,7 +45,10 @@ Lista zadań dla gałęzi `claude/project-thread-cvdyq6`. Kolejność = kolejno�
 - [ ] `feature-flags` w `tekton-pipelines`: `coschedule: disabled` (zamiast `oc patch tektonconfig`).
 - [ ] Namespace `agents`, Secrety (GitHub App, webhook secret, klucz API) — docelowo przez ESO/Infisical.
 - [ ] Ruch wychodzący z podów do GitHub, GHCR, Quay i API modeli (`opencode.ai`, `api.anthropic.com`).
-- [ ] Publiczny URL webhooka + aktualizacja w GitHub App.
+- [x] Tunel `k3s-ai-factory` i VPC Service `ai-factory-el` założone przez API CF; token tunelu w Infisical (`infra-k3s` / `vrtx-cluster`).
+- [ ] Token deployu Workera: dodać Connectivity Directory: Bind.
+- [ ] Po deployu Workera: `FACTORY_REPO_IDS`, `FACTORY_ROUTE_ENABLED=true`; Secrety `cloudflared-tunnel` i `github-webhook-secret` (= sekret webhooka App) w `ai-factory`.
+- [ ] Login bota w CEL i `GIT_AUTHOR_*` → `klaudiuszai[bot]`.
 
 ## 5. Dokumentacja
 
