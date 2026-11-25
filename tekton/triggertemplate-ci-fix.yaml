@@ -1,0 +1,73 @@
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: ci-fix
+  namespace: agents
+spec:
+  params:
+    - name: head-sha
+    - name: event-type
+    - name: repo-url
+    - name: repo-full-name
+    - name: pr-number
+    - default: ''
+      name: branch
+    - default: ''
+      name: check-app
+    - name: base-branch
+  resourcetemplates:
+    - apiVersion: tekton.dev/v1
+      kind: PipelineRun
+      metadata:
+        # One run per commit: every failed check suite of the same commit (one per workflow) maps to this name,
+        # Tekton refuses the duplicates and the first run waits for the remaining checks before it reads the logs.
+        name: pr-ci-fix-$(tt.params.head-sha)
+      spec:
+        params:
+          - name: mode
+            value: ci-fix
+          - name: head-sha
+            value: $(tt.params.head-sha)
+          - name: event-type
+            value: $(tt.params.event-type)
+          - name: repo-url
+            value: $(tt.params.repo-url)
+          - name: repo-full-name
+            value: $(tt.params.repo-full-name)
+          - name: pr-number
+            value: $(tt.params.pr-number)
+          - name: pr-title
+            value: ''
+          - name: branch
+            value: $(tt.params.branch)
+          - name: comment-author
+            value: $(tt.params.check-app)
+          - name: comment-body
+            value: 'CI failed on commit $(tt.params.head-sha)'
+          - name: base-branch
+            value: $(tt.params.base-branch)
+        pipelineRef:
+          name: pr-comment-agent
+        taskRunTemplate:
+          serviceAccountName: pipeline
+        timeouts:
+          pipeline: 3h15m0s
+          tasks: 3h0m0s
+          finally: 15m0s
+        workspaces:
+          - name: skills
+            volumeClaimTemplate:
+              spec:
+                accessModes:
+                  - ReadWriteOnce
+                resources:
+                  requests:
+                    storage: 1Gi
+          - name: work
+            volumeClaimTemplate:
+              spec:
+                accessModes:
+                  - ReadWriteOnce
+                resources:
+                  requests:
+                    storage: 10Gi

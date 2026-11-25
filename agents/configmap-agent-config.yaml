@@ -20,12 +20,14 @@ data:
   # Which engine runs which agent task. Change it here and apply the ConfigMap; the next run picks it up.
   # A label on the issue / PR overrides it for that issue: engine:claude, engine:opencode, engine-implement:opencode, ...
   # Tasks: PLAN (plan steps of all three event pipelines), IMPLEMENT (agent steps), FIX (build-fix attempts in
-  # verify-build), REQUIREMENTS (requirements-agent analysis). Values: opencode | claude.
+  # verify-build), CI_FIX (pr-comment-agent started by a red CI check), REQUIREMENTS (requirements-agent analysis).
+  # Values: opencode | claude. Label for one task: engine-<task>:<engine>, e.g. engine-ci-fix:opencode.
   routing.env: |
     AGENT_ENGINE_DEFAULT=opencode
     AGENT_ENGINE_PLAN=opencode
     AGENT_ENGINE_IMPLEMENT=claude
     AGENT_ENGINE_FIX=claude
+    AGENT_ENGINE_CI_FIX=claude
     AGENT_ENGINE_REQUIREMENTS=opencode
     # Models per engine. OpenCode: provider/model (OpenCode Go: opencode-go/<model-id>, list with
     # curl -H "Authorization: Bearer $OPENCODE_API_KEY" https://opencode.ai/inference/go/v1/models).
@@ -128,6 +130,48 @@ data:
         "DISABLE_TELEMETRY": "1"
       }
     }
+  # Failed CI checks of one commit with the tail of each log, as Markdown: ci-failures.sh <owner/repo> <sha> <output file>.
+  # Needs GH_TOKEN of the GitHub App with Checks: read (check runs), Actions: read (job logs of GitHub Actions) and Commit statuses: read.
+  # Missing permissions only make the report shorter: the script never fails the step. An empty file means nothing failed.
+  # CI_WAIT_SECONDS > 0: first wait (up to that long) until no check of the commit is queued or running.
+  ci-failures.sh: |
+    #!/usr/bin/env bash
+    set -uo pipefail
+    repo="$1"; sha="$2"; out="$3"; lines="${CI_LOG_LINES:-150}"; max_bytes="${CI_REPORT_MAX_BYTES:-60000}"; wait_s="${CI_WAIT_SECONDS:-0}"
+    : > "$out"
+    list_runs() { gh api --paginate "repos/${repo}/commits/${sha}/check-runs?per_page=100" --jq '.check_runs[]' 2>/dev/null | jq -s '.'; }
+    runs="$(list_runs)" || { echo "Cannot list check runs of ${sha} (GitHub App needs Checks: read)"; exit 0; }
+    while [ "$wait_s" -gt 0 ] && [ "$(printf '%s' "$runs" | jq '[.[] | select(.status != "completed")] | length')" -gt 0 ]; do
+      echo "Waiting for running checks of ${sha} (${wait_s}s left)"
+      sleep 30; wait_s=$((wait_s - 30))
+      runs="$(list_runs)" || exit 0
+    done
+    # Latest run per check name (a re-run that passed hides the older failure), only the failed ones
+    failed="$(printf '%s' "$runs" | jq -c '[group_by(.name)[] | max_by(.started_at // "") | select(.status == "completed" and (.conclusion | IN("failure", "timed_out", "action_required", "startup_failure")))] | .[]')"
+    statuses="$(gh api "repos/${repo}/commits/${sha}/status" --jq '.statuses[] | select(.state == "failure" or .state == "error") | "- **\(.context)**: \(.state), \(.description // "") \(.target_url // "")"' 2>/dev/null || true)"
+    [ -n "$failed" ] || [ -n "$statuses" ] || exit 0
+    {
+      printf 'Failed checks of commit %s:\n' "$sha"
+      while IFS= read -r run; do
+        [ -n "$run" ] || continue
+        id="$(jq -r .id <<<"$run")"
+        printf '\n### %s: %s (%s)\n%s\n' "$(jq -r .name <<<"$run")" "$(jq -r .conclusion <<<"$run")" "$(jq -r '.app.slug // "?"' <<<"$run")" "$(jq -r '.html_url // ""' <<<"$run")"
+        jq -r '[.output.title, .output.summary] | map(select(. != null and . != "")) | join("\n")' <<<"$run" | head -c 4000
+        gh api "repos/${repo}/check-runs/${id}/annotations?per_page=50" \
+          --jq '.[] | "- \(.annotation_level) \(.path):\(.start_line): \(.title // "") \(.message)"' 2>/dev/null | head -n 50 || true
+        if [ "$(jq -r '.app.slug // ""' <<<"$run")" = "github-actions" ]; then
+          # For GitHub Actions the check run id is the job id. Timestamps and colour codes are noise for the agent.
+          log="$(gh api "repos/${repo}/actions/jobs/${id}/logs" 2>/dev/null \
+            | sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z ?//; s/\x1b\[[0-9;]*[A-Za-z]//g' | tail -n "$lines")" \
+            || log="(log not available: the GitHub App needs Actions: read)"
+        else
+          log="$(jq -r '.output.text // ""' <<<"$run" | tail -n "$lines")"
+        fi
+        if [ -n "$log" ]; then printf '\nLast lines of the log:\n~~~~text\n%s\n~~~~\n' "$log"; fi
+      done <<<"$failed"
+      if [ -n "$statuses" ]; then printf '\n### Commit statuses\n%s\n' "$statuses"; fi
+    } | head -c "$max_bytes" > "$out"
+    echo "CI failures of ${sha}: $(grep -c '^### ' "$out") section(s), $(wc -c < "$out") bytes"
   # Helpers shared by the requirements scan (CronJob) and the requirements-agent pipeline. Source it; it needs GH_TOKEN and REPO_FULL_NAME.
   requirements-lib.sh: |
     # sha256 of the requirements text: a different value means the issue was edited

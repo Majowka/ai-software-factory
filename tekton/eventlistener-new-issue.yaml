@@ -113,3 +113,32 @@ spec:
       name: issue-comment
       template:
         ref: issue-comment
+    # Automatic CI fix. Fires only once the GitHub App subscribes to "Check suite" and the relay forwards check_suite.
+    # Whether the PR was opened by the factory bot, the attempt limit and the head commit are checked in prepare
+    # (the check_suite payload has no PR author).
+    - bindings:
+        - kind: TriggerBinding
+          ref: ci-failure
+      interceptors:
+        - params:
+            - name: secretRef
+              value:
+                secretKey: secret
+                secretName: github-webhook-secret
+            - name: eventTypes
+              value:
+                - check_suite
+          ref:
+            kind: ClusterInterceptor
+            name: github
+        - params:
+            - name: filter
+              value: body.action == 'completed' && body.check_suite.conclusion in
+                ['failure', 'timed_out', 'startup_failure'] && size(body.check_suite.pull_requests)
+                > 0
+          ref:
+            kind: ClusterInterceptor
+            name: cel
+      name: ci-failure
+      template:
+        ref: ci-fix
