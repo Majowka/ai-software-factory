@@ -56,16 +56,19 @@ data:
   # Values: opencode | claude. Label for one task: engine-<task>:<engine>, e.g. engine-ci-fix:opencode.
   routing.env: |
     AGENT_ENGINE_DEFAULT=opencode
-    AGENT_ENGINE_PLAN=opencode
-    # Until the Claude Code token is in place every task runs on OpenCode; set IMPLEMENT, FIX and CI_FIX back to claude then.
+    # Claude Code (subscription) where DeepSeek flash was inaccurate: the plan of every run and the code of bug fixes.
+    # Everything else stays on OpenCode; Claude falls back to OpenCode on the subscription's limits (agent-run.sh).
+    AGENT_ENGINE_PLAN=claude
     AGENT_ENGINE_IMPLEMENT=opencode
+    AGENT_ENGINE_IMPLEMENT_BUG=claude
     AGENT_ENGINE_FIX=opencode
     AGENT_ENGINE_CI_FIX=opencode
     AGENT_ENGINE_REQUIREMENTS=opencode
     AGENT_ENGINE_REVIEW=opencode
     # Models per engine. OpenCode: provider/model (OpenCode Go: opencode-go/<model-id>, list with
     # curl -H "Authorization: Bearer $OPENCODE_API_KEY" https://opencode.ai/inference/go/v1/models).
-    # Claude Code: an alias (sonnet, opus, haiku) or a full model id. Per-task overrides: OPENCODE_MODEL_<TASK>, CLAUDE_MODEL_<TASK>.
+    # Claude Code: an alias (sonnet, opus, haiku) or a full model id. Per-task overrides: OPENCODE_MODEL_<TASK>, CLAUDE_MODEL_<TASK>
+    # (bug issues: <VAR>_<TASK>_BUG first).
     OPENCODE_MODEL=opencode-go/deepseek-v4.1-flash
     # Reasoning effort of OpenCode (`opencode run --variant`), per task: OPENCODE_VARIANT_<TASK>, default OPENCODE_VARIANT
     # (empty = the provider's default). The values are the model's variants in OpenCode's model list
@@ -80,12 +83,21 @@ data:
   # Runs one agent task with the engine chosen in routing.env: agent-run.sh <task> <timeout> <log file> <prompt>.
   # Returns the engine's exit code (124 on timeout). Credentials come from the environment of the step:
   # OPENCODE_API_KEY (secret opencode-go) and CLAUDE_CODE_OAUTH_TOKEN (secret claude-code-oauth).
+  # Bug issues (is_bug in regression-test.sh) look up <VAR>_<TASK>_BUG before <VAR>_<TASK>, e.g. AGENT_ENGINE_IMPLEMENT_BUG.
+  # Claude falls back to OpenCode when there is no token, or when Claude Code fails on the subscription's usage or rate
+  # limit, an overloaded API or a refused token (many runs share one subscription); a timeout or another error does not.
   agent-run.sh: |
     #!/usr/bin/env bash
     set -uo pipefail
     task="$(printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_')"; limit="$2"; log="$3"; prompt="$4"
     set -a; source /config/routing.env; set +a
-    pick() { local v="${1}_${task}"; if [ -n "${!v:-}" ]; then printf '%s' "${!v}"; else v="$1"; printf '%s' "${!v:-$2}"; fi; }
+    bug=""
+    if [ -f /config/regression-test.sh ]; then source /config/regression-test.sh; is_bug && bug=1; fi
+    pick() {
+      local v
+      if [ -n "$bug" ]; then v="${1}_${task}_BUG"; if [ -n "${!v:-}" ]; then printf '%s' "${!v}"; return; fi; fi
+      v="${1}_${task}"; if [ -n "${!v:-}" ]; then printf '%s' "${!v}"; else v="$1"; printf '%s' "${!v:-$2}"; fi
+    }
     engine="$(pick AGENT_ENGINE "${AGENT_ENGINE_DEFAULT:-opencode}")"
     # GitHub labels of the issue / PR (written by the prepare steps) win over routing.env:
     # engine-<task>:<engine> for one task (e.g. engine-implement:opencode), engine:<engine> for all tasks.
@@ -96,20 +108,37 @@ data:
       if [ -n "$label" ]; then engine="${label#*:}"; echo "Engine from label ${label}" | tee -a "$log"; fi
     fi
     mkdir -p "$(dirname "$log")"
+    run_opencode() { # $1: note for the header
+      local model variant
+      model="$(pick OPENCODE_MODEL '')"
+      variant="$(pick OPENCODE_VARIANT '')"
+      echo "=== ${task}: opencode ${model}${variant:+ (variant ${variant})}${1:+ $1} ===" | tee -a "$log"
+      OPENCODE_CONFIG=/config/opencode.json timeout "$limit" opencode run ${model:+-m "$model"} ${variant:+--variant "$variant"} \
+        "$prompt" 2>&1 | tee -a "$log"
+      rc=${PIPESTATUS[0]}
+    }
     case "$engine" in
       opencode)
-        model="$(pick OPENCODE_MODEL '')"
-        variant="$(pick OPENCODE_VARIANT '')"
-        echo "=== ${task}: opencode ${model}${variant:+ (variant ${variant})} ===" | tee -a "$log"
-        OPENCODE_CONFIG=/config/opencode.json timeout "$limit" opencode run ${model:+-m "$model"} ${variant:+--variant "$variant"} \
-          "$prompt" 2>&1 | tee -a "$log"
-        rc=${PIPESTATUS[0]} ;;
+        run_opencode "" ;;
       claude)
-        model="$(pick CLAUDE_MODEL sonnet)"
-        echo "=== ${task}: claude ${model} ===" | tee -a "$log"
-        timeout "$limit" claude -p "$prompt" --model "$model" --settings /config/claude-settings.json \
-          --output-format text 2>&1 | tee -a "$log"
-        rc=${PIPESTATUS[0]} ;;
+        if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+          echo "No CLAUDE_CODE_OAUTH_TOKEN (secret claude-code-oauth): falling back to OpenCode" | tee -a "$log"
+          run_opencode "(fallback from claude: no token)"
+        else
+          model="$(pick CLAUDE_MODEL sonnet)"
+          echo "=== ${task}: claude ${model}${bug:+ (bug)} ===" | tee -a "$log"
+          out="$(mktemp)"
+          timeout "$limit" claude -p "$prompt" --model "$model" --settings /config/claude-settings.json \
+            --output-format text 2>&1 | tee -a "$log" "$out"
+          rc=${PIPESTATUS[0]}
+          # Usage / rate limit of the subscription, overloaded API, refused token: the run goes on with OpenCode.
+          limit_re='usage limit|rate[ _-]?limit|limit reached|hit your limit|limit will reset|API Error: (401|403|429|529)|overloaded|authentication_error|invalid (api key|bearer token)|OAuth token (has )?(expired|revoked)|credit balance'
+          if [ "$rc" -ne 124 ] && { [ "$rc" -ne 0 ] || [ "$(wc -c < "$out")" -lt 500 ]; } && grep -qiE "$limit_re" "$out"; then
+            echo "Claude Code hit a usage/rate limit or was refused (exit ${rc}): falling back to OpenCode" | tee -a "$log"
+            run_opencode "(fallback from claude)"
+          fi
+          rm -f "$out"
+        fi ;;
       *)
         echo "Unknown engine '${engine}' for task ${task} (routing.env)" | tee -a "$log"; rc=2 ;;
     esac

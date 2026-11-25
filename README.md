@@ -370,23 +370,27 @@ mounted at `/config`:
 
 | Task | Where | Default engine |
 |---|---|---|
-| `PLAN` | `plan` step of the three event pipelines | `opencode` |
-| `IMPLEMENT` | `agent` step of the three event pipelines | `claude` |
-| `FIX` | build-fix attempts and self-review fixes in `verify-build` | `claude` |
-| `CI_FIX` | `agent` step of `pr-comment-agent` started by a failed CI check (section 6.10) | `claude` |
+| `PLAN` | `plan` step of the three event pipelines | `claude` (`opus`) |
+| `IMPLEMENT` | `agent` step of the three event pipelines | `opencode`; `claude` (`sonnet`) for bug issues |
+| `FIX` | build-fix attempts and self-review fixes in `verify-build` | `opencode` |
+| `CI_FIX` | `agent` step of `pr-comment-agent` started by a failed CI check (section 6.10) | `opencode` |
 | `REQUIREMENTS` | `analyze` step of the requirements agent | `opencode` |
+| `REVIEW` | `pr-review-agent` and the self-review in `verify-build` | `opencode` |
 
 ```bash
 AGENT_ENGINE_DEFAULT=opencode
-AGENT_ENGINE_PLAN=opencode
-AGENT_ENGINE_IMPLEMENT=claude
-AGENT_ENGINE_FIX=claude
-AGENT_ENGINE_CI_FIX=claude
-AGENT_ENGINE_REQUIREMENTS=opencode
+AGENT_ENGINE_PLAN=claude
+AGENT_ENGINE_IMPLEMENT=opencode
+AGENT_ENGINE_IMPLEMENT_BUG=claude       # bug issues (labels as in regression-test.sh): <VAR>_<TASK>_BUG first
 OPENCODE_MODEL=opencode-go/deepseek-v4.1-flash # per task: OPENCODE_MODEL_<TASK>
 CLAUDE_MODEL=sonnet                     # per task: CLAUDE_MODEL_<TASK>
 CLAUDE_MODEL_PLAN=opus
 ```
+
+**Fallback.** A task routed to `claude` runs on OpenCode instead when the `claude-code-oauth` secret is missing, or
+when Claude Code fails on the subscription's usage or rate limit, an overloaded API or a refused token (several runs
+share one subscription). The log then shows `falling back to OpenCode` and a second header
+`=== IMPLEMENT: opencode ... (fallback from claude) ===`. A timeout or any other error does not fall back.
 
 To move a task to the other engine, change its line and `kubectl apply -k agents`; the next run uses it.
 
