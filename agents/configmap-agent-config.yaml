@@ -66,6 +66,14 @@ data:
     # curl -H "Authorization: Bearer $OPENCODE_API_KEY" https://opencode.ai/inference/go/v1/models).
     # Claude Code: an alias (sonnet, opus, haiku) or a full model id. Per-task overrides: OPENCODE_MODEL_<TASK>, CLAUDE_MODEL_<TASK>.
     OPENCODE_MODEL=opencode-go/deepseek-v4.1-flash
+    # Reasoning effort of OpenCode (`opencode run --variant`), per task: OPENCODE_VARIANT_<TASK>, default OPENCODE_VARIANT
+    # (empty = the provider's default). The values are the model's variants in OpenCode's model list
+    # (`opencode models opencode-go --verbose`): deepseek-v4.1-flash has low, high and max. Thinking hard pays off where the
+    # agent has to find the cause or judge code (plan, review, build fixes); writing the code (IMPLEMENT) keeps the default.
+    OPENCODE_VARIANT_PLAN=high
+    OPENCODE_VARIANT_REVIEW=high
+    OPENCODE_VARIANT_FIX=high
+    OPENCODE_VARIANT_CI_FIX=high
     CLAUDE_MODEL=sonnet
     CLAUDE_MODEL_PLAN=opus
   # Runs one agent task with the engine chosen in routing.env: agent-run.sh <task> <timeout> <log file> <prompt>.
@@ -90,8 +98,10 @@ data:
     case "$engine" in
       opencode)
         model="$(pick OPENCODE_MODEL '')"
-        echo "=== ${task}: opencode ${model} ===" | tee -a "$log"
-        OPENCODE_CONFIG=/config/opencode.json timeout "$limit" opencode run ${model:+-m "$model"} "$prompt" 2>&1 | tee -a "$log"
+        variant="$(pick OPENCODE_VARIANT '')"
+        echo "=== ${task}: opencode ${model}${variant:+ (variant ${variant})} ===" | tee -a "$log"
+        OPENCODE_CONFIG=/config/opencode.json timeout "$limit" opencode run ${model:+-m "$model"} ${variant:+--variant "$variant"} \
+          "$prompt" 2>&1 | tee -a "$log"
         rc=${PIPESTATUS[0]} ;;
       claude)
         model="$(pick CLAUDE_MODEL sonnet)"
