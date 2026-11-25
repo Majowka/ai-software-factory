@@ -336,7 +336,7 @@ spec:
 
               PROMPT="Implement this GitHub issue, following the repository's AGENTS.md.
 
-              Pipeline context: you run non-interactively with no GitHub credentials; the pipeline handles git, the pull request and the issue comment, so ignore those sections of AGENTS.md. Use only the available tools (bash, read, edit, write, glob, grep, skill, task); there is no 'step', 'run' or 'todo' tool. When done, write a 2-4 bullet summary to .agent-summary.md in the repository root (the pipeline posts it on the issue and removes it from the commit): what was changed, the test result, anything left undone or worth a reviewer's attention. Also write .agent-pr.txt in the repository root (the pipeline uses it for the commit and the pull request and removes it from the commit) with the line 'title: <type>(<scope>): <subject>', a Conventional Commits header in English (type one of feat, fix, docs, refactor, perf, test, build, ci, chore; scope lowercase and optional; at most 72 characters; e.g. 'feat(bridge): add VLAN filter to the bridge config'). If the change covers only part of what the issue asks for, add the line 'scope: partial'.
+              Pipeline context: you run non-interactively with no GitHub credentials; the pipeline handles git, the pull request and the issue comment, so ignore those sections of AGENTS.md. Use only the available tools (bash, read, edit, write, glob, grep, skill, task); there is no 'step', 'run' or 'todo' tool. When done, write a summary to .agent-summary.md in the repository root (the pipeline uses it as the pull request description, posts it on the issue and removes it from the commit): Markdown with exactly these three sections: '### What changed and why' (2-4 bullets: what you changed in plain language and the reason, for a bug the root cause), '### Testing' (the tests you added or changed and the result of the tests you ran), '### Known limitations' (anything left undone, risky or worth a reviewer's attention; 'None.' if nothing). Also write .agent-pr.txt in the repository root (the pipeline uses it for the commit and the pull request and removes it from the commit) with the line 'title: <type>(<scope>): <subject>', a Conventional Commits header in English (type one of feat, fix, docs, refactor, perf, test, build, ci, chore; scope lowercase and optional; at most 72 characters; e.g. 'feat(bridge): add VLAN filter to the bridge config'). If the change covers only part of what the issue asks for, add the line 'scope: partial'.
 
               $(cat /workspace/issue.txt)"
               if [ -s /workspace/out/plan.md ]; then
@@ -470,6 +470,8 @@ spec:
               # A build that stays red after the fix attempts opens a draft pull request
               DRAFT_FLAG=""
               if [ -f /workspace/out/verify-failed ]; then DRAFT_FLAG="--draft"; fi
+              # The PR description is built from the agent's own summary, so read it before the verify note is put in front
+              cp /workspace/out/summary.md /workspace/out/summary.agent.md 2>/dev/null || true
               # Result of the verify step goes in front of the reply
               if [ -s /workspace/out/verify-note.md ]; then
                 { cat /workspace/out/verify-note.md; echo; cat /workspace/out/summary.md 2>/dev/null || true; } > /workspace/out/summary.full.md
@@ -479,6 +481,9 @@ spec:
               # Conventional Commits title proposed by the agent (validated, with a safe default) and Closes/Refs by scope
               source /config/pr-meta.sh
               pr_meta "feat: implement issue #${ISSUE_NUMBER}"
+              source /config/pr-body.sh
+              # A broken description must never stop the pull request: fall back to the issue link alone
+              pr_body "$ISSUE_NUMBER" > /workspace/out/pr-body.md || printf '%s #%s\n' "$PR_KEYWORD" "$ISSUE_NUMBER" > /workspace/out/pr-body.md
 
               git add -A -- . ':(exclude)**/target/**'
               git commit -m "$PR_TITLE" -m "Refs #${ISSUE_NUMBER}"
@@ -490,7 +495,7 @@ spec:
                 --head "$BRANCH" \
                 $DRAFT_FLAG \
                 --title "$PR_TITLE" \
-                --body "${PR_KEYWORD} #${ISSUE_NUMBER}")"
+                --body-file /workspace/out/pr-body.md)"
               echo "Created PR: $PR_URL"
 
               # Merge automatically once branch protection is satisfied (required review and checks); never fails the pipeline
