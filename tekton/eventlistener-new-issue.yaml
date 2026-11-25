@@ -32,9 +32,12 @@ spec:
       name: new-issue
       template:
         ref: new-issue
-    # Review comments and reviews: every one on a pull request of the factory (branch issue-*, opened by the bot); on any
-    # other pull request (also human ones) only when the body starts with `@ai`. authorize-author checks the commenter
-    # (write or more), prepare refuses forks.
+    # Reviews and review comments start one run per REVIEW: every inline comment belongs to a review (also a single comment
+    # or a reply, which GitHub wraps in a review of its own), and the run reads the whole PR conversation anyway. The
+    # pull_request_review event decides (trigger pr-review below); an inline comment starts a run only when it starts with
+    # `@ai` itself, and then under the name of its review (pr-comment-agent-r<review id>), so the review event and the other
+    # inline comments of the same review map to that one run and Tekton refuses the duplicates.
+    # authorize-author checks the commenter (write or more), prepare refuses forks.
     - bindings:
         - kind: TriggerBinding
           ref: pr-review-comment
@@ -54,8 +57,7 @@ spec:
             - name: filter
               value: body.action == 'created' && body.pull_request.state == 'open'
                 && body.sender.type != 'Bot'
-                && ((body.pull_request.user.type == 'Bot' && body.pull_request.head.ref.startsWith('issue-'))
-                || body.comment.body.matches('^@ai(\\s|$)'))
+                && body.comment.body.matches('^@ai(\\s|$)')
           ref:
             kind: ClusterInterceptor
             name: cel
@@ -79,10 +81,20 @@ spec:
             name: github
         - params:
             - name: filter
+              # Any review whose summary starts with `@ai`. On a pull request of the factory also one without `@ai`, also one
+              # with no summary (only inline comments), but never an approval: an approve without `@ai` anywhere in its
+              # summary needs no answer (a series of approvals used to queue one run each).
               value: body.action == 'submitted' && body.pull_request.state == 'open'
-                && body.sender.type != 'Bot' && body.review.body != null && body.review.body != ''
-                && ((body.pull_request.user.type == 'Bot' && body.pull_request.head.ref.startsWith('issue-'))
-                || body.review.body.matches('^@ai(\\s|$)'))
+                && body.sender.type != 'Bot'
+                && ((body.review.body != null && body.review.body.matches('^@ai(\\s|$)'))
+                || (body.pull_request.user.type == 'Bot' && body.pull_request.head.ref.startsWith('issue-')
+                && (body.review.state != 'approved'
+                || (body.review.body != null && body.review.body.matches('(^|\\s)@ai(\\s|$)')))))
+            # Text for the agent: a review with inline comments only has an empty (null) summary
+            - name: overlays
+              value:
+                - key: review_body
+                  expression: "body.review.body == null || body.review.body == '' ? '(review without a summary: its inline comments are in the conversation below)' : body.review.body"
           ref:
             kind: ClusterInterceptor
             name: cel
