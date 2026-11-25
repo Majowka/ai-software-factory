@@ -580,14 +580,14 @@ With hosted models this also caps how much of your subscription limits parallel 
    the build fails, the agent (task `FIX`) gets the end of the log and fixes the code, up to
    `max-fix-attempts` times. A green build then gets a **self-review** (task `REVIEW`, at most 6 minutes and 15 tool calls, no test runs): the agent reads
    its own diff against the task, looking for a symptom fixed instead of the root cause, broken error or
-   rollback paths and tests that would pass with the bug. Remarks that need a change go back to the agent
+   rollback paths and tests that would pass with the bug. Only numbered remarks marked `[blocker]` or `[major]`, each tied to a concrete failing case, count; style and other minor points go under `Notes:` and do not trigger a fix. Remarks that need a change go back to the agent
    (task `FIX`) and the build and review run again, up to `self-review-rounds` (1) fix rounds, then a last review that only reports; all of it
    within 75 minutes. The step never fails: it leaves a note with the result, and a blocker the last
    review still reports keeps the pull request a draft.
    **Bug issues** (label `bug`, `type: bug`, `kind/bug`, `defect` or `regression`, see `regression-test.sh` in
    `agent-config`): the plan and the agent are told to find the root cause and write a regression test first, and
    name the command that runs it in `.agent-regression-test.txt`. On a green build `verify` runs that command with
-   the change (must pass) and on the base commit with only the new test files copied in (must fail). Otherwise the
+   the change (must pass) and on the base commit with only the new test files copied in (must fail), with the verify script's Python virtualenv (`~/.cache/verify-venv/<repo>`) first on `PATH`. Otherwise the
    agent gets up to two rounds to fix the test; a bug fix without a valid regression test is opened as a draft.
    `pr-comment-agent` turns the check off (`regression-test: off`).
 7. **`publish`** (its own task): mints a fresh token, commits and pushes. The issue pipelines also open a
