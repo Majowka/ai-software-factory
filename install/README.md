@@ -1,5 +1,10 @@
 # Plan: test cluster for the AI Software Factory (ROSA + 1 GPU node)
 
+> [!NOTE]
+> This is the log of the earlier **OpenShift (ROSA) test cluster with a GPU node for vLLM**. The factory no longer needs
+> OpenShift or GPUs: it runs on k3s or any Kubernetes with Tekton and uses hosted models (top-level `README.md`,
+> `deploy/k3s/README.md`). Keep this file as a reference for an OpenShift install; the GPU and `ai/` parts no longer apply.
+
 This file is the plan for the agent (Claude Code) that builds the test cluster, so the user does not have to explain it again.
 Read it completely before touching AWS or the cluster. It is a description, not automation: check the CLI flags with `--help`
 before use (the commands are the intended shape) and update this file when reality differs.

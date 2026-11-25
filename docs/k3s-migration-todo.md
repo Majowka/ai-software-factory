@@ -49,9 +49,10 @@ Lista zadań dla gałęzi `claude/project-thread-cvdyq6`. Kolejność = kolejno�
 
 ## 5. Dokumentacja
 
-- [ ] README: `oc` → `kubectl`, `oc new-project` → `kubectl create ns`, `oc secrets link` → `kubectl patch sa`.
-- [ ] `install/README.md`: zastąpić instalację ROSA instrukcją dla k3s.
-- [ ] Diagramy/opisy: „OpenShift Route” → Ingress, bez vLLM.
+- [x] README: `oc` → `kubectl`, `oc new-project` → `kubectl create ns`, `oc secrets link` → `kubectl patch sa`.
+- [x] `install/README.md`: oznaczony jako log klastra ROSA; instrukcja k3s w `deploy/k3s/README.md` i README (sekcje 1, 6.2).
+- [x] Opisy w README: Ingress/Route, dwa silniki, bez vLLM; skrócone kopie YAML zastąpione odnośnikami do plików.
+- [ ] Diagramy SVG (`docs/diagrams`, `docs/images/factory-overview.svg`) nadal pokazują vLLM/OpenShift — do przerysowania.
 
 ## 6. Test end-to-end
 
