@@ -723,6 +723,13 @@ spec:
                 fi
               fi
 
+              # Auto-merge enabled when the PR was opened must not merge a fix round whose self-review still has remarks
+              # or whose build stayed red (mesh-manager#6816 merged that way on 2026-11-25)
+              if [ -f /workspace/out/no-auto-merge ] || [ -f /workspace/out/verify-failed ]; then
+                gh pr merge "$PR_NUMBER" --repo "$REPO_FULL_NAME" --disable-auto \
+                  && echo "auto-merge disabled (self-review remarks left or build red)" || echo "auto-merge was not enabled"
+              fi
+
               echo "=== Replying on the pull request ==="
               if [ -s /workspace/out/summary.md ]; then
                 gh pr comment "$PR_NUMBER" --repo "$REPO_FULL_NAME" --body-file /workspace/out/summary.md
