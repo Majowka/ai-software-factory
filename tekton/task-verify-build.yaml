@@ -161,15 +161,18 @@ spec:
           last_review_tree="$snapshot"
           rm -f "$OUT/self-review.md"
           echo "=== Self-review round ${round} ($(wc -l < "$diff_file") diff lines) ==="
-          REVIEW_PROMPT="You are a strict senior reviewer. Another engineer made the change below in this repository (the working tree at /workspace/repo has it applied; the diff against the last commit is in ${diff_file}). The build and tests pass: ${cmd}
+          REVIEW_PROMPT="You are a senior reviewer. Another engineer made the change below in this repository (the working tree at /workspace/repo has it applied; the diff against the last commit is in ${diff_file}). The build and tests pass: ${cmd}
 
-        Find what is still wrong. Read the diff, then open the changed code, its callers and its tests; do not run any tests. You have 5 minutes and at most 15 tool calls: write a first version of /workspace/out/self-review.md after your first few reads, then refine it; read whole functions in one go instead of many small slices. Check, in this order:
+        Decide whether this change can be merged as it is. A good change gets VERDICT: ok; do not look for something to say. Read the diff, then open the changed code, its callers and its tests; do not run any tests. You have 5 minutes and at most 15 tool calls: write a first version of /workspace/out/self-review.md after your first few reads, then refine it; read whole functions in one go instead of many small slices. Check, in this order:
         1. Root cause: does the change fix the cause of the problem described in the task, or only hide a symptom (a retry, a broad try/except, a guard in the wrong layer, an early return)? Follow the failing path through the real code, including other processes or workers that run the same code.
         2. Correctness of the new code: error and rollback paths, transactions and sessions, async/await and threads, None/empty values, existing callers.
         3. Tests: would the new or changed tests fail without the fix? A test that only exercises a mock or a fake of the very thing that broke proves nothing.
         4. Scope: requirements of the task that are not done; changes the task did not ask for.
 
-        Write /workspace/out/self-review.md and nothing else (do not modify any other file, do not run git commit or gh). Its first line is exactly 'VERDICT: ok' when nothing needs to change, or 'VERDICT: fix' when something does. Then a numbered list of remarks, each with severity (blocker or major; skip minor points and style), 'path:line', what goes wrong and in which case, and how to fix it. Only remarks you verified in the code. An empty list with 'VERDICT: ok' is a valid result.
+        Write /workspace/out/self-review.md and nothing else (do not modify any other file, do not run git commit or gh). Its first line is exactly 'VERDICT: fix' when there is at least one blocker or major remark, otherwise exactly 'VERDICT: ok'. Then one numbered line per remark, in the form '1. [blocker] path:line: <concrete case: input or state, and the wrong result it gives>. Fix: <how>' (use [major] for a major one).
+        - blocker: the change does not fix the cause of the task, or it breaks existing behaviour, loses or corrupts data, or crashes in a normal case.
+        - major: a real bug in a realistic case, a requirement of the task that is not done, or a new test that would still pass without the fix.
+        Not a remark at all: style, naming, comments, docs, logging, refactors, extra tests that would be nice, and anything you cannot tie to a concrete failing case you verified in the code. If you want, list such minor points after the remarks under a 'Notes:' heading; they do not change the verdict and nobody acts on them.
 
         The task:
         $(task_context)${previous}"
@@ -179,8 +182,10 @@ spec:
           git read-tree "$snapshot" && git checkout-index -a -f && git clean -qfd -- . ':(exclude)**/target/**'
           if [ ! -s "$OUT/self-review.md" ]; then echo "Self-review wrote nothing; skipping it"; return 0; fi
           cat "$OUT/self-review.md"
-          if head -n 3 "$OUT/self-review.md" | grep -qiE '^[[:space:]]*VERDICT:[[:space:]]*fix'; then
-            if grep -qi 'blocker' "$OUT/self-review.md"; then return 2; fi
+          # Only numbered remarks marked [blocker] or [major] count (above the Notes heading); a 'fix' verdict without one is ok
+          local remarks; remarks="$(sed '/^[[:space:]#*]*Notes:/,$d' "$OUT/self-review.md" | grep -iE '^[[:space:]]*[0-9]+[.)][[:space:]]*\[(blocker|major)\]' || true)"
+          if head -n 3 "$OUT/self-review.md" | grep -qiE '^[[:space:]]*VERDICT:[[:space:]]*fix' && [ -n "$remarks" ]; then
+            if grep -qiE '\[blocker\]' <<<"$remarks"; then return 2; fi
             return 1
           fi
           return 0
@@ -193,6 +198,10 @@ spec:
         if [ "${REGRESSION_TEST:-auto}" = "auto" ] && is_bug; then regression_needed=true; echo "Bug issue: a regression test is required"; fi
         regression_check() {
           local why="" rcmd="" f base=/workspace/regression-base
+          # Run the command with the verify script's Python environment (pytest and the dependencies are there), not the system one
+          local venv; venv="${HOME}/.cache/verify-venv/$(basename "$(printf '%s' "${REPO_FULL_NAME:-}" | tr '[:upper:]' '[:lower:]')")"
+          local run_env=""
+          if [ -x "$venv/bin/python" ]; then run_env="export VIRTUAL_ENV='$venv' PATH='$venv/bin':\"\$PATH\"; "; fi
           rm -f "$OUT/regression-check.md"
           git add -A -- . ':(exclude)**/target/**'
           local tests; tests="$(git diff --cached --name-only --diff-filter=AM HEAD | while IFS= read -r f; do if is_test_path "$f"; then echo "$f"; fi; done)"
@@ -206,7 +215,7 @@ spec:
           else
             echo "=== Regression test: ${rcmd} ==="
             echo "Test files of the change:"; printf '  %s\n' $tests
-            if ! timeout 15m bash -c "$rcmd" > /workspace/regression-after.log 2>&1; then
+            if ! timeout 15m bash -c "${run_env}${rcmd}" > /workspace/regression-after.log 2>&1; then
               why="The regression test command fails with the change applied. Last lines:
         $(tail -n 60 /workspace/regression-after.log)"
             else
@@ -214,7 +223,7 @@ spec:
               git worktree remove --force "$base" 2>/dev/null || true
               git worktree add -q --detach "$base" HEAD
               while IFS= read -r f; do mkdir -p "$base/$(dirname "$f")"; cp "$f" "$base/$f"; done <<<"$tests"
-              if (cd "$base" && timeout 15m bash -c "$rcmd") > /workspace/regression-base.log 2>&1; then
+              if (cd "$base" && timeout 15m bash -c "${run_env}${rcmd}") > /workspace/regression-base.log 2>&1; then
                 why="The regression test passes on the base commit too (the code without your fix, with your test files copied in), so it does not reproduce the bug. Make it exercise the failing path through the real code. Last lines on the base commit:
         $(tail -n 40 /workspace/regression-base.log)"
               else
