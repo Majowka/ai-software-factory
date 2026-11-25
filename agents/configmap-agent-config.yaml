@@ -10,11 +10,16 @@ data:
     set -euo pipefail
     b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
     # Rebuild the PEM with 64-character lines: OpenSSL 3 rejects a key stored on one line (spaces or literal \n
-    # instead of line breaks), which is how a secret store may hand it over.
+    # instead of line breaks), which is how a secret store may hand it over. A key without BEGIN/END lines is
+    # wrapped according to the detected format: PKCS#8 -> PRIVATE KEY, PKCS#1 -> RSA PRIVATE KEY (GitHub App keys).
     pem_normalize() {
       local kind body
       kind="$(printf '%s' "$1" | sed -nE 's/.*-----BEGIN ([A-Z ]+)-----.*/\1/p' | head -n 1)"
       body="$(printf '%s' "$1" | sed -E 's/\\n/ /g; s/-----(BEGIN|END) [A-Z ]+-----//g' | tr -d ' \t\r\n')"
+      if [ -z "$kind" ]; then
+        if printf '%s' "$body" | openssl base64 -d -A 2>/dev/null | openssl asn1parse -inform DER 2>/dev/null \
+          | sed -n 3p | grep -q 'SEQUENCE'; then kind="PRIVATE KEY"; else kind="RSA PRIVATE KEY"; fi
+      fi
       printf -- '-----BEGIN %s-----\n%s\n-----END %s-----\n' "$kind" "$(printf '%s' "$body" | fold -w 64)" "$kind"
     }
     now="$(date +%s)"
