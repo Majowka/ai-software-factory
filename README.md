@@ -106,58 +106,39 @@ drawings, not the official logos.
 │   ├── route-new-issue.yaml             public HTTPS endpoint for the GitHub webhook
 │   └── serviceaccount-*.yaml, rolebinding-*.yaml   service account and RBAC for the EventListener
 ├── secrets/                             secret skeletons with placeholders only (never commit real values)
-│   └── secret-github-app.yaml, secret-github-webhook-secret.yaml, secret-hf-token.yaml, ...
-├── ai/                                  the model: cache volume, Deployment and Service for qwen38-flash and qwen3-coder
+│   └── secret-github-app.yaml, secret-github-webhook-secret.yaml, ...
 └── docs/
     ├── diagrams/                        SVG diagrams of the three event flows
     └── images/                          screenshots used in this README
 ```
 
-Namespaces used: `ai` for models and `agents` for pipelines and triggers.
+Namespace used: `agents` for pipelines and triggers. The model is a hosted API (section 5).
 
 ## 1. Prerequisites
 
-### 1.1 Cluster and GPU nodes
+### 1.1 Cluster
 
 - An OpenShift cluster (the setup was built on ROSA) with permissions to install operators.
-- At least one GPU machine pool. Each model deployment in `ai/` requests **2 GPUs**
-  (`--tensor-parallel-size=2`), 180 GiB of memory and a 300 GiB cache volume. Both deployments
-  ship with `replicas: 0`; run only one at a time unless you have 4 GPUs.
-- The model manifests tolerate the `nvidia.com/gpu:NoSchedule` taint. If you taint your GPU nodes
-  differently, change the `tolerations` in `ai/`.
-- The checkpoints are NVFP4 quantized. Check the vLLM release notes for the GPU generation you
-  use, because FP4 kernels are primarily aimed at Blackwell GPUs.
 - A default `StorageClass` that supports `ReadWriteOnce` (the manifests use `gp3-csi`).
-- Access to `registry.redhat.io` for the vLLM images (the cluster pull secret normally covers it).
+- Outbound HTTPS from the `agents` namespace to GitHub and to the model API.
 
 ### 1.2 Operators
 
-Install from OperatorHub, in this order:
+Install from OperatorHub:
 
-1. **Node Feature Discovery Operator**. After installing, create a `NodeFeatureDiscovery`
-   instance (the defaults are fine). It labels nodes that have NVIDIA hardware.
-2. **NVIDIA GPU Operator**. After installing, create the default `ClusterPolicy`. It installs
-   the driver, container toolkit and device plugin on GPU nodes.
-3. **Red Hat OpenShift Pipelines** (Tekton Pipelines and Tekton Triggers). It provides the
+1. **Red Hat OpenShift Pipelines** (Tekton Pipelines and Tekton Triggers). It provides the
    `github` and `cel` cluster interceptors and the `pipeline` service account.
 
 ![Installed operators in the OpenShift console](docs/images/operators-installed.png)
-*Installed Operators: Node Feature Discovery, NVIDIA GPU Operator and Red Hat OpenShift Pipelines.*
+*Installed Operators (the screenshot predates the move to a hosted model; only Pipelines is needed now).*
 
 Verify:
 
 ```bash
-# GPU nodes are discovered and advertise GPUs
-oc get nodes -l feature.node.kubernetes.io/pci-10de.present=true
-oc describe node <gpu-node> | grep -A2 'nvidia.com/gpu'
-
 # Tekton is running
 oc get pods -n openshift-pipelines
 oc get clusterinterceptors
 ```
-
-![GPU node advertising nvidia.com/gpu](docs/images/gpu-nodes.png)
-*A GPU node with the `nvidia.com/gpu` resource in its capacity and allocatable lists.*
 
 **Tekton setting for current OpenShift Pipelines (1.24 and newer).** The pipelines in this repository
 give one task two volumes (`skills` and `work`). By default Tekton schedules such pods with an affinity
@@ -179,7 +160,6 @@ image or publish your own skills artifact (section 4).
 ### 1.4 Namespaces
 
 ```bash
-oc new-project ai
 oc new-project agents
 ```
 
@@ -286,24 +266,6 @@ stringData:
 
 ```bash
 oc apply -f secrets/secret-github-webhook-secret.yaml
-```
-
-**Hugging Face token** (`secrets/secret-hf-token.yaml`). The model deployment uses it to download
-the weights:
-
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: hf-token
-  namespace: ai
-type: Opaque
-stringData:
-  token: "<HF_TOKEN>"
-```
-
-```bash
-oc apply -f secrets/secret-hf-token.yaml
 ```
 
 The same secrets can be created without a file, for example:
@@ -422,163 +384,11 @@ tar -czf skills.tar.gz skills agents
 oras push quay.io/<org>/<skills-repo>:<version> skills.tar.gz
 ```
 
-## 5. The AI model (vLLM)
+## 5. The AI model
 
-The manifests in `ai/` run `vllm serve` for Qwen3.8 Flash (`qwen38-flash`) and Qwen3 Coder
-(`qwen3-coder`). The pipelines use **Qwen3.8 Flash**, served as `qwen38_flash`, with tool calling
-enabled and a 128k context.
-
-**Cache volume** (`ai/pvc-qwen38-flash-cache.yaml`). The Hugging Face cache lives on a persistent
-volume so the weights are downloaded only once:
-
-```yaml
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: qwen38-flash-cache
-  namespace: ai
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 300Gi
-  storageClassName: gp3-csi
-```
-
-```bash
-oc apply -f ai/pvc-qwen38-flash-cache.yaml
-```
-
-**Deployment** (`ai/deployment-qwen38-flash.yaml`, shortened). The arguments that matter are the
-served model name, tensor parallelism over two GPUs, the context length and the tool-calling
-parser, which OpenCode relies on:
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: qwen38-flash
-  namespace: ai
-spec:
-  replicas: 0                    # scale to 1 when you want the model running
-  strategy:
-    type: Recreate               # the cache volume is ReadWriteOnce
-  selector:
-    matchLabels:
-      app: qwen38-flash
-  template:
-    metadata:
-      labels:
-        app: qwen38-flash
-    spec:
-      tolerations:
-        - key: nvidia.com/gpu
-          operator: Exists
-          effect: NoSchedule
-      containers:
-        - name: vllm
-          image: registry.redhat.io/rhaii-preview/vllm-cuda-rhel9:v0.31.0
-          command:
-            - vllm
-            - serve
-          args:
-            - RedHatAI/Qwen3.8-Flash-Next-NVFP4
-            - --port=8000
-            - --served-model-name=qwen38_flash
-            - --tensor-parallel-size=2
-            - --max-model-len=131072
-            - --gpu-memory-utilization=0.90
-            - --enable-auto-tool-choice
-            - --tool-call-parser=qwen3_coder
-            - --reasoning-parser=qwen3
-            - --enforce-eager
-            - --no-enable-flashinfer-autotune
-          env:
-            - name: HUGGING_FACE_HUB_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: hf-token
-                  key: token
-            - name: HF_HOME
-              value: /cache/hf
-          ports:
-            - containerPort: 8000
-          resources:
-            requests:
-              cpu: "4"
-              memory: 180Gi
-              nvidia.com/gpu: "2"
-            limits:
-              cpu: "16"
-              memory: 200Gi
-              nvidia.com/gpu: "2"
-          # startup, liveness and readiness probes on /health:8000 omitted;
-          # the startup probe allows about an hour for the first download
-          volumeMounts:
-            - name: shm
-              mountPath: /dev/shm
-            - name: cache
-              mountPath: /cache/hf
-              subPath: hf
-            - name: cache
-              mountPath: /tmp/vllm
-              subPath: vllm
-      volumes:
-        - name: shm
-          emptyDir:
-            medium: Memory
-            sizeLimit: 32Gi
-        - name: cache
-          persistentVolumeClaim:
-            claimName: qwen38-flash-cache
-```
-
-**Service** (`ai/service-qwen38-flash.yaml`). It gives the agents a stable address,
-`http://qwen38-flash.ai.svc.cluster.local:8000/v1`:
-
-```yaml
-apiVersion: v1
-kind: Service
-metadata:
-  name: qwen38-flash
-  namespace: ai
-spec:
-  type: ClusterIP
-  selector:
-    app: qwen38-flash
-  ports:
-    - port: 8000
-      targetPort: 8000
-      protocol: TCP
-```
-
-```bash
-oc apply -f ai/deployment-qwen38-flash.yaml -f ai/service-qwen38-flash.yaml
-oc scale deployment/qwen38-flash -n ai --replicas=1
-```
-
-`ai/deployment-qwen3-coder.yaml` and `ai/service-qwen3-coder.yaml` define the second model the same
-way (`RedHatAI/Qwen3-Coder-Next-NVFP4`, served as `qwen3_coder`, no cache volume). Both ship with
-`replicas: 0`; run only one at a time unless you have 4 GPUs.
-
-The first start downloads the weights, which can take a long time. Watch it with
-`oc logs -f deployment/qwen38-flash -n ai`.
-
-Verify the endpoint:
-
-```bash
-oc port-forward svc/qwen38-flash 8000:8000 -n ai &
-curl -s localhost:8000/v1/models | jq '.data[].id'     # expect "qwen38_flash"
-```
-
-![vLLM model pod running in the ai namespace](docs/images/vllm-pods-running.png)
-*The `qwen38-flash` pod is `Running` and `/v1/models` lists `qwen38_flash`.*
-
-The agent reaches the model through the address above. That address, the model name and the
-context limit live in the agent configuration (section 6.1). To switch models, change the provider
-and model there and nothing else. Scale the model down when it is not needed (`--replicas=0`) to
-release the GPUs.
+The factory no longer runs its own model: vLLM, the GPU nodes and the `ai` namespace were removed.
+The agent uses a hosted model API instead. The provider, model and API key secret are set in the
+agent configuration (section 6.1). This part is being reworked; see `docs/k3s-migration-todo.md`.
 
 ## 6. Tekton: pipelines, triggers and the listener
 

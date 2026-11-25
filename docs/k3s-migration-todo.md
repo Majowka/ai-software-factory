@@ -10,9 +10,9 @@ Lista zadań dla gałęzi `claude/project-thread-cvdyq6`. Kolejność = kolejno�
 
 ## 1. Usunięcie vLLM / GPU
 
-- [ ] Usunąć `ai/` (Deploymenty i Service `qwen38-flash`, `qwen3-coder`, PVC cache).
-- [ ] Usunąć `secrets/secret-hf-token.yaml`.
-- [ ] README: usunąć sekcje o GPU, NFD, NVIDIA GPU Operator, modelu i namespace `ai`.
+- [x] Usunąć `ai/` (Deploymenty i Service `qwen38-flash`, `qwen3-coder`, PVC cache).
+- [x] Usunąć `secrets/secret-hf-token.yaml`.
+- [x] README: usunąć sekcje o GPU, NFD, NVIDIA GPU Operator, modelu i namespace `ai`.
 
 ## 2. Zewnętrzny model (wariant A — OpenCode)
 
