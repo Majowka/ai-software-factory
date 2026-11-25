@@ -572,6 +572,9 @@ spec:
                 # Merge automatically once branch protection is satisfied (required review and checks); never fails the pipeline
                 if [ -n "$DRAFT_FLAG" ]; then
                   echo "draft pull request (build verification failed); auto-merge not enabled"
+                elif [ -f /workspace/out/no-auto-merge ] || [ "$PR_KEYWORD" = "Refs" ]; then
+                  # The last self-review still had remarks, or the agent says the change is partial: a person decides
+                  echo "auto-merge not enabled (self-review remarks left or partial change); merge manually"
                 elif gh pr merge "$PR_URL" --auto --merge; then
                   echo "auto-merge enabled (merges once the required review and checks pass)"
                 else

@@ -102,7 +102,7 @@ spec:
         MAX_FIX_ATTEMPTS="${MAX_FIX_ATTEMPTS:-3}"
         SELF_REVIEW_ROUNDS="${SELF_REVIEW_ROUNDS:-1}"
         BUDGET_MINUTES="${VERIFY_BUDGET_MINUTES:-75}"
-        rm -f "$OUT/verify-note.md" "$OUT/verify-failed" "$OUT/self-review.md" "$OUT/regression-check.md"
+        rm -f "$OUT/verify-note.md" "$OUT/verify-failed" "$OUT/self-review.md" "$OUT/regression-check.md" "$OUT/no-auto-merge"
         # The agent names its regression test here; never committed
         take_regression_file() { if [ -f .agent-regression-test.txt ]; then mv .agent-regression-test.txt "$OUT/regression-test.txt"; fi; }
         take_regression_file
@@ -303,7 +303,8 @@ spec:
                 cat "$OUT/self-review.md"
                 printf '\n</details>\n'
               } >> "$OUT/verify-note.md"
-              # A blocker that survived the fix rounds keeps the pull request a draft (no auto-merge)
+              # Remarks left after the fix rounds: a person merges (no auto-merge); a blocker also keeps the PR a draft
+              touch "$OUT/no-auto-merge"
               if [ "$verdict" -eq 2 ]; then cp "$OUT/verify-note.md" "$OUT/verify-failed"; fi
             fi
             if [ "$regression_needed" = true ]; then
