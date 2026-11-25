@@ -331,6 +331,13 @@ spec:
                 1. Write the plan to /workspace/out/plan.md. The first line is '### Implementation plan', followed by a GitHub markdown checklist: one '- [ ] ' line per concrete step, in the order you will carry the steps out (code changes, tests), 3 to 10 lines, no other text.
               The pipeline posts the plan for you: do not run gh. Do not modify any file in the repository and do not write .agent-summary.md."
 
+              source /config/regression-test.sh
+              if is_bug; then
+                PLAN_PROMPT="$PLAN_PROMPT
+
+              This issue is a bug: the plan starts with finding the root cause (name the file and function where it is) and writing a regression test that fails on the current code, before the fix."
+              fi
+
               bash /config/agent-run.sh plan 15m /workspace/plan.log "$PLAN_PROMPT" || echo "Continuing without a plan"
               if [ -s /workspace/out/plan.md ]; then
                 GH_TOKEN="$PLAN_GH_TOKEN" gh issue comment "$ISSUE_NUMBER" --repo "$REPO_FULL_NAME" --body-file /workspace/out/plan.md \
@@ -414,6 +421,14 @@ spec:
 
               Follow this plan:
               $(cat /workspace/out/plan.md)"
+              fi
+
+              # Bug issues: root cause first, and a regression test that verify-build checks against the base commit
+              source /config/regression-test.sh
+              if is_bug; then
+                PROMPT="$PROMPT
+
+              ${REGRESSION_TEST_RULES}"
               fi
 
               bash /config/agent-run.sh implement 3h /workspace/agent.log "$PROMPT" || echo "Continuing"

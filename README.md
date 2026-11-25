@@ -583,6 +583,12 @@ With hosted models this also caps how much of your subscription limits parallel 
    (task `FIX`) and the build and review run again, up to `self-review-rounds` (2) fix rounds; all of it
    within 75 minutes. The step never fails: it leaves a note with the result, and a blocker the last
    review still reports keeps the pull request a draft.
+   **Bug issues** (label `bug`, `type: bug`, `kind/bug`, `defect` or `regression`, see `regression-test.sh` in
+   `agent-config`): the plan and the agent are told to find the root cause and write a regression test first, and
+   name the command that runs it in `.agent-regression-test.txt`. On a green build `verify` runs that command with
+   the change (must pass) and on the base commit with only the new test files copied in (must fail). Otherwise the
+   agent gets up to two rounds to fix the test; a bug fix without a valid regression test is opened as a draft.
+   `pr-comment-agent` turns the check off (`regression-test: off`).
 7. **`publish`** (its own task): mints a fresh token, commits and pushes. The issue pipelines also open a
    pull request and enable auto-merge; `pr-comment-agent` pushes to the existing PR branch. The agent's
    summary is then posted as a comment, preceded by the verification result. If the build stays
