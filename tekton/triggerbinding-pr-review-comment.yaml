@@ -6,7 +6,7 @@ metadata:
 spec:
   params:
     - name: event-id
-      value: c$(body.comment.id)
+      value: r$(body.comment.pull_request_review_id)
     - name: event-type
       value: $(header.X-Github-Event)
     - name: repo-url

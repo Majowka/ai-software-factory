@@ -2,6 +2,10 @@
 # The trigger templates and the requirements scan create every run with `status: PipelineRunPending`; Tekton does not
 # start such a run (no pods, no PVCs, and its timeouts do not tick yet). Every POLL_SECONDS this loop counts the active
 # runs (started, not finished) and clears `spec.status` on the oldest waiting runs until MAX_ACTIVE are active.
+# One pr-comment-agent run per pull request at a time: a waiting run of a pull request that already has an active run
+# stays waiting until that run ends (two runs pushing to one branch end in "Not pushed"). A waiting comment run of a
+# pull request that already has an older waiting comment run is deleted: the older one has not started yet and reads the
+# whole PR conversation when it starts, so the newer remarks reach it. `@ai fix` requests and ci-fix runs are never folded.
 # Without it, runs stay pending: to start one by hand,
 #   kubectl -n <ns> patch pipelinerun <name> --type merge -p '{"spec":{"status":null}}'
 # Agent steps that talk to an LLM are capped per engine as well (llm-slot.sh, LLM_SLOTS_* in routing.env).
@@ -67,17 +71,48 @@ spec:
               while :; do
                 code="$(api GET "${runs_path}?limit=50${cont:+&continue=$cont}" /tmp/page.json)"
                 if [ "$code" != 200 ]; then echo "could not list PipelineRuns (HTTP $code)" >&2; ok=0; break; fi
-                jq -c '.items[] | {name: .metadata.name, created: .metadata.creationTimestamp,
-                  pending: (.spec.status == "PipelineRunPending"), done: (.status.completionTime != null)}' \
+                # pr: "<repo>#<number>" for pr-comment-agent runs (one active per PR). fold: runs with the same pr and fold
+                # are interchangeable while waiting (plain comment runs); `@ai fix` requests and ci-fix runs get a unique key.
+                jq -c '.items[] | ((.spec.params // []) | map({key: .name, value: .value}) | from_entries) as $p
+                  | {name: .metadata.name, created: .metadata.creationTimestamp,
+                  pending: (.spec.status == "PipelineRunPending"), done: (.status.completionTime != null),
+                  pr: (if .spec.pipelineRef.name == "pr-comment-agent" and ($p["pr-number"] // "") != ""
+                    then "\($p["repo-full-name"])#\($p["pr-number"])" else null end),
+                  fold: (if ($p.mode // "comment") == "comment"
+                    and ((($p["comment-body"] // "" | tostring) + "\n" | split("\n")[0] | ascii_downcase | gsub("\\s+"; " ") | ltrimstr(" ") | rtrimstr(" "))
+                      | test("^@ai fix( ci)?$") | not)
+                    then "comment" else .metadata.name end)}' \
                   /tmp/page.json >> /tmp/runs.jsonl
                 cont="$(jq -r '.metadata.continue // "" | @uri' /tmp/page.json)"
                 [ -n "$cont" ] || break
               done
               [ "$ok" = 1 ] || continue
               active="$(jq -s '[.[] | select((.pending | not) and (.done | not))] | length' /tmp/runs.jsonl)"
-              jq -rs 'map(select(.pending and (.done | not))) | sort_by(.created, .name) | .[].name' /tmp/runs.jsonl > /tmp/waiting.txt
-              waiting="$(wc -l < /tmp/waiting.txt)"
-              state="active ${active}/${MAX_ACTIVE}, waiting ${waiting}"
+              # Oldest first: a run without a PR is a candidate; a PR run is folded into an older waiting run of the same PR,
+              # or held while its PR has an active run (or an older candidate in this round)
+              jq -rs '
+                ([.[] | select((.pending | not) and (.done | not) and .pr != null) | {key: .pr, value: true}] | from_entries) as $busy
+                | [.[] | select(.pending and (.done | not))] | sort_by(.created, .name)
+                | reduce .[] as $r ({seen: {}, busy: $busy, out: []};
+                    if $r.pr == null then .out += ["start \($r.name)"]
+                    elif .seen["\($r.pr) \($r.fold)"] then .out += ["fold \($r.name) \(.seen["\($r.pr) \($r.fold)"])"]
+                    else .seen["\($r.pr) \($r.fold)"] = $r.name
+                      | if .busy[$r.pr] then .out += ["hold \($r.name)"] else .busy[$r.pr] = true | .out += ["start \($r.name)"] end
+                    end)
+                | .out[]' /tmp/runs.jsonl > /tmp/plan.txt
+              waiting="$(grep -c '^start \|^hold ' /tmp/plan.txt)"
+              held="$(grep -c '^hold ' /tmp/plan.txt)"
+              while read -r verb run into; do
+                [ "$verb" = fold ] || continue
+                code="$(api DELETE "${runs_path}/${run}" /tmp/delete.json)"
+                if [ "$code" = 200 ] || [ "$code" = 202 ]; then
+                  echo "$(date -u +%FT%TZ) folded ${run} into ${into} (same pull request, still waiting; it reads the whole conversation)"
+                else
+                  echo "could not delete ${run} (HTTP ${code}): $(jq -r '.message // .' /tmp/delete.json 2>/dev/null)" >&2
+                fi
+              done < /tmp/plan.txt
+              sed -n 's/^start //p' /tmp/plan.txt > /tmp/waiting.txt
+              state="active ${active}/${MAX_ACTIVE}, waiting ${waiting} (${held} held behind a run of the same PR)"
               [ "$state" = "$last" ] || { echo "$(date -u +%FT%TZ) ${state}"; last="$state"; }
               free=$((MAX_ACTIVE - active))
               while [ "$free" -gt 0 ] && read -r run; do

@@ -38,7 +38,7 @@ Ingress (k3s: Traefik) / Route (OpenShift) ──► EventListener (Tekton Trigg
 |---|---|---|
 | `issue-agent` | a new issue (`issues` / `opened`) | Posts a checklist plan as an issue comment, implements the issue on a new branch, opens a pull request, enables auto-merge and replies with a summary. |
 | `issue-comment-agent` | an issue comment starting with `@ai` | Treats the comment as an instruction. A question gets an answer; a change request gets a plan, a branch and a pull request. |
-| `pr-comment-agent` | a review or review comment on a factory pull request; on any other pull request of the repository (also human ones) a PR comment, review or review comment starting with `@ai` | Reads the whole PR conversation and the failing CI logs of the head commit, pushes the requested change to the PR branch as a new commit of the bot (never a force push; or answers a question) and replies on the PR. `@ai fix` alone fixes the failing CI. Pull requests from forks are refused. |
+| `pr-comment-agent` | a review on a factory pull request (not an approval, unless its summary mentions `@ai`); on any pull request of the repository (also human ones) a PR comment, review or inline review comment starting with `@ai`. One run per review, one active run per pull request | Reads the whole PR conversation and the failing CI logs of the head commit, pushes the requested change to the PR branch as a new commit of the bot (never a force push; or answers a question) and replies on the PR. `@ai fix` alone fixes the failing CI. Pull requests from forks are refused. |
 | `pr-review-agent` | a PR comment starting with `@ai review`, on any open pull request of the repository | Read-only technical review (correctness, security, tests, match with the linked issue) with the `code-review` skill, posted as one PR review: remarks on diff lines as inline comments, **request changes** when there is a blocker, otherwise a comment. **Approve** only in repositories listed in `REVIEW_APPROVE_REPOS` (`review.env` in `agent-config`, empty by default), with no blocker or major remark and every check of the commit green when the review is posted. A new review supersedes the previous one of the factory (its verdict dismissed, its inline comments hidden as outdated). Never pushes. Text after `@ai review` sets the focus. |
 | `requirements-agent` | the hourly `requirements-scan` CronJob, for open issues labeled `requirements` | Compares the requirements with the code and creates the task issues in dependency order, at most 3 open at a time (section 6.9). Each task issue then runs through `issue-agent`. |
 
@@ -520,7 +520,10 @@ issues (`tekton/triggerbinding-new-issue.yaml`) reads `body.repository.clone_url
 `default_branch`, and `body.issue.number`, `title`, `body`, `id` and `user.login`. The binding for issue
 comments adds the event type (`$(header.X-Github-Event)`) and the comment (`body.comment.id`,
 `user.login`, `body`). The two pull request bindings read `body.pull_request.number`, `title` and
-`head.ref`, and take the author and text from `body.comment` (review comment) or `body.review` (review).
+`head.ref`, and take the author and text from `body.comment` (review comment) or `body.review` (review). Both name the
+run after the review (`pr-comment-agent-r<review id>`, from `body.comment.pull_request_review_id` for an inline comment), so
+one review with several inline comments starts one run. A review without a summary gets a placeholder text from a CEL
+overlay (`extensions.review_body`).
 
 A **TriggerTemplate** turns those parameters into a `PipelineRun` with a fixed name, the global
 timeouts, `taskRunTemplate.serviceAccountName: pipeline` and two `volumeClaimTemplate` workspaces
@@ -546,8 +549,8 @@ The `new-issue` EventListener has seven triggers. Each verifies the webhook sign
 |---|---|---|---|
 | `new-issue` | `issues` | action `opened`, issue **without** the `manual` or `requirements` label, repository on the automatic list (only `Majowka/ai-software-factory`; other repositories start runs with `@ai` comments only) | `new-issue`, `issue-agent` |
 | `issue-comment` | `issue_comment` | action `created`, issue open, **not a pull request**, not a bot, **body starts with `@ai`** | `issue-comment`, `issue-comment-agent` |
-| `pr-review-comment` | `pull_request_review_comment` | action `created`, PR open, not a bot, **PR opened by the factory** (author is a bot, branch `issue-*`) **or body starts with `@ai`** | `pr-comment`, `pr-comment-agent` |
-| `pr-review` | `pull_request_review` | action `submitted`, PR open, not a bot, non-empty body, **PR opened by the factory** (author is a bot, branch `issue-*`) **or body starts with `@ai`** | `pr-comment`, `pr-comment-agent` |
+| `pr-review-comment` | `pull_request_review_comment` | action `created`, PR open, not a bot, **body starts with `@ai`** (other inline comments reach the agent through their review) | `pr-comment`, `pr-comment-agent` |
+| `pr-review` | `pull_request_review` | action `submitted`, PR open, not a bot, **body starts with `@ai`**, or **PR opened by the factory** (author is a bot, branch `issue-*`) and the review is **not an approval** (an approval only when its body mentions `@ai`); a review without a summary counts | `pr-comment`, `pr-comment-agent` |
 | `pr-conversation-comment` | `issue_comment` | action `created`, open **pull request** (any author), not a bot, **body starts with `@ai`, but not `@ai review`** | `pr-comment`, `pr-comment-agent` |
 | `pr-review-request` | `issue_comment` | action `created`, open **pull request** (any author, also humans), not a bot, **body is `@ai review` (optionally followed by a focus)** | `pr-review`, `pr-review-agent` |
 | `ci-failure` | `check_suite` | action `completed`, conclusion `failure`, `timed_out` or `startup_failure`, belongs to a pull request of the same repository, branch `issue-*` (PR author and attempt limit checked in `prepare`) | `ci-fix`, `pr-comment-agent` (mode `ci-fix`) |
@@ -718,7 +721,10 @@ Two queues keep the factory from starting more work than the cluster and the mod
 **Runs.** The trigger templates and the requirements scan create every PipelineRun with `status: PipelineRunPending`.
 Tekton does not start such a run: no pods, no PVCs, and its timeouts do not tick yet. The `run-dispatcher` Deployment
 (`tekton/deployment-run-dispatcher.yaml`, no AI) checks every `POLL_SECONDS` (10) how many runs are active (started,
-not finished) and starts the oldest waiting ones, until `MAX_ACTIVE` (6) are active. Without the dispatcher, new runs
+not finished) and starts the oldest waiting ones, until `MAX_ACTIVE` (6) are active. A `pr-comment-agent` run of a pull request that
+already has an active run stays waiting until that run ends, and a newer waiting comment run of the same pull request is
+deleted (folded): the older one has not started yet and reads the whole PR conversation when it starts. `@ai fix`
+requests and ci-fix runs are never folded. Without the dispatcher, new runs
 stay pending; to start one by hand: `kubectl patch pipelinerun <name> -n <namespace> --type merge -p '{"spec":{"status":null}}'`.
 
 **LLM calls.** Every agent task goes through `agent-run.sh`, which first takes a slot of its engine (`llm-slot.sh`):

@@ -355,6 +355,7 @@ spec:
                 printf '# Pull request #%s: %s\n\n' "$PR_NUMBER" "$PR_TITLE"
                 gh pr view "$PR_NUMBER" --repo "$REPO_FULL_NAME" --json body -q '.body // ""'
                 printf '\n## Conversation (oldest first)\n\n'
+                printf 'The factory runs one job per pull request at a time and folds new events into a run that is still waiting, so human comments, reviews and inline comments posted after the NEW COMMENT that no reply of the bot answers yet belong to this request too.\n\n'
                 jq -r '.[] | "### \(.who), \(.kind), \(.at)\n\(.text)\n"' /workspace/conversation.json
                 if [ -s /workspace/ci-failures.md ]; then
                   printf '\n## Failing CI checks of the head commit\n\n'
