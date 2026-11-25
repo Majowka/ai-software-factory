@@ -22,6 +22,6 @@ spec:
     - name: comment-author
       value: $(body.review.user.login)
     - name: comment-body
-      value: $(body.review.body)
+      value: $(extensions.review_body)
     - name: base-branch
       value: $(body.repository.default_branch)
