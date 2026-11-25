@@ -9,10 +9,16 @@ spec:
     the log and fixes it (the script in the verify step). Never fails: the result is left in
     /workspace/out/verify-note.md and, when the build stays red, /workspace/out/verify-failed.
   params:
+    - name: repo-full-name
+      type: string
+      default: ""
+      description: owner/repo, picks the per-repository verify script from the agent-config ConfigMap.
     - name: verify-command
       type: string
       default: ""
-      description: Build and test command. Empty means `mvn -B -ntp verify` when there is a pom.xml, otherwise nothing. `skip` disables it.
+      description: >-
+        Build and test command. Empty means: the script verify--<owner>--<repo>.sh from agent-config when there is one,
+        otherwise `mvn -B -ntp verify` when there is a pom.xml, otherwise nothing. `skip` disables it.
     - name: max-fix-attempts
       type: string
       default: "3"
@@ -39,6 +45,8 @@ spec:
           memory: 3Gi
           cpu: "2"
       env:
+        - name: REPO_FULL_NAME
+          value: $(params.repo-full-name)
         - name: VERIFY_COMMAND
           value: $(params.verify-command)
         - name: MAX_FIX_ATTEMPTS
@@ -78,11 +86,25 @@ spec:
           echo "No changes, nothing to verify"; exit 0
         fi
 
+        # Command: the pipeline parameter, else the repository's script in agent-config, else Maven when there is a pom.xml
         cmd="${VERIFY_COMMAND:-}"
+        script_text=""
+        repo_script="/config/verify--$(printf '%s' "${REPO_FULL_NAME:-}" | tr '[:upper:]' '[:lower:]' | sed 's|/|--|').sh"
+        if [ -z "$cmd" ] && [ -n "${REPO_FULL_NAME:-}" ] && [ -f "$repo_script" ]; then
+          cmd="bash ${repo_script}"
+          script_text="$(cat "$repo_script")"
+        fi
         if [ -z "$cmd" ]; then
           if [ -f pom.xml ]; then cmd="mvn -B -ntp verify"; else echo "No build detected, skipping verification"; exit 0; fi
         fi
         if [ "$cmd" = "skip" ]; then echo "Verification disabled"; exit 0; fi
+        script_note=""
+        if [ -n "$script_text" ]; then
+          script_note="
+
+        The command runs this script (read-only, from the pipeline configuration; you cannot change it):
+        ${script_text}"
+        fi
 
         deadline=$(( $(date +%s) + BUDGET_MINUTES * 60 ))
         attempt=0
@@ -102,7 +124,7 @@ spec:
           echo "=== Build failed, asking the agent to fix it (attempt ${attempt}) ==="
           PROMPT="The build and tests of this repository fail after your changes. Fix the code so that this command passes: ${cmd}
 
-        Keep the change minimal. Do not delete or weaken tests just to make them pass. You may run the command yourself to check. The pipeline handles git and GitHub; do not write .agent-summary.md.
+        Keep the change minimal. Do not delete or weaken tests just to make them pass. You may run the command yourself to check. The pipeline handles git and GitHub; do not write .agent-summary.md.${script_note}
 
         Last lines of the output:
         $(tail -n 150 "$LOG")"
