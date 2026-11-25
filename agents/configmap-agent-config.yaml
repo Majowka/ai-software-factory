@@ -39,7 +39,10 @@ data:
         scope="$(sed -nE 's/^[[:space:]]*scope:[[:space:]]*//p' "$file" | head -n 1 | tr -d '\r' | tr '[:upper:]' '[:lower:]')"
       fi
       local re='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9._/-]+\))?!?: [^[:space:]][^[:cntrl:]]*$'
-      if [ "${#title}" -le 100 ] && printf '%s' "$title" | grep -qE "$re"; then
+      # Count characters, not bytes: the step has no UTF-8 locale, so ${#title} would reject valid titles with Polish letters
+      local title_chars
+      title_chars="$(printf '%s' "$title" | python3 -c 'import sys; print(len(sys.stdin.buffer.read().decode("utf-8", "replace")))')"
+      if [ "$title_chars" -le 100 ] && printf '%s' "$title" | grep -qE "$re"; then
         PR_TITLE="$title"
       else
         [ -n "$title" ] && echo "pr-meta: rejected title proposed by the agent: $title" >&2
