@@ -182,8 +182,10 @@ the Claude Code token you need the `claude` CLI once on your own machine (sectio
 Create a GitHub App (Settings, Developer settings, GitHub Apps) with:
 
 - **Repository permissions**: Contents *read and write*, Pull requests *read and write*,
-  Issues *read and write*, Metadata *read-only*.
+  Issues *read and write*, Metadata *read-only*. For CI logs (section 6.10): Checks *read-only*,
+  Actions *read-only* and Commit statuses *read-only*.
 - **Subscribe to events**: Issues, Issue comment, Pull request review, Pull request review comment.
+  Optional: Check suite, for the automatic CI fix (section 6.10).
 - **Webhook**: leave it for later (section 7); you need the public URL of the listener first. Set a
   webhook secret now (you will store it as `github-webhook-secret`). Use a long random value, for
   example `openssl rand -hex 32`.
@@ -360,6 +362,7 @@ mounted at `/config`:
 | `opencode.json` | OpenCode permissions and the OpenCode Go provider (key from `OPENCODE_API_KEY`). |
 | `claude-settings.json` | Claude Code permissions, the same rules as `opencode.json`. |
 | `gh-app-token.sh` | Mints a GitHub App installation token (valid 1h). |
+| `ci-failures.sh` | Failed checks of a commit with their log tails, as Markdown (section 6.10). |
 | `requirements-lib.sh` | Helpers of the requirements scan and the requirements agent. |
 
 **Routing.** Every agent call names its task:
@@ -369,6 +372,7 @@ mounted at `/config`:
 | `PLAN` | `plan` step of the three event pipelines | `opencode` |
 | `IMPLEMENT` | `agent` step of the three event pipelines | `claude` |
 | `FIX` | build-fix attempts in `verify-build` | `claude` |
+| `CI_FIX` | `agent` step of `pr-comment-agent` started by a failed CI check (section 6.10) | `claude` |
 | `REQUIREMENTS` | `analyze` step of the requirements agent | `opencode` |
 
 ```bash
@@ -376,6 +380,7 @@ AGENT_ENGINE_DEFAULT=opencode
 AGENT_ENGINE_PLAN=opencode
 AGENT_ENGINE_IMPLEMENT=claude
 AGENT_ENGINE_FIX=claude
+AGENT_ENGINE_CI_FIX=claude
 AGENT_ENGINE_REQUIREMENTS=opencode
 OPENCODE_MODEL=opencode-go/deepseek-v4.1-flash # per task: OPENCODE_MODEL_<TASK>
 CLAUDE_MODEL=sonnet                     # per task: CLAUDE_MODEL_<TASK>
@@ -389,7 +394,7 @@ To move a task to the other engine, change its line and `kubectl apply -k agents
 | Label | Effect |
 |---|---|
 | `engine:claude` / `engine:opencode` | every task of this issue or PR runs on that engine |
-| `engine-<task>:<engine>` | one task only, e.g. `engine-implement:opencode`, `engine-plan:claude` |
+| `engine-<task>:<engine>` | one task only, e.g. `engine-implement:opencode`, `engine-plan:claude`, `engine-ci-fix:opencode` |
 
 The task-specific label wins over `engine:...`, and both win over `routing.env`. The `prepare` steps read
 the labels when the run starts, so a label added later applies to the next run (the next comment). Tasks
@@ -480,8 +485,9 @@ The other two pipelines differ in what they read and where they write:
   only when the comment asks for a code change. `publish` opens a pull request only if files
   changed, and always replies on the issue.
 - `tekton/pipeline-pr-comment-agent.yaml`: `prepare` checks that the PR is open and not from a
-  fork, collects the description, comments, reviews and inline comments, and clones the PR branch.
-  `publish` pushes to that branch and replies on the pull request.
+  fork, collects the description, comments, reviews and inline comments, adds the failed CI checks of
+  the head commit (section 6.10), and clones the PR branch. `publish` pushes to that branch and replies
+  on the pull request.
 
 ![Pipelines in the OpenShift console](docs/images/pipelines-in-console.png)
 *PipelineRuns of the three pipelines in the `agents` namespace (OpenShift Pipelines console; on k3s use `tkn` or the Tekton Dashboard).*
@@ -518,7 +524,7 @@ That service is published over HTTPS by `deploy/k3s/ingress-new-issue.yaml` (Tra
 
 ### 6.6 How events become pipeline runs
 
-The `new-issue` EventListener has four triggers. Each verifies the webhook signature with the
+The `new-issue` EventListener has five triggers. Each verifies the webhook signature with the
 `github-webhook-secret` secret, filters with CEL, and then maps the payload with a binding.
 
 | Trigger | GitHub event | CEL filter (all conditions) | Template, pipeline |
@@ -527,6 +533,7 @@ The `new-issue` EventListener has four triggers. Each verifies the webhook signa
 | `issue-comment` | `issue_comment` | action `created`, issue open, **not a pull request**, not a bot, **body starts with `@ai`** | `issue-comment`, `issue-comment-agent` |
 | `pr-review-comment` | `pull_request_review_comment` | action `created`, PR open, not a bot, **PR opened by the factory** (author is a bot, branch `issue-*`) | `pr-comment`, `pr-comment-agent` |
 | `pr-review` | `pull_request_review` | action `submitted`, PR open, not a bot, non-empty body, **PR opened by the factory** (author is a bot, branch `issue-*`) | `pr-comment`, `pr-comment-agent` |
+| `ci-failure` | `check_suite` | action `completed`, conclusion `failure`, `timed_out` or `startup_failure`, belongs to a pull request of the same repository, branch `issue-*` (PR author and attempt limit checked in `prepare`) | `ci-fix`, `pr-comment-agent` (mode `ci-fix`) |
 
 Each `PipelineRun` gets its own volumes (`volumeClaimTemplate`): 1 GiB for the skills workspace and
 10 GiB for the work workspace (the clone and the Maven cache). The only Tekton timeouts are
@@ -637,6 +644,26 @@ CronJob requirements-scan (every hour, no AI)
 - **Limits.** Editing a requirement adds tasks but does not change tasks that already exist. The state comment must
   stay under the 65536-character comment limit.
 
+### 6.10 CI logs for the agent
+
+**Logs on every PR run.** The `prepare` step of `pr-comment-agent` lists the check runs of the PR head
+commit with `ci-failures.sh` and, for each failed one (the latest run per check name), writes the
+annotations and the last 150 lines of the log to `/workspace/ci-failures.md`: the job log for GitHub
+Actions, the check output for other apps, plus failed commit statuses. The report is appended to the PR
+conversation the `plan` and `agent` steps see, so a review such as "fix the build" works without pasting
+logs. Only `prepare` uses the GitHub App token; the agent sees the text, never the token. Without the
+Checks / Actions / Commit statuses permissions the report is just shorter (the step does not fail).
+
+**Automatic fix (optional).** The `ci-failure` trigger starts `pr-comment-agent` with `mode=ci-fix`
+when a check suite of a pull request fails. `prepare` then does nothing unless the PR was opened by
+`klaudiuszai[bot]`, the failed commit is still the PR head and fewer than `max-ci-fix-attempts` (2)
+automatic attempts were made on the PR. It waits up to 15 minutes for the other checks of the commit,
+skips the plan, runs the agent as task `CI_FIX` and `publish` posts the reply with the marker
+`<!-- factory:ci-fix -->` that counts the attempts. After the last attempt the bot says once that it
+stopped. One `PipelineRun` per commit (`pr-ci-fix-<sha>`), so several failed workflows of one commit do
+not start several fixes. To turn it on, the GitHub App needs the permissions above and the Check suite
+event, and the webhook relay must forward `check_suite`.
+
 ## 7. Connect GitHub to the cluster
 
 The public URL of the listener is the host of the Ingress (k3s) or the Route (OpenShift):
@@ -731,9 +758,6 @@ Ideas for features and architecture changes, none of them implemented yet.
 - **Automatic routing.** A triage step chooses the engine and model per issue (simple issues to a cheaper
   model, hard ones to a stronger one) and sets the `engine` label, instead of a human. A fallback to the other
   engine when one hits its usage limit.
-- **Self-healing after CI.** `check_run` or `workflow_run` events with a failure start
-  `pr-comment-agent` automatically, so the loop "pull request, red CI, fix" closes without a human.
-  It needs a limit on the number of automatic attempts per pull request.
 - **Preview environments.** `skaffold` and `kubectl` are already in the agent image. An ephemeral
   namespace per pull request with end-to-end tests would be a much stronger check than the build
   alone. It needs a separate service account and RBAC for the agent pods, which is the
