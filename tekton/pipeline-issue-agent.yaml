@@ -329,7 +329,7 @@ spec:
 
               PROMPT="Implement this GitHub issue, following the repository's AGENTS.md.
 
-              Pipeline context: you run non-interactively with no GitHub credentials; the pipeline handles git, the pull request and the issue comment, so ignore those sections of AGENTS.md. Use only the available tools (bash, read, edit, write, glob, grep, skill, task); there is no 'step', 'run' or 'todo' tool. When done, write a 2-4 bullet summary to .agent-summary.md in the repository root (the pipeline posts it on the issue and removes it from the commit): what was changed, the test result, anything left undone or worth a reviewer's attention.
+              Pipeline context: you run non-interactively with no GitHub credentials; the pipeline handles git, the pull request and the issue comment, so ignore those sections of AGENTS.md. Use only the available tools (bash, read, edit, write, glob, grep, skill, task); there is no 'step', 'run' or 'todo' tool. When done, write a 2-4 bullet summary to .agent-summary.md in the repository root (the pipeline posts it on the issue and removes it from the commit): what was changed, the test result, anything left undone or worth a reviewer's attention. Also write .agent-pr.txt in the repository root (the pipeline uses it for the commit and the pull request and removes it from the commit) with the line 'title: <type>(<scope>): <subject>', a Conventional Commits header in English (type one of feat, fix, docs, refactor, perf, test, build, ci, chore; scope lowercase and optional; at most 72 characters; e.g. 'feat(bridge): add VLAN filter to the bridge config'). If the change covers only part of what the issue asks for, add the line 'scope: partial'.
 
               $(cat /workspace/issue.txt)"
               if [ -s /workspace/out/plan.md ]; then
@@ -340,6 +340,9 @@ spec:
               fi
 
               bash /config/agent-run.sh implement 3h /workspace/agent.log "$PROMPT" || echo "Continuing"
+
+              # Title proposal for the commit and the pull request; never committed
+              if [ -f .agent-pr.txt ]; then mv .agent-pr.txt /workspace/out/pr.txt; fi
 
               if [ -z "$(git status --porcelain -uall -- . ':(exclude)**/target/**')" ]; then
                 echo "No changes generated"
@@ -455,8 +458,12 @@ spec:
                 mv /workspace/out/summary.full.md /workspace/out/summary.md
               fi
 
+              # Conventional Commits title proposed by the agent (validated, with a safe default) and Closes/Refs by scope
+              source /config/pr-meta.sh
+              pr_meta "feat: implement issue #${ISSUE_NUMBER}"
+
               git add -A -- . ':(exclude)**/target/**'
-              git commit -m "feat: implement issue #${ISSUE_NUMBER}" -m "Refs #${ISSUE_NUMBER}"
+              git commit -m "$PR_TITLE" -m "Refs #${ISSUE_NUMBER}"
               git push origin "$BRANCH"
 
               PR_URL="$(gh pr create \
@@ -464,8 +471,8 @@ spec:
                 --base "$BASE_BRANCH" \
                 --head "$BRANCH" \
                 $DRAFT_FLAG \
-                --title "AI: implement issue #${ISSUE_NUMBER}" \
-                --body "Closes #${ISSUE_NUMBER}")"
+                --title "$PR_TITLE" \
+                --body "${PR_KEYWORD} #${ISSUE_NUMBER}")"
               echo "Created PR: $PR_URL"
 
               # Merge automatically once branch protection is satisfied (required review and checks); never fails the pipeline

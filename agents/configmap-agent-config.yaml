@@ -25,6 +25,28 @@ data:
       -H "Authorization: Bearer ${header}.${payload}.${signature}" \
       -H "Accept: application/vnd.github+json" \
       "https://api.github.com/app/installations/${GITHUB_APP_INSTALLATION_ID}/access_tokens" | jq -er .token
+  # Title and issue keyword of the pull request opened by `publish`. The agent proposes them in .agent-pr.txt
+  # (moved to /workspace/out/pr.txt by the agent step):  "title: <type>(<scope>): <subject>"  and optionally
+  # "scope: partial". Usage: source /config/pr-meta.sh; pr_meta "<fallback title>"  -> sets PR_TITLE and PR_KEYWORD.
+  # A title that is not a valid Conventional Commits header falls back to the given default; "scope: partial"
+  # writes "Refs #<issue>" instead of "Closes #<issue>", so a partial change does not close the issue.
+  pr-meta.sh: |
+    pr_meta() {
+      local file=/workspace/out/pr.txt title="" scope=""
+      if [ -f "$file" ]; then
+        title="$(sed -nE 's/^[[:space:]]*title:[[:space:]]*//p' "$file" | head -n 1 | tr -d '\r' | sed -E 's/[[:space:]]+$//')"
+        scope="$(sed -nE 's/^[[:space:]]*scope:[[:space:]]*//p' "$file" | head -n 1 | tr -d '\r' | tr '[:upper:]' '[:lower:]')"
+      fi
+      local re='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9._/-]+\))?!?: [^[:space:]][^[:cntrl:]]*$'
+      if [ "${#title}" -le 100 ] && printf '%s' "$title" | grep -qE "$re"; then
+        PR_TITLE="$title"
+      else
+        [ -n "$title" ] && echo "pr-meta: rejected title proposed by the agent: $title" >&2
+        PR_TITLE="$1"
+      fi
+      case "$scope" in partial*) PR_KEYWORD="Refs" ;; *) PR_KEYWORD="Closes" ;; esac
+      echo "pr-meta: title='$PR_TITLE' keyword=$PR_KEYWORD"
+    }
   # Which engine runs which agent task. Change it here and apply the ConfigMap; the next run picks it up.
   # A label on the issue / PR overrides it for that issue: engine:claude, engine:opencode, engine-implement:opencode, ...
   # Tasks: PLAN (plan steps of all three event pipelines), IMPLEMENT (agent steps), FIX (build-fix attempts in
