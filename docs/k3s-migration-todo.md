@@ -28,20 +28,22 @@ Lista zadań dla gałęzi `claude/project-thread-cvdyq6`. Kolejność = kolejno�
 - [ ] Opcjonalnie: wybór silnika per issue etykietą (np. `engine:claude`), nadpisujący `routing.env`.
 - [ ] Opcjonalnie: subagenci OpenCode przetłumaczeni na format Claude Code.
 
-## 3. Manifesty pod k3s
+## 3. Manifesty pod k3s (`deploy/k3s`, `deploy/openshift`, wspólne `agents/` i `tekton/`)
 
-- [ ] `tekton/route-new-issue.yaml` → `Ingress` (Traefik) z TLS (cert-manager lub cert z zewnętrznego proxy).
-- [ ] Dodać ServiceAccount `pipeline` (+ RoleBinding), na OpenShift tworzy go operator Pipelines.
-- [ ] `triggertemplate-new-issue.yaml`: jawny `taskRunTemplate.serviceAccountName: pipeline` (jak w pozostałych).
-- [ ] Workspace'y Tekton: działają na domyślnym StorageClass (`local-path`); ewentualnie `podTemplate.securityContext.fsGroup`.
-- [ ] Kustomization dla całości (`kubectl apply -k`), opcjonalnie overlaye `openshift/` i `k3s/`.
+- [ ] Ustawić host w `deploy/k3s/ingress-new-issue.yaml` i źródło certyfikatu TLS.
+
+- [x] `tekton/route-new-issue.yaml` → `Ingress` (Traefik) z TLS (cert-manager lub cert z zewnętrznego proxy).
+- [x] Dodać ServiceAccount `pipeline` (+ RoleBinding), na OpenShift tworzy go operator Pipelines.
+- [x] `triggertemplate-new-issue.yaml`: jawny `taskRunTemplate.serviceAccountName: pipeline` (jak w pozostałych).
+- [x] Workspace'y Tekton: działają na domyślnym StorageClass (`local-path`); ewentualnie `podTemplate.securityContext.fsGroup`.
+- [x] Kustomization dla całości (`kubectl apply -k`), opcjonalnie overlaye `openshift/` i `k3s/`.
 
 ## 4. Platforma (repo `infrastructure` / `Majowka/gitops`)
 
 - [ ] Tekton Pipelines + Triggers + Interceptors jako aplikacja ArgoCD.
 - [ ] `feature-flags` w `tekton-pipelines`: `coschedule: disabled` (zamiast `oc patch tektonconfig`).
 - [ ] Namespace `agents`, Secrety (GitHub App, webhook secret, klucz API) — docelowo przez ESO/Infisical.
-- [ ] Ruch wychodzący z podów do GitHub i API modeli.
+- [ ] Ruch wychodzący z podów do GitHub, GHCR, Quay i API modeli (`opencode.ai`, `api.anthropic.com`).
 - [ ] Publiczny URL webhooka + aktualizacja w GitHub App.
 
 ## 5. Dokumentacja

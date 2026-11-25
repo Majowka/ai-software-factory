@@ -92,7 +92,7 @@ drawings, not the official logos.
 ├── agents/                              the agent: images and shared configuration
 │   ├── Dockerfile                       the agent image: OpenCode and Claude Code, gh, JDK, Maven (built by .github/workflows/agent-image.yml)
 │   ├── configmap-agent-config.yaml      engine routing per task, agent-run.sh, OpenCode and Claude Code permissions, the GitHub App token script and the requirements helpers
-│   └── skills/                          skills delivered as a ConfigMap (requirements-breakdown), built with `oc apply -k agents/skills`
+│   └── skills/                          skills delivered as a ConfigMap (requirements-breakdown), built with `kubectl apply -k agents/skills`
 ├── tekton/                              pipelines and everything that triggers them
 │   ├── pipeline-*.yaml                  the three Tekton pipelines
 │   ├── triggerbinding-*.yaml            map webhook payloads to pipeline parameters
@@ -102,8 +102,8 @@ drawings, not the official logos.
 │   ├── pipeline-requirements-agent.yaml, cronjob-requirements-scan.yaml, role/rolebinding/serviceaccount-requirements-scheduler.yaml
 │   │                                    the requirements agent and the CronJob that starts it (section 6.9)
 │   ├── resourcequota-agents.yaml        optional cap on parallel runs
-│   ├── route-new-issue.yaml             public HTTPS endpoint for the GitHub webhook
 │   └── serviceaccount-*.yaml, rolebinding-*.yaml   service account and RBAC for the EventListener
+├── deploy/                              kustomize entry points: deploy/openshift (Route) and deploy/k3s (Ingress, pipeline SA, namespace)
 ├── secrets/                             secret skeletons with placeholders only (never commit real values)
 │   └── secret-github-app.yaml, secret-github-webhook-secret.yaml, ...
 └── docs/

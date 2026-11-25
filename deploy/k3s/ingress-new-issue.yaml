@@ -1,0 +1,28 @@
+# Public HTTPS endpoint for the GitHub webhook (replaces the OpenShift Route). k3s ships Traefik as the ingress controller.
+# Set the host; the TLS secret comes from cert-manager (annotation below) or is created by hand.
+# GitHub must reach this host from the internet, so the Traefik entry point has to be published (reverse proxy, port forward or tunnel).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: new-issue
+  namespace: agents
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    # cert-manager.io/cluster-issuer: letsencrypt
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - factory-webhook.example.com
+      secretName: new-issue-tls
+  rules:
+    - host: factory-webhook.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: el-new-issue
+                port:
+                  name: http-listener
