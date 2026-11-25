@@ -78,7 +78,7 @@ spec:
                     spec: {
                       status: "PipelineRunPending",
                       pipelineRef: {name: "requirements-agent"},
-                      taskRunTemplate: {serviceAccountName: "pipeline"},
+                      taskRunTemplate: {serviceAccountName: "pipeline", podTemplate: {priorityClassName: "ai-factory"}},
                       params: [
                         {name: "repo-url", value: ("https://github.com/" + $repo + ".git")},
                         {name: "repo-full-name", value: $repo},
