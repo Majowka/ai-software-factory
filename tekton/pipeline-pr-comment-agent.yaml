@@ -247,6 +247,8 @@ spec:
                 value: $(params.head-sha)
               - name: MAX_CI_FIX_ATTEMPTS
                 value: $(params.max-ci-fix-attempts)
+              - name: COMMENT_BODY
+                value: $(params.comment-body)
               - name: HOME
                 value: /workspace/home
             script: |
@@ -264,17 +266,48 @@ spec:
 
               # Resolve the head branch from the PR itself (authoritative, also checks that the PR is open and not from a fork).
               # /workspace/skip tells the following steps there is nothing to do.
-              PR_INFO="$(gh pr view "$PR_NUMBER" --repo "$REPO_FULL_NAME" --json state,headRefName,headRefOid,isCrossRepository,title)"
+              PR_INFO="$(gh pr view "$PR_NUMBER" --repo "$REPO_FULL_NAME" --json state,headRefName,headRefOid,baseRefName,isCrossRepository,title)"
               PR_STATE="$(printf '%s' "$PR_INFO" | jq -r .state)"
               BRANCH="$(printf '%s' "$PR_INFO" | jq -r .headRefName)"
               PR_HEAD="$(printf '%s' "$PR_INFO" | jq -r .headRefOid)"
+              PR_BASE="$(printf '%s' "$PR_INFO" | jq -r .baseRefName)"
               CROSS_REPO="$(printf '%s' "$PR_INFO" | jq -r .isCrossRepository)"
               [ -n "$PR_TITLE" ] || PR_TITLE="$(printf '%s' "$PR_INFO" | jq -r .title)"
-              echo "PR #${PR_NUMBER} state=${PR_STATE} branch=${BRANCH} head=${PR_HEAD} fork=${CROSS_REPO} mode=${MODE}"
+              echo "PR #${PR_NUMBER} state=${PR_STATE} branch=${BRANCH} base=${PR_BASE} head=${PR_HEAD} fork=${CROSS_REPO} mode=${MODE}"
               if [ "$PR_STATE" != "OPEN" ]; then
                 echo "Pull request is not open; nothing to do"
                 touch /workspace/skip
                 exit 0
+              fi
+              # The App cannot push to a fork, and code from a fork is not run with the factory's credentials
+              if [ "$CROSS_REPO" = "true" ]; then
+                gh pr comment "$PR_NUMBER" --repo "$REPO_FULL_NAME" \
+                  --body "Pull requests from forks are not supported by the agent (it cannot push to a fork); no changes were made. Push the branch to this repository and comment again." || true
+                touch /workspace/skip
+                exit 0
+              fi
+              # Never commit to the default branch, also when a pull request is opened from it
+              DEFAULT_BRANCH="$(gh api "repos/${REPO_FULL_NAME}" --jq .default_branch)"
+              if [ "$BRANCH" = "$DEFAULT_BRANCH" ]; then
+                gh pr comment "$PR_NUMBER" --repo "$REPO_FULL_NAME" \
+                  --body "The head branch of this pull request is the default branch \`${BRANCH}\`; the agent does not push there. No changes were made." || true
+                touch /workspace/skip
+                exit 0
+              fi
+              # The base of THIS pull request (the event only knows the default branch of the repository)
+              echo "$PR_BASE" > /workspace/base-branch
+              # `@ai fix` (optionally `@ai fix ci`) with nothing else: fix the failing CI of the head commit, like ci-fix,
+              # but on request and on any pull request of the repository, without the automatic attempt counter
+              REQUEST="$(printf '%s' "$COMMENT_BODY" | tr '\r\n\t' '   ' | sed -E 's/ +/ /g; s/^ //; s/ $//' | tr 'A-Z' 'a-z')"
+              if [ "$MODE" = "comment" ] && { [ "$REQUEST" = "@ai fix" ] || [ "$REQUEST" = "@ai fix ci" ]; }; then
+                # The checks may still be running when someone asks: wait for them before reading the logs
+                CI_WAIT_SECONDS=900 bash /config/ci-failures.sh "$REPO_FULL_NAME" "$PR_HEAD" /workspace/ci-failures.md
+                if [ ! -s /workspace/ci-failures.md ]; then
+                  gh pr comment "$PR_NUMBER" --repo "$REPO_FULL_NAME" \
+                    --body "No failed CI checks on the head commit \`${PR_HEAD:0:7}\`, so there is nothing to fix. Write what to change after \`@ai\`, for example \`@ai fix the null check in Foo.parse\`." || true
+                  touch /workspace/skip; exit 0
+                fi
+                touch /workspace/ci-fix-request
               fi
               if [ "$MODE" = "ci-fix" ]; then
                 # Automatic fixes only on pull requests of the factory itself, only for the current head, a limited number of times.
@@ -305,15 +338,9 @@ spec:
                   echo "No failed checks on ${PR_HEAD} any more (re-run passed?); nothing to do"
                   touch /workspace/skip; exit 0
                 fi
-              else
+              elif [ ! -f /workspace/ci-fix-request ]; then
                 # Red CI of the head commit, so that a comment like "fix the build" has the logs. The agent never gets the token.
                 bash /config/ci-failures.sh "$REPO_FULL_NAME" "$PR_HEAD" /workspace/ci-failures.md
-              fi
-              if [ "$CROSS_REPO" = "true" ]; then
-                gh pr comment "$PR_NUMBER" --repo "$REPO_FULL_NAME" \
-                  --body "Pull requests from forks are not supported by the agent; no changes were made."
-                touch /workspace/skip
-                exit 0
               fi
 
               # Whole PR conversation: description, conversation comments, reviews and inline review comments
@@ -340,6 +367,8 @@ spec:
               echo "=== Cloning repository, branch ${BRANCH} ==="
               git clone --branch "$BRANCH" -- "$REPO_URL" /workspace/repo
               echo "$BRANCH" > /workspace/branch
+              # Head the agent starts from: publish pushes only as a fast-forward of it
+              git -C /workspace/repo rev-parse HEAD > /workspace/start-sha
               # Short-lived token (1h) handed to the plan step; the GitHub App key stays in this step
               ( umask 077; printf '%s' "$GH_TOKEN" > /workspace/gh-token )
 
@@ -405,13 +434,14 @@ spec:
               PLAN_GH_TOKEN="$(cat /workspace/gh-token)"
               rm -f /workspace/gh-token
 
-              # A CI fix has no review remarks to triage: no plan
-              if [ "$MODE" = "ci-fix" ]; then
+              # A CI fix (automatic or `@ai fix`) has no review remarks to triage: no plan
+              if [ "$MODE" = "ci-fix" ] || [ -f /workspace/ci-fix-request ]; then
                 echo "CI fix: no plan"
                 exit 0
               fi
 
               BRANCH="$(cat /workspace/branch)"
+              BASE_BRANCH="$(cat /workspace/base-branch 2>/dev/null || echo "$BASE_BRANCH")"
               PLAN_PROMPT="You are working on the pull request below, on its head branch '${BRANCH}' (base branch '${BASE_BRANCH}').
               A new ${EVENT_TYPE} event was triggered by a comment from ${COMMENT_AUTHOR}:
 
@@ -492,6 +522,7 @@ spec:
               fi
 
               BRANCH="$(cat /workspace/branch)"
+              BASE_BRANCH="$(cat /workspace/base-branch 2>/dev/null || echo "$BASE_BRANCH")"
               PROMPT="You are working on the pull request below, on its head branch '${BRANCH}' (base branch '${BASE_BRANCH}'), following the repository's AGENTS.md.
               A new ${EVENT_TYPE} event was triggered by a comment from ${COMMENT_AUTHOR}. Act on THIS comment, using the rest of the conversation as context:
 
@@ -517,10 +548,12 @@ spec:
               fi
 
               TASK=implement
-              if [ "$MODE" = "ci-fix" ]; then
+              if [ "$MODE" = "ci-fix" ] || [ -f /workspace/ci-fix-request ]; then
                 TASK=ci-fix
+                ASKED=""
+                if [ -f /workspace/ci-fix-request ]; then ASKED=" and ${COMMENT_AUTHOR} asked you to fix them"; fi
                 PROMPT="You are working on the pull request below, on its head branch '${BRANCH}' (base branch '${BASE_BRANCH}'), following the repository's AGENTS.md.
-              The CI checks of its head commit failed. Their log tails are in the section 'Failing CI checks of the head commit' at the end (full report: /workspace/ci-failures.md).
+              The CI checks of its head commit failed${ASKED}. Their log tails are in the section 'Failing CI checks of the head commit' at the end (full report: /workspace/ci-failures.md).
 
               $(cat /workspace/pr-conversation.md)
 
@@ -656,6 +689,9 @@ spec:
               fi
 
               COMMIT_MSG="fix: address comment on pull request #${PR_NUMBER}"
+              if [ -f /workspace/ci-fix-request ]; then
+                COMMIT_MSG="fix: failing CI on pull request #${PR_NUMBER}"
+              fi
               if [ "$MODE" = "ci-fix" ]; then
                 COMMIT_MSG="fix: failing CI on pull request #${PR_NUMBER}"
                 # The marker counts the attempt (prepare reads it), so the reply is posted even when the agent changed nothing
@@ -667,7 +703,14 @@ spec:
               if [ -n "$(git status --porcelain -uall -- . ':(exclude)**/target/**')" ]; then
                 git add -A -- . ':(exclude)**/target/**'
                 git commit -m "$COMMIT_MSG" -m "Refs #${PR_NUMBER}"
-                git push origin "$BRANCH"
+                # A plain push: when someone pushed to the branch during the run it is rejected as non-fast-forward.
+                # The factory never force-pushes or rewrites the history of a pull request branch.
+                if ! git push origin "HEAD:refs/heads/${BRANCH}"; then
+                  { printf ':warning: **Not pushed.** The branch `%s` got new commits during the run (the agent started from `%s`), and the agent never force-pushes. Comment again to run on the new head.\n\n' \
+                      "$BRANCH" "$(cut -c1-7 /workspace/start-sha 2>/dev/null || echo '?')"
+                    cat /workspace/out/summary.md 2>/dev/null || true; } > /workspace/out/summary.np.md
+                  mv /workspace/out/summary.np.md /workspace/out/summary.md
+                fi
               fi
 
               echo "=== Replying on the pull request ==="

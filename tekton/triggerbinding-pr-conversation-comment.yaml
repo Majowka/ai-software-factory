@@ -1,0 +1,26 @@
+# issue_comment on a pull request (the PR conversation). The payload has no head branch: prepare resolves it from the PR.
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: pr-conversation-comment
+  namespace: agents
+spec:
+  params:
+    - name: event-id
+      value: i$(body.comment.id)
+    - name: event-type
+      value: $(header.X-Github-Event)
+    - name: repo-url
+      value: $(body.repository.clone_url)
+    - name: repo-full-name
+      value: $(body.repository.full_name)
+    - name: pr-number
+      value: $(body.issue.number)
+    - name: pr-title
+      value: $(body.issue.title)
+    - name: comment-author
+      value: $(body.comment.user.login)
+    - name: comment-body
+      value: $(body.comment.body)
+    - name: base-branch
+      value: $(body.repository.default_branch)
