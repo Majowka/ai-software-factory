@@ -407,7 +407,8 @@ spec:
               - If the comment requests a change, implement it, add or update tests where appropriate, and keep the change minimal.
               - If the comment is only a question or needs no code change, do not modify any file; answer it in the summary.
               - Pipeline context: you run non-interactively with no GitHub credentials; the pipeline handles git, the pull request and the issue comment, so ignore those sections of AGENTS.md. Use only the available tools (bash, read, edit, write, glob, grep, skill, task); there is no 'step', 'run' or 'todo' tool.
-              - When done, write a 2-4 bullet summary to .agent-summary.md in the repository root (the pipeline posts it as the reply and removes it from the commit): what was changed in plain language (or the answer to the question), the test result, anything left undone or worth a reviewer's attention."
+              - When done, write a 2-4 bullet summary to .agent-summary.md in the repository root (the pipeline posts it as the reply and removes it from the commit): what was changed in plain language (or the answer to the question), the test result, anything left undone or worth a reviewer's attention.
+              - If you changed files, also write .agent-pr.txt in the repository root (the pipeline uses it for the commit and the pull request and removes it from the commit) with the line 'title: <type>(<scope>): <subject>', a Conventional Commits header in English (type one of feat, fix, docs, refactor, perf, test, build, ci, chore; scope lowercase and optional; at most 72 characters; e.g. 'fix(bridge): keep VLAN order on reload'). If the change covers only part of what the issue asks for, add the line 'scope: partial'."
               if [ -s /workspace/out/plan.md ]; then
                 PROMPT="$PROMPT
 
@@ -419,6 +420,7 @@ spec:
 
               # Only sources: never commit build output (target/ is tracked in this repo) or the agent summary
               if [ -f .agent-summary.md ]; then mv .agent-summary.md /workspace/out/summary.md; fi
+              if [ -f .agent-pr.txt ]; then mv .agent-pr.txt /workspace/out/pr.txt; fi
 
     - name: verify
       runAfter:
@@ -532,8 +534,12 @@ spec:
               fi
 
               if [ -n "$(git status --porcelain -uall -- . ':(exclude)**/target/**')" ]; then
+                # Conventional Commits title proposed by the agent (validated, with a safe default) and Closes/Refs by scope
+                source /config/pr-meta.sh
+                pr_meta "feat: address comment on issue #${ISSUE_NUMBER}"
+
                 git add -A -- . ':(exclude)**/target/**'
-                git commit -m "feat: address comment on issue #${ISSUE_NUMBER}" -m "Refs #${ISSUE_NUMBER}"
+                git commit -m "$PR_TITLE" -m "Refs #${ISSUE_NUMBER}"
                 git push origin "$BRANCH"
 
                 PR_URL="$(gh pr create \
@@ -541,8 +547,8 @@ spec:
                   --base "$BASE_BRANCH" \
                   --head "$BRANCH" \
                   $DRAFT_FLAG \
-                  --title "AI: address comment on issue #${ISSUE_NUMBER}" \
-                  --body "Closes #${ISSUE_NUMBER}")"
+                  --title "$PR_TITLE" \
+                  --body "${PR_KEYWORD} #${ISSUE_NUMBER}")"
                 echo "Created PR: $PR_URL"
 
                 # Merge automatically once branch protection is satisfied (required review and checks); never fails the pipeline

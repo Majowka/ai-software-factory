@@ -129,7 +129,7 @@ spec:
         Last lines of the output:
         $(tail -n 150 "$LOG")"
           bash /config/agent-run.sh fix 15m /workspace/agent.log "$PROMPT" || echo "Continuing"
-          rm -f .agent-summary.md
+          rm -f .agent-summary.md .agent-pr.txt
         done
 
         {

@@ -477,7 +477,10 @@ The heart of `tekton/pipeline-issue-agent.yaml` (shortened):
 ```
 
 `publish` then mints a fresh token, commits, pushes, opens the pull request (`Closes #<issue>`),
-enables auto-merge and posts the summary on the issue.
+enables auto-merge and posts the summary on the issue. The commit message and the PR title come from
+`.agent-pr.txt`: the agent proposes a Conventional Commits header there (`title: feat(scope): subject`),
+`/config/pr-meta.sh` validates it and falls back to `feat: implement issue #<n>`. When the agent adds
+`scope: partial`, the body says `Refs #<issue>` instead, so a partial change does not close the issue.
 
 The other two pipelines differ in what they read and where they write:
 
