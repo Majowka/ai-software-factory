@@ -163,7 +163,7 @@ spec:
           echo "=== Self-review round ${round} ($(wc -l < "$diff_file") diff lines) ==="
           REVIEW_PROMPT="You are a strict senior reviewer. Another engineer made the change below in this repository (the working tree at /workspace/repo has it applied; the diff against the last commit is in ${diff_file}). The build and tests pass: ${cmd}
 
-        Find what is still wrong. Read the diff, then open the changed code, its callers and its tests; do not run any tests. Use at most 30 tool calls: read whole functions in one go instead of many small slices. Check, in this order:
+        Find what is still wrong. Read the diff, then open the changed code, its callers and its tests; do not run any tests. You have 5 minutes and at most 15 tool calls: write a first version of /workspace/out/self-review.md after your first few reads, then refine it; read whole functions in one go instead of many small slices. Check, in this order:
         1. Root cause: does the change fix the cause of the problem described in the task, or only hide a symptom (a retry, a broad try/except, a guard in the wrong layer, an early return)? Follow the failing path through the real code, including other processes or workers that run the same code.
         2. Correctness of the new code: error and rollback paths, transactions and sessions, async/await and threads, None/empty values, existing callers.
         3. Tests: would the new or changed tests fail without the fix? A test that only exercises a mock or a fake of the very thing that broke proves nothing.
@@ -173,7 +173,8 @@ spec:
 
         The task:
         $(task_context)${previous}"
-          bash /config/agent-run.sh review 20m /workspace/self-review.log "$REVIEW_PROMPT" || echo "Self-review ended with an error; using what it wrote"
+          # Hard budget: a self-review of one change must stay short; a review cut off by the timeout keeps what it wrote
+          bash /config/agent-run.sh review "${SELF_REVIEW_MINUTES:-6}m" /workspace/self-review.log "$REVIEW_PROMPT" || echo "Self-review ended with an error; using what it wrote"
           # Drop anything the reviewer changed: back to the snapshot (index and files), untracked leftovers removed
           git read-tree "$snapshot" && git checkout-index -a -f && git clean -qfd -- . ':(exclude)**/target/**'
           if [ ! -s "$OUT/self-review.md" ]; then echo "Self-review wrote nothing; skipping it"; return 0; fi
