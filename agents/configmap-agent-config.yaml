@@ -28,7 +28,8 @@ data:
   # Which engine runs which agent task. Change it here and apply the ConfigMap; the next run picks it up.
   # A label on the issue / PR overrides it for that issue: engine:claude, engine:opencode, engine-implement:opencode, ...
   # Tasks: PLAN (plan steps of all three event pipelines), IMPLEMENT (agent steps), FIX (build-fix attempts in
-  # verify-build), CI_FIX (pr-comment-agent started by a red CI check), REQUIREMENTS (requirements-agent analysis).
+  # verify-build), CI_FIX (pr-comment-agent started by a red CI check), REQUIREMENTS (requirements-agent analysis),
+  # REVIEW (pr-review-agent, `@ai review`; best on another engine than IMPLEMENT, so the author does not review itself).
   # Values: opencode | claude. Label for one task: engine-<task>:<engine>, e.g. engine-ci-fix:opencode.
   routing.env: |
     AGENT_ENGINE_DEFAULT=opencode
@@ -38,6 +39,7 @@ data:
     AGENT_ENGINE_FIX=opencode
     AGENT_ENGINE_CI_FIX=opencode
     AGENT_ENGINE_REQUIREMENTS=opencode
+    AGENT_ENGINE_REVIEW=opencode
     # Models per engine. OpenCode: provider/model (OpenCode Go: opencode-go/<model-id>, list with
     # curl -H "Authorization: Bearer $OPENCODE_API_KEY" https://opencode.ai/inference/go/v1/models).
     # Claude Code: an alias (sonnet, opus, haiku) or a full model id. Per-task overrides: OPENCODE_MODEL_<TASK>, CLAUDE_MODEL_<TASK>.

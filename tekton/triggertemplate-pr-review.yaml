@@ -1,0 +1,50 @@
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: pr-review
+  namespace: agents
+spec:
+  params:
+    - name: repo-url
+    - name: repo-full-name
+    - name: pr-number
+    - name: comment-id
+    - name: comment-author
+    - name: comment-body
+  resourcetemplates:
+    - apiVersion: tekton.dev/v1
+      kind: PipelineRun
+      metadata:
+        # Fixed name: a redelivered webhook cannot start a second review for the same comment
+        name: pr-review-agent-$(tt.params.comment-id)
+      spec:
+        params:
+          - name: repo-url
+            value: $(tt.params.repo-url)
+          - name: repo-full-name
+            value: $(tt.params.repo-full-name)
+          - name: pr-number
+            value: $(tt.params.pr-number)
+          - name: comment-id
+            value: $(tt.params.comment-id)
+          - name: comment-author
+            value: $(tt.params.comment-author)
+          - name: comment-body
+            value: $(tt.params.comment-body)
+        pipelineRef:
+          name: pr-review-agent
+        taskRunTemplate:
+          serviceAccountName: pipeline
+        timeouts:
+          pipeline: 1h15m0s
+          tasks: 1h0m0s
+          finally: 15m0s
+        workspaces:
+          - name: work
+            volumeClaimTemplate:
+              spec:
+                accessModes:
+                  - ReadWriteOnce
+                resources:
+                  requests:
+                    storage: 10Gi

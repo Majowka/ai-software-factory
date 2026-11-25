@@ -111,6 +111,34 @@ spec:
       name: issue-comment
       template:
         ref: issue-comment
+    # Read-only technical review of any open pull request (also human-authored ones): a comment starting with
+    # `@ai review` on the PR conversation. authorize-author checks the commenter; the pipeline never pushes.
+    - bindings:
+        - kind: TriggerBinding
+          ref: pr-review-request
+      interceptors:
+        - params:
+            - name: secretRef
+              value:
+                secretKey: secret
+                secretName: github-webhook-secret
+            - name: eventTypes
+              value:
+                - issue_comment
+          ref:
+            kind: ClusterInterceptor
+            name: github
+        - params:
+            - name: filter
+              value: body.action == 'created' && body.issue.state == 'open'
+                && has(body.issue.pull_request) && body.sender.type != 'Bot'
+                && body.comment.body.startsWith('@ai review')
+          ref:
+            kind: ClusterInterceptor
+            name: cel
+      name: pr-review-request
+      template:
+        ref: pr-review
     # Automatic CI fix. Fires only once the GitHub App subscribes to "Check suite" and the relay forwards check_suite.
     # Whether the PR was opened by the factory bot, the attempt limit and the head commit are checked in prepare
     # (the check_suite payload has no PR author).
