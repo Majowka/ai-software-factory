@@ -1,0 +1,72 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: authorize-author
+  namespace: agents
+spec:
+  description: >-
+    Lets the pipeline go on only when the author of the issue or comment may write to the repository (permission
+    admin, maintain or write, read through the GitHub App), or is the factory's own bot. The CEL filters cannot do
+    this: the webhook's author_association says NONE for org members whose membership is private.
+  params:
+    - name: repo-full-name
+      type: string
+    - name: author
+      type: string
+    - name: bot-login
+      type: string
+      default: klaudiuszai[bot]
+  volumes:
+    - name: config
+      configMap:
+        name: agent-config
+  steps:
+    - name: check
+      image: ghcr.io/majowka/factory-agent:latest
+      volumeMounts:
+        - name: config
+          mountPath: /config
+          readOnly: true
+      env:
+        - name: GITHUB_APP_ID
+          valueFrom:
+            secretKeyRef:
+              name: github-app
+              key: app-id
+        - name: GITHUB_APP_INSTALLATION_ID
+          valueFrom:
+            secretKeyRef:
+              name: github-app
+              key: installation-id
+        - name: GITHUB_APP_PRIVATE_KEY
+          valueFrom:
+            secretKeyRef:
+              name: github-app
+              key: private-key.pem
+        - name: REPO_FULL_NAME
+          value: $(params.repo-full-name)
+        - name: AUTHOR
+          value: $(params.author)
+        - name: BOT_LOGIN
+          value: $(params.bot-login)
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        if [ "$AUTHOR" = "$BOT_LOGIN" ]; then
+          echo "Author ${AUTHOR} is the factory bot: allowed."
+          exit 0
+        fi
+        if ! printf '%s' "$AUTHOR" | grep -Eq '^[A-Za-z0-9-]{1,39}$'; then
+          echo "Author '${AUTHOR}' is not a valid GitHub login: rejected." >&2
+          exit 1
+        fi
+        GH_TOKEN="$(bash /config/gh-app-token.sh)"
+        export GH_TOKEN
+        permission="$(gh api "repos/${REPO_FULL_NAME}/collaborators/${AUTHOR}/permission" --jq .permission 2>/dev/null || echo none)"
+        case "$permission" in
+          admin|maintain|write)
+            echo "Author ${AUTHOR} has ${permission} on ${REPO_FULL_NAME}: allowed." ;;
+          *)
+            echo "Author ${AUTHOR} has '${permission}' on ${REPO_FULL_NAME}, needs write or more: rejected." >&2
+            exit 1 ;;
+        esac
