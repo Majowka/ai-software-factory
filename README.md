@@ -372,7 +372,7 @@ mounted at `/config`:
 |---|---|---|
 | `PLAN` | `plan` step of the three event pipelines | `opencode` |
 | `IMPLEMENT` | `agent` step of the three event pipelines | `claude` |
-| `FIX` | build-fix attempts in `verify-build` | `claude` |
+| `FIX` | build-fix attempts and self-review fixes in `verify-build` | `claude` |
 | `CI_FIX` | `agent` step of `pr-comment-agent` started by a failed CI check (section 6.10) | `claude` |
 | `REQUIREMENTS` | `analyze` step of the requirements agent | `opencode` |
 
@@ -440,13 +440,13 @@ pipeline are shared `Task` resources (`tekton/task-*.yaml`), referenced with `ta
 | Task | Used for |
 |---|---|
 | `fetch-skills` | pulls and unpacks the skills artifact |
-| `verify-build` | builds and tests the result, the agent fixes a red build |
+| `verify-build` | builds and tests the result, the agent fixes a red build, then reviews and fixes its own change |
 | `report-failure` | comments on the issue or pull request when the run failed |
 
 The pipelines keep only what differs: the event parameters and the `prepare`, `plan`, `agent` and
 `publish` logic. Two optional parameters control `verify`: `verify-command` (default:
 `mvn -B -ntp verify` when there is a `pom.xml`, `skip` disables it) and `max-fix-attempts`
-(default `3`). Two workspaces are volumes that every `PipelineRun` creates for itself: `skills`
+(default `3`); the task's `self-review-rounds` (default `2`, `0` disables it) caps the self-review fixes. Two workspaces are volumes that every `PipelineRun` creates for itself: `skills`
 (the unpacked skills) and `work` (the clone, the plan, the labels and the summary, shared by all tasks
 after `fetch-skills`). Every `PipelineRun` runs under the `pipeline` service account.
 
@@ -577,7 +577,12 @@ With hosted models this also caps how much of your subscription limits parallel 
    repository's `AGENTS.md`. It writes a short summary to `.agent-summary.md`. It has 3 hours.
 6. **`verify`** (its own task): builds and tests the result (the script is in the `verify-build` Task). If
    the build fails, the agent (task `FIX`) gets the end of the log and fixes the code, up to
-   `max-fix-attempts` times and within 45 minutes. The step never fails: it leaves a note with the result.
+   `max-fix-attempts` times. A green build then gets a **self-review** (task `REVIEW`): the agent reads
+   its own diff against the task, looking for a symptom fixed instead of the root cause, broken error or
+   rollback paths and tests that would pass with the bug. Remarks that need a change go back to the agent
+   (task `FIX`) and the build and review run again, up to `self-review-rounds` (2) fix rounds; all of it
+   within 75 minutes. The step never fails: it leaves a note with the result, and a blocker the last
+   review still reports keeps the pull request a draft.
 7. **`publish`** (its own task): mints a fresh token, commits and pushes. The issue pipelines also open a
    pull request and enable auto-merge; `pr-comment-agent` pushes to the existing PR branch. The agent's
    summary is then posted as a comment, preceded by the verification result. If the build stays
