@@ -782,7 +782,11 @@ reset, runs on the next engine of `LLM_FALLBACK_OPENCODE` instead; with `fail` i
 Gemini CLI ends at once on a used-up daily quota ("You have exhausted your capacity on this model. Your quota will
 reset after 7h12m3s."); `agent-run.sh` closes the Lease `llm-block-gemini` until that reset (without a time: the next
 midnight Pacific time, when Google resets the daily quota) and the task goes on with `LLM_FALLBACK_GEMINI`. A short 429
-or "no capacity available" (Google's servers, not the quota) is retried like OpenCode's rate limit.
+or "no capacity available" (Google's servers, not the quota) is retried like OpenCode's rate limit. `run-dispatcher` also
+reads the account's Gemini quota every `USAGE_POLL_SECONDS` (the `retrieveUserQuota` call Gemini CLI uses for `/stats`,
+no model call, with the login from `gemini-oauth`), logs the share left per model whenever it changes
+(`kubectl logs deploy/run-dispatcher | grep 'gemini quota'`, the way to see how much Google AI Pro really gives) and
+keeps `llm-block-gemini` closed until the earliest reset while no model has quota left.
 
 ## 7. Connect GitHub to the cluster
 

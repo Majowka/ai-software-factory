@@ -51,6 +51,14 @@ spec:
                   name: opencode-go
                   key: api-key
                   optional: true
+            # Gemini CLI login (secret gemini-oauth): every USAGE_POLL_SECONDS the dispatcher reads the account's Gemini
+            # quota (retrieveUserQuota, no model call), logs it when it changes and keeps the Lease llm-block-gemini.
+            - name: GEMINI_OAUTH_CREDS
+              valueFrom:
+                secretKeyRef:
+                  name: gemini-oauth
+                  key: oauth_creds.json
+                  optional: true
             - name: HOME
               value: /tmp
             - name: NAMESPACE
@@ -107,11 +115,65 @@ spec:
                   + " " + (map(.key + " " + (.value.percent | tostring) + "% " + .value.status) | join(", ")) end' /tmp/usage.json 2>/dev/null)" || return 0
               [ -n "$st" ] && set_gate opencode "${st%% *}" "usage endpoint: ${st#* }"
             }
+            # Gemini quota of the Google account (AI Pro): the same calls Gemini CLI makes for /stats. The OAuth client is
+            # Gemini CLI's public "installed app" client, read from the CLI in this image (GEMINI_OAUTH_CLIENT_ID/_SECRET
+            # override it). Every model's bucket is logged when it changes (that is the measurement of the real daily
+            # capacity); the gate closes until the earliest reset when no model has quota left, and opens otherwise.
+            # A task that hits the quota closes the gate itself (agent-run.sh); this only makes the next tasks skip Gemini
+            # at once and opens the gate again after the reset.
+            gem_proj=""; gem_last=""; gem_err=""
+            gem_cc="${GEMINI_CODE_ASSIST_URL:-https://cloudcode-pa.googleapis.com/v1internal}"
+            gem_client() {
+              local b
+              if [ -n "${GEMINI_OAUTH_CLIENT_ID:-}" ]; then printf '%s %s' "$GEMINI_OAUTH_CLIENT_ID" "${GEMINI_OAUTH_CLIENT_SECRET:-}"; return; fi
+              b="$(dirname "$(readlink -f "$(command -v gemini)")" 2>/dev/null)" || return 1
+              printf '%s %s' "$(grep -ho 'OAUTH_CLIENT_ID = "[^"]*"' "$b"/*.js 2>/dev/null | head -n1 | cut -d'"' -f2)" \
+                "$(grep -ho 'OAUTH_CLIENT_SECRET = "[^"]*"' "$b"/*.js 2>/dev/null | head -n1 | cut -d'"' -f2)"
+            }
+            gem_note() { [ "$gem_err" = "$1" ] || echo "$(date -u +%FT%TZ) gemini quota: $1" >&2; gem_err="$1"; }
+            check_gemini_usage() {
+              local rt client at code st summary
+              [ -n "${GEMINI_OAUTH_CREDS:-}" ] || return 0
+              rt="$(printf '%s' "$GEMINI_OAUTH_CREDS" | jq -r '.refresh_token // empty' 2>/dev/null)"
+              [ -n "$rt" ] || { gem_note "no refresh_token in the secret gemini-oauth"; return 0; }
+              client="$(gem_client)"; [ -n "${client%% *}" ] || { gem_note "Gemini CLI OAuth client not found"; return 0; }
+              code="$(curl -sS --max-time 15 -o /tmp/gem-token.json -w '%{http_code}' "${GEMINI_TOKEN_URL:-https://oauth2.googleapis.com/token}" \
+                -d grant_type=refresh_token --data-urlencode "client_id=${client%% *}" --data-urlencode "client_secret=${client#* }" \
+                --data-urlencode "refresh_token=${rt}" 2>/dev/null || echo 000)"
+              at="$(jq -r '.access_token // empty' /tmp/gem-token.json 2>/dev/null)"; rm -f /tmp/gem-token.json
+              [ -n "$at" ] || { gem_note "token refresh failed (HTTP ${code}): log in again and update the secret gemini-oauth"; return 0; }
+              if [ -z "$gem_proj" ]; then
+                code="$(curl -sS --max-time 15 -o /tmp/gem-load.json -w '%{http_code}' -X POST "${gem_cc}:loadCodeAssist" \
+                  -H "Authorization: Bearer ${at}" -H 'Content-Type: application/json' \
+                  --data '{"metadata":{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}}' 2>/dev/null || echo 000)"
+                gem_proj="$(jq -r '.cloudaicompanionProject | if type == "object" then .id else . end // empty' /tmp/gem-load.json 2>/dev/null)"
+                [ -n "$gem_proj" ] && echo "$(date -u +%FT%TZ) gemini quota: tier $(jq -r '.currentTier.id // .currentTier.name // "?"' /tmp/gem-load.json 2>/dev/null)"
+                [ -n "$gem_proj" ] || { gem_note "loadCodeAssist gave no project (HTTP ${code})"; return 0; }
+              fi
+              code="$(curl -sS --max-time 15 -o /tmp/gem-quota.json -w '%{http_code}' -X POST "${gem_cc}:retrieveUserQuota" \
+                -H "Authorization: Bearer ${at}" -H 'Content-Type: application/json' \
+                --data "$(jq -cn --arg p "$gem_proj" '{project:$p}')" 2>/dev/null || echo 000)"
+              [ "$code" = 200 ] || { gem_note "retrieveUserQuota answered HTTP ${code}"; [ "$code" = 403 ] && gem_proj=""; return 0; }
+              gem_err=""
+              # "<model> <percent left>% (reset HH:MM UTC)" per bucket, and the gate: "0" when a model has quota left,
+              # otherwise the earliest resetTime
+              summary="$(jq -r '[.buckets[]? | select(.modelId and .remainingFraction != null)
+                | "\(.modelId)\(if .tokenType and .tokenType != "REQUESTS" then "/" + .tokenType else "" end) \((.remainingFraction * 100) | floor)%"
+                  + (if .remainingAmount then " (" + .remainingAmount + " left)" else "" end)] | join(", ")' /tmp/gem-quota.json 2>/dev/null)"
+              st="$(jq -r '[.buckets[]? | select(.modelId and .remainingFraction != null)] as $b
+                | if ($b | length) == 0 or ($b | any(.remainingFraction > 0)) then "0"
+                  else ($b | map(.resetTime // empty | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) | if length == 0 then 0 else min end | tostring) end' \
+                /tmp/gem-quota.json 2>/dev/null)"
+              if [ "$summary" != "$gem_last" ]; then
+                echo "$(date -u +%FT%TZ) gemini quota: ${summary:-no buckets}"; gem_last="$summary"
+              fi
+              [ -n "$st" ] && set_gate gemini "$st" "quota endpoint: ${summary}"
+            }
             echo "run-dispatcher: at most ${MAX_ACTIVE} active runs, FIFO"
             last=""; usage_at=0
             while :; do
               sleep "$POLL_SECONDS"
-              if [ $(( $(date +%s) - usage_at )) -ge "$USAGE_POLL_SECONDS" ]; then usage_at="$(date +%s)"; check_opencode_usage; fi
+              if [ $(( $(date +%s) - usage_at )) -ge "$USAGE_POLL_SECONDS" ]; then usage_at="$(date +%s)"; check_opencode_usage; check_gemini_usage; fi
               # Only what is needed from each run (a run carries its whole pipeline spec), read in pages
               : > /tmp/runs.jsonl; cont=""; ok=1
               while :; do
