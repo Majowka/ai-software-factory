@@ -60,7 +60,7 @@ data:
   # (PR_KEYWORD): source /config/pr-body.sh; pr_body <issue> > <file>. Reads the agent's summary from summary.agent.md
   # (publish copies it there before putting the verify note in front of summary.md for the issue reply).
   # Sections: issue link, the agent's summary (what changed and why, testing, known limitations), the pipeline's build
-  # verification and regression-test check, the self-review verdict, the plan, the engines used. Each part is capped
+  # verification, the CI gates of the verify script (ci-gates.md), the regression-test check, the self-review verdict, the plan, the engines used. Each part is capped
   # so the body stays below GitHub's 65536-character limit.
   pr-body.sh: |
     pr_body() {
@@ -81,6 +81,10 @@ data:
         cap 15000 < "$out/verify-note.md"; printf '\n'
       else
         printf 'Build verification did not run (no verify command for this repository).\n'
+      fi
+      if [ -s "$out/ci-gates.md" ]; then
+        printf '\n### CI gates (verify)\n\nChecks of the repository CI that the factory ran before opening this PR; skipped gates do not touch the changed paths.\n\n'
+        cap 6000 < "$out/ci-gates.md"; printf '\n'
       fi
       if [ -s "$out/self-review.md" ] && ! grep -q '<summary>Self-review</summary>' "$out/verify-note.md" 2>/dev/null; then
         part="$(head -n 3 "$out/self-review.md" | grep -ioE 'VERDICT:[[:space:]]*(ok|fix)' | head -n 1 || true)"
@@ -457,53 +461,290 @@ data:
   # A repository without a script keeps the default: `mvn -B -ntp verify` when there is a pom.xml, otherwise nothing.
   verify--majowka--mesh-manager.sh: |
     #!/usr/bin/env bash
-    # Majowka/mesh-manager: unit tests of the Go bridge and of the backend, the same shards as CI (unit-core, unit-api,
-    # unit-services, unit-bridge in .github/workflows/ci-backend.yml). Nothing here needs Postgres/Timescale, Redis or
-    # MQTT: the backend tests fall back to SQLite. Integration tests (bridge-go -tags integration, backend
-    # tests/integration, real-integration-*) are left to the repository's CI. Runs in the repository root.
-    set -euo pipefail
+    # Majowka/mesh-manager: a small copy of the repository's CI, so that a factory pull request is not red there.
+    # Each gate runs only when the change touches its paths (like detect-changes in their workflows); all selected gates
+    # run even when one fails, then the script exits 1 with a summary. Results also go to /workspace/out/ci-gates.md
+    # (self-review and the pull request description read it).
+    #   base-sync      backend/alembic/versions: the change moves onto the newest base branch, so a migration that a
+    #                  merged PR added meanwhile shows up here (alembic heads), not as a down_revision fork in CI
+    #   guards         always: scripts/ci/check-test-shard-coverage.py and the root guard tests (ci.yml ci-guard-tests:
+    #                  workflow guards, generated reference docs drift, db contract manifest)
+    #   go             bridge-go/**: go vet (3 variants), golangci-lint v2.15.0 with their .golangci.yml, openwrt build,
+    #                  go test -race and go test -tags openwrt (bridge-go.yml)
+    #   bridge         bridge/**: flake8 E9/F, Bandit -ll on the production code, bridge/tests/unit (bridge-pipeline.yml,
+    #                  security.yml)
+    #   alembic        backend/alembic/**, backend/app/models/**, requirements: alembic heads, upgrade head and alembic
+    #                  check on TimescaleDB (ci.yml alembic-check), against the shared verify-postgres service
+    #   backend        backend/** or frontend/src/services/**: API contract check and the unit shards of
+    #                  ci-backend.yml (unit-core, unit-api, unit-services, unit-bridge) on SQLite
+    # Not here, left to their CI: real-integration shards, bridge-go integration tests (MQTT), QEMU/OpenWRT, image
+    # builds, smoke, frontend. VERIFY_GATES=all runs every gate whatever the change; VERIFY_GATES="go bridge" only
+    # those (when the change touches them).
+    set -uo pipefail
 
-    echo "=== bridge-go: go test ==="; start=$SECONDS
-    (cd bridge-go && CGO_ENABLED=0 go test -count=1 -timeout 300s ./...)
-    echo "=== bridge-go: done in $((SECONDS - start))s ==="
+    OUT="${VERIFY_OUT:-/workspace/out}"
+    GATES_MD="${OUT}/ci-gates.md"
+    GATE_LOGS="${HOME}/.cache/verify-gates"
+    mkdir -p "$GATE_LOGS" "$OUT"
+    ROOT="$(pwd)"
+    export GOTOOLCHAIN=auto
+    SECRET_KEY_CI=f0e1d2c3b4a5968778695a4b3c2d1e0f
 
-    echo "=== backend: dependencies (uv, Python 3.13) ==="
-    venv="${HOME}/.cache/verify-venv/mesh-manager"
-    uv venv -q --allow-existing -p 3.13 "$venv"
-    start=$SECONDS
-    VIRTUAL_ENV="$venv" uv pip install -q -r backend/requirements_ci.txt
-    echo "=== backend: dependencies done in $((SECONDS - start))s ==="
+    # ---- what changed: against the merge base with the base branch (covers the commits of a PR branch) plus the tree
+    upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
+    default_ref="$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || echo origin/develop)"
+    if [ -n "$upstream" ] && [ "$(git rev-list --count "${upstream}..HEAD" 2>/dev/null || echo 1)" = 0 ]; then
+      base_ref="$upstream"      # issue pipelines: HEAD is the base branch, the change is only in the working tree
+    else
+      base_ref="$default_ref"   # a pull request branch: compare with the default branch
+    fi
+    changed() {
+      local mb; mb="$(git merge-base HEAD "$base_ref" 2>/dev/null || git rev-parse HEAD)"
+      { git diff --name-only "$mb"; git ls-files --others --exclude-standard; } | sort -u
+    }
+    CHANGED="$(changed)"
+    touches() { grep -qE "$1" <<<"$CHANGED"; }
+    want() {  # want <gate> <regex>; VERIFY_GATES: "all" runs every gate, a list of names runs only those (when touched)
+      [ "${VERIFY_GATES:-}" = all ] && return 0
+      if [ -n "${VERIFY_GATES:-}" ] && ! grep -qw -- "$1" <<<"$VERIFY_GATES"; then return 1; fi
+      touches "$2"
+    }
 
-    cd backend
-    # No CI markers and no database URL: conftest.py then uses SQLite instead of the CI Postgres service
-    unset CI GITHUB_ACTIONS POSTGRES_AVAILABLE DATABASE_URL DATABASE_URL_SYNC
-    export TESTING=1 SKIP_ENV_VALIDATION=1 BCRYPT_ROUNDS=4
-    shard() {
-      echo "=== backend: ${1} ==="; shift
-      rm -f test*.db
-      local rc=0 start=$SECONDS
-      "$venv/bin/python" -m pytest -q --no-header -p no:cacheprovider --timeout=120 --maxfail=5 "$@" || rc=$?
-      echo "=== backend: shard done in $((SECONDS - start))s (exit ${rc}) ==="
-      # 5 = no tests collected: a branch older than these test paths, not a failure of the change
-      if [ "$rc" -eq 5 ]; then echo "warning: no tests collected"; rc=0; fi
+    declare -a G_NAME G_STATUS G_SECS G_NOTE
+    record() { G_NAME+=("$1"); G_STATUS+=("$2"); G_SECS+=("$3"); G_NOTE+=("${4:-}"); }
+    # run_gate <name> <function>: output to its own log (shown in full when it fails)
+    run_gate() {
+      local name="$1" fn="$2" rc=0 start=$SECONDS
+      echo "=== gate ${name}: start ==="
+      ( "$fn" ) > "${GATE_LOGS}/${name}.log" 2>&1 || rc=$?
+      if [ "$rc" -eq 0 ]; then
+        tail -n 5 "${GATE_LOGS}/${name}.log"
+        record "$name" pass $((SECONDS - start))
+      elif [ "$rc" -eq 3 ]; then
+        tail -n 5 "${GATE_LOGS}/${name}.log"
+        record "$name" warn $((SECONDS - start)) "$(grep -E '^warning:' "${GATE_LOGS}/${name}.log" | tail -n 1 | cut -c1-200)"
+      else
+        tail -n 80 "${GATE_LOGS}/${name}.log"
+        record "$name" FAIL $((SECONDS - start)) "$(grep -vE '^\s*$' "${GATE_LOGS}/${name}.log" | tail -n 1 | cut -c1-160)"
+      fi
+      echo "=== gate ${name}: $(case "$rc" in 0) echo pass ;; 3) echo warn ;; *) echo FAIL ;; esac) in $((SECONDS - start))s ==="
+      return 0
+    }
+    skip_gate() { record "$1" skip 0 "$2"; echo "=== gate $1: skipped ($2) ==="; }
+
+    # ---- Python environments (uv cache in $HOME on the run workspace)
+    backend_venv="${HOME}/.cache/verify-venv/mesh-manager"
+    backend_env() {
+      uv venv -q --allow-existing -p 3.13 "$backend_venv"
+      VIRTUAL_ENV="$backend_venv" uv pip install -q -r "${ROOT}/backend/requirements_ci.txt"
+    }
+
+    # ---- gates
+    gate_base_sync() {
+      # Only when nothing is committed on top of the base branch (issue pipelines); a PR branch gets the heads check
+      # on a preview of the merge instead.
+      git fetch -q origin "${base_ref#origin/}" || { echo "fetch of ${base_ref} failed, checking the current base"; }
+      if [ "$base_ref" = "$upstream" ] && git merge-base --is-ancestor HEAD "$base_ref" && [ "$(git rev-parse HEAD)" != "$(git rev-parse "$base_ref")" ]; then
+        local before; before="$(git rev-parse HEAD)"
+        echo "Base branch moved: $(git rev-list --count HEAD.."$base_ref") new commit(s) on ${base_ref}; moving the change onto it"
+        git stash push -q -u -m verify-base-sync || return 1
+        git merge -q --ff-only "$base_ref" || { git stash pop -q; return 1; }
+        if ! git stash pop -q; then
+          echo "The change conflicts with the newest ${base_ref}; staying on the old base"
+          git reset -q --hard "$before" && git clean -qfd && git stash pop -q
+          echo "error: rebase the change onto ${base_ref} by hand (conflicting files: see above)"
+          return 1
+        fi
+        echo "Now on $(git rev-parse --short HEAD) (was ${before:0:8})"
+      else
+        echo "Base is current or this is a pull request branch (base ${base_ref})"
+      fi
+      local base_tmp all_tmp base_heads all_heads
+      base_tmp="$(mktemp -d)"; all_tmp="$(mktemp -d)"
+      # Heads of the base alone, and of the base plus the change's migration files
+      git archive "$( [ "$base_ref" = "$upstream" ] && echo HEAD || echo "$base_ref")" backend/alembic/versions | tar -x -C "$base_tmp"
+      cp -r "$base_tmp/backend" "$all_tmp/"
+      cp "${ROOT}"/backend/alembic/versions/*.py "$all_tmp/backend/alembic/versions/"
+      base_heads="$(alembic_heads "$base_tmp/backend/alembic/versions")"
+      all_heads="$(alembic_heads "$all_tmp/backend/alembic/versions")"
+      rm -rf "$base_tmp" "$all_tmp"
+      local nb na; nb="$(grep -c . <<<"$base_heads")"; na="$(grep -c . <<<"$all_heads")"
+      echo "Alembic heads of ${base_ref}: ${nb} ($(paste -sd ' ' <<<"$base_heads")); with the change: ${na} ($(paste -sd ' ' <<<"$all_heads"))"
+      if [ "$na" -gt "$nb" ] || { [ "$nb" -le 1 ] && [ "$na" -ne 1 ]; }; then
+        echo "error: the change adds an Alembic head (${nb} -> ${na}): its migration shares a down_revision with a migration on ${base_ref}."
+        if [ "$base_ref" = "$upstream" ]; then
+          if [ "$nb" -gt 1 ]; then
+            echo "Set down_revision of the new migration to one of the heads of ${base_ref} ($(paste -sd ' ' <<<"$base_heads")). The base is already forked (a repository problem, not this change); do not add a merge migration unless the task asks for it."
+          else
+            echo "Set down_revision of the new migration to the head of ${base_ref}: ${base_heads}."
+          fi
+        else
+          echo "Merge ${base_ref} into this branch (git merge, no force push), then point down_revision of the new migration at its head."
+        fi
+        return 1
+      fi
+      if [ "$nb" -gt 1 ]; then
+        # Not the change's fault: their CI (test_alembic_single_head, alembic-heads-guard) is red for every PR until a
+        # merge migration lands on the base branch
+        echo "warning: ${base_ref} itself has ${nb} Alembic heads (a fork already merged there); CI fails on that for every PR. Not caused by this change."
+        return 3
+      fi
+    }
+
+    # alembic_heads <versions dir>: revisions nobody names as down_revision (static, like their test_alembic_single_head)
+    alembic_heads() {
+      python3 - "$1" <<'PY'
+    import ast, sys, pathlib
+    revs, parents = set(), set()
+    for p in pathlib.Path(sys.argv[1]).glob("*.py"):
+        for n in ast.parse(p.read_text()).body:
+            t, v = (n.target, n.value) if isinstance(n, ast.AnnAssign) else ((n.targets[0], n.value) if isinstance(n, ast.Assign) else (None, None))
+            if not isinstance(t, ast.Name) or v is None: continue
+            if t.id == "revision": revs.add(ast.literal_eval(v))
+            elif t.id == "down_revision":
+                d = ast.literal_eval(v)
+                if isinstance(d, str): parents.add(d)
+                elif d: parents.update(d)
+    for h in sorted(revs - parents): print(h)
+    PY
+    }
+
+    gate_guards() {
+      python3 scripts/ci/check-test-shard-coverage.py --self-test > /dev/null
+      python3 scripts/ci/check-test-shard-coverage.py
+      local v="${HOME}/.cache/verify-venv/mesh-manager-guards"
+      uv venv -q --allow-existing -p 3.13 "$v"
+      VIRTUAL_ENV="$v" uv pip install -q pytest==8.3.4 pyyaml==6.0.3 requests==2.32.5 \
+        "$(grep -E '^coverage==' backend/requirements_ci.txt)"
+      local log="${GATE_LOGS}/guards-pytest.log"
+      "$v/bin/python" -m pytest tests/unit scripts/ci -q -rs -p no:cacheprovider 2>&1 | tee "$log" | tail -n 40
+      local rc="${PIPESTATUS[0]}" summary; summary="$(tail -n 1 "$log")"
+      [ "$rc" -eq 0 ] || return "$rc"
+      if grep -q skipped <<<"$summary"; then echo "error: guard tests were skipped (CI fails on skips): $summary"; return 1; fi
+    }
+
+    gate_go() {
+      cd bridge-go
+      go vet ./... && go vet -tags openwrt ./... && go vet -printf.funcs=Info,Debug,Warn,Critical ./... || return 1
+      echo "go vet: ok"
+      golangci-lint run --timeout=5m || return 1
+      CGO_ENABLED=0 go build -tags openwrt -o /dev/null ./cmd/bridge || return 1
+      CGO_ENABLED=1 go test -race -count=1 -timeout 300s ./... || return 1
+      CGO_ENABLED=0 go test -tags openwrt -count=1 -timeout 300s ./...
+    }
+
+    gate_bridge() {
+      local v="${HOME}/.cache/verify-venv/mesh-manager-bridge"
+      uv venv -q --allow-existing -p 3.11 "$v"
+      VIRTUAL_ENV="$v" uv pip install -q -r bridge/requirements-dev.txt flake8 bandit
+      local rc=0
+      echo "--- flake8 (E9,F63,F7,F82) ---"
+      (cd bridge && "$v/bin/flake8" . --count --select=E9,F63,F7,F82 --show-source --statistics) || rc=1
+      echo "--- bandit -ll (production code; a '# nosec' must sit on the line Bandit reports) ---"
+      "$v/bin/bandit" -q -r bridge -x bridge/tests -ll -f txt 2>/dev/null || rc=1
+      echo "--- bridge/tests/unit ---"
+      (cd bridge && "$v/bin/python" -m pytest tests/unit/ -q -p no:cacheprovider --no-cov --maxfail=10) || rc=1
       return "$rc"
     }
-    shard unit-core \
-      tests/core/ tests/unit/core/ tests/unit/models/ tests/unit/middleware/ tests/unit/schemas/ tests/unit/scripts/ \
-      tests/regression/ tests/unit/test_celery_schedule_guard.py tests/unit/test_compose_celery_module_guard.py \
-      tests/unit/test_compose_uat_db_pool.py tests/unit/test_main_smoke.py tests/unit/test_pagination_gh4091.py \
-      tests/unit/test_pytest_configuration.py tests/unit/test_release_please_extra_files_guard.py \
-      tests/unit/test_root_docker_compose_config.py tests/unit/test_security_logging_rate_limit.py \
-      tests/unit/test_security_blocks.py tests/unit/test_alembic_single_head.py \
-      tests/unit/test_add_alert_type_column_migration.py tests/unit/test_add_system_logs_timestamps_migration.py \
-      tests/unit/test_drop_v1_update_tables_migration.py tests/unit/test_gh3171_mqtt_username_partial_unique_migration.py \
-      tests/unit/test_gh4193_backfill_cancelled_commands_migration.py \
-      tests/unit/test_rename_bridge_logs_metadata_migration.py tests/unit/test_nginx_v2_websocket_proxy.py
-    shard unit-api tests/unit/api/ tests/unit/tasks/ tests/unit/test_v2_surface.py
-    shard unit-services tests/services/ tests/unit/services/ tests/unit/test_mosquitto_logging_config.py tests/unit/test_user_service.py
-    # Its own run: together with the other shards, tests/unit/bridge shadows the repository's bridge package
-    shard unit-bridge tests/unit/bridge/ tests/unit/test_issue_6052_bridge_logs_and_tasks.py tests/unit/test_mirror_helper.py
-    rm -f test*.db
+
+    gate_alembic() {
+      backend_env
+      local host="${VERIFY_PG_HOST:-verify-postgres}" db
+      db="verify_$(date +%s)_$$"
+      local admin="postgresql://mesh_user:${VERIFY_PG_PASSWORD:-mesh_test_pass_secure_2024}@${host}:5432/postgres"
+      "$backend_venv/bin/python" - "$admin" "$db" create <<'PY' || { echo "error: no TimescaleDB at the verify-postgres service"; return 1; }
+    import sys, time, psycopg
+    url, db, op = sys.argv[1:]
+    for i in range(30):
+        try:
+            with psycopg.connect(url, autocommit=True, connect_timeout=5) as c:
+                if op == "create": c.execute(f'CREATE DATABASE "{db}"')
+                else: c.execute(f'DROP DATABASE IF EXISTS "{db}" WITH (FORCE)')
+            break
+        except psycopg.OperationalError as e:
+            if i == 29: raise
+            time.sleep(2)
+    PY
+      local rc=0
+      (
+        cd backend
+        export DATABASE_URL="postgresql+asyncpg://mesh_user:${VERIFY_PG_PASSWORD:-mesh_test_pass_secure_2024}@${host}:5432/${db}?ssl=disable"
+        export DATABASE_URL_SYNC="postgresql+psycopg://mesh_user:${VERIFY_PG_PASSWORD:-mesh_test_pass_secure_2024}@${host}:5432/${db}?sslmode=disable"
+        export SECRET_KEY="$SECRET_KEY_CI" ENVIRONMENT=ci
+        unset TESTING SKIP_ENV_VALIDATION
+        "$backend_venv/bin/alembic" heads && "$backend_venv/bin/alembic" upgrade head && "$backend_venv/bin/alembic" check
+      ) || rc=1
+      "$backend_venv/bin/python" - "$admin" "$db" drop <<'PY' || true
+    import sys, psycopg
+    url, db, _ = sys.argv[1:]
+    with psycopg.connect(url, autocommit=True, connect_timeout=5) as c:
+        c.execute(f'DROP DATABASE IF EXISTS "{db}" WITH (FORCE)')
+    PY
+      [ "$rc" -eq 0 ] || echo "error: model/migration parity failed (alembic check): add a migration for the model change, or make the models match the migrations"
+      return "$rc"
+    }
+
+    gate_backend() {
+      backend_env
+      cd backend
+      # No CI markers and no database URL: conftest.py then uses SQLite instead of the CI Postgres service
+      unset CI GITHUB_ACTIONS POSTGRES_AVAILABLE DATABASE_URL DATABASE_URL_SYNC
+      export TESTING=1 SKIP_ENV_VALIDATION=1 BCRYPT_ROUNDS=4
+      local rc=0
+      echo "--- API contract (frontend paths vs backend spec) ---"
+      SECRET_KEY="$SECRET_KEY_CI" DATABASE_URL="sqlite+aiosqlite:///:memory:" ENVIRONMENT=ci PYTHONPATH=. \
+        "$backend_venv/bin/python" ../scripts/ci/check-api-contract.py || rc=1
+      shard() {
+        echo "--- ${1} ---"; shift
+        rm -f test*.db
+        local r=0 s=$SECONDS
+        "$backend_venv/bin/python" -m pytest -q --no-header -p no:cacheprovider --timeout=120 --maxfail=5 "$@" || r=$?
+        echo "--- shard done in $((SECONDS - s))s (exit ${r}) ---"
+        # 5 = no tests collected: a branch older than these test paths, not a failure of the change
+        [ "$r" -eq 5 ] && r=0
+        return "$r"
+      }
+      shard unit-core \
+        tests/core/ tests/unit/core/ tests/unit/models/ tests/unit/middleware/ tests/unit/schemas/ tests/unit/scripts/ \
+        tests/regression/ tests/unit/test_celery_schedule_guard.py tests/unit/test_compose_celery_module_guard.py \
+        tests/unit/test_compose_uat_db_pool.py tests/unit/test_main_smoke.py tests/unit/test_pagination_gh4091.py \
+        tests/unit/test_pytest_configuration.py tests/unit/test_release_please_extra_files_guard.py \
+        tests/unit/test_root_docker_compose_config.py tests/unit/test_security_logging_rate_limit.py \
+        tests/unit/test_security_blocks.py tests/unit/test_alembic_single_head.py \
+        tests/unit/test_add_alert_type_column_migration.py tests/unit/test_add_system_logs_timestamps_migration.py \
+        tests/unit/test_drop_v1_update_tables_migration.py tests/unit/test_gh3171_mqtt_username_partial_unique_migration.py \
+        tests/unit/test_gh4193_backfill_cancelled_commands_migration.py \
+        tests/unit/test_rename_bridge_logs_metadata_migration.py tests/unit/test_nginx_v2_websocket_proxy.py || rc=1
+      shard unit-api tests/unit/api/ tests/unit/tasks/ tests/unit/test_v2_surface.py || rc=1
+      shard unit-services tests/services/ tests/unit/services/ tests/unit/test_mosquitto_logging_config.py tests/unit/test_user_service.py || rc=1
+      # Its own run: together with the other shards, tests/unit/bridge shadows the repository's bridge package
+      shard unit-bridge tests/unit/bridge/ tests/unit/test_issue_6052_bridge_logs_and_tasks.py tests/unit/test_mirror_helper.py || rc=1
+      rm -f test*.db
+      return "$rc"
+    }
+
+    # ---- run
+    echo "=== changed files: $(grep -c . <<<"$CHANGED") (base ${base_ref}) ==="
+    if want base-sync '^backend/alembic/versions/'; then run_gate base-sync gate_base_sync; CHANGED="$(changed)"; else skip_gate base-sync "no new migration"; fi
+    if want guards .; then run_gate guards gate_guards; else skip_gate guards "not selected"; fi
+    if want go '^bridge-go/'; then run_gate go gate_go; else skip_gate go "no change in bridge-go/"; fi
+    if want bridge '^bridge/'; then run_gate bridge gate_bridge; else skip_gate bridge "no change in bridge/"; fi
+    if want alembic '^backend/(alembic/|app/models/|app/core/database|requirements)'; then run_gate alembic gate_alembic; else skip_gate alembic "no migration or model change"; fi
+    if want backend '^backend/|^frontend/src/services/'; then run_gate backend gate_backend; else skip_gate backend "no change in backend/"; fi
+
+    # ---- summary (stdout and ci-gates.md)
+    failed=0
+    {
+      printf '| Gate | Result | Time | Note |\n|---|---|---|---|\n'
+      for i in "${!G_NAME[@]}"; do
+        case "${G_STATUS[$i]}" in pass) icon=':white_check_mark: pass' ;; warn) icon=':warning: repo problem' ;; FAIL) icon=':x: fail'; failed=1 ;; *) icon=':heavy_minus_sign: skipped' ;; esac
+        printf '| %s | %s | %ss | %s |\n' "${G_NAME[$i]}" "$icon" "${G_SECS[$i]}" "$(printf '%s' "${G_NOTE[$i]}" | tr '|' '/')"
+      done
+      printf '\nNot run here (left to the repository CI): real-integration shards, bridge-go integration (MQTT), QEMU/OpenWRT, image builds, smoke, frontend.\n'
+    } > "$GATES_MD"
+    echo "=== CI gates summary ==="
+    cat "$GATES_MD"
+    exit "$failed"
   # Automated review (`@ai review`, pr-review-agent). REVIEW_APPROVE_REPOS: space-separated owner/repo list where the review
   # may APPROVE a pull request (verdict approve, no blocker or major remark, no failed check). Empty by default: with
   # branch protection that counts the App's approval, the factory could otherwise unblock the merge of its own code.
@@ -699,6 +940,7 @@ data:
     set -uo pipefail
     repo="$1"; sha="$2"; out="$3"; lines="${CI_LOG_LINES:-150}"; max_bytes="${CI_REPORT_MAX_BYTES:-60000}"; wait_s="${CI_WAIT_SECONDS:-0}"
     : > "$out"
+    known="/config/ci-known--$(printf '%s' "$repo" | tr '[:upper:]' '[:lower:]' | sed 's|/|--|').txt"
     list_runs() { gh api --paginate "repos/${repo}/commits/${sha}/check-runs?per_page=100" --jq '.check_runs[]' 2>/dev/null | jq -s '.'; }
     runs="$(list_runs)" || { echo "Cannot list check runs of ${sha} (GitHub App needs Checks: read)"; exit 0; }
     while [ "$wait_s" -gt 0 ] && [ "$(printf '%s' "$runs" | jq '[.[] | select(.status != "completed")] | length')" -gt 0 ]; do
@@ -727,11 +969,27 @@ data:
         else
           log="$(jq -r '.output.text // ""' <<<"$run" | tail -n "$lines")"
         fi
+        # Known failures of the repository's own CI (ci-known--<owner>--<repo>.txt): say so, so nobody changes code for them
+        if [ -f "$known" ]; then
+          while IFS=$'\t' read -r pat why; do
+            case "$pat" in ''|'#'*) continue ;; esac
+            if printf '%s\n%s\n' "$(jq -r .name <<<"$run")" "$log" | grep -qiE -- "$pat"; then
+              printf '\n> [!NOTE]\n> Known problem of the repository CI, most likely not caused by this change: %s Do not change code for it; mention it in the reply.\n' "$why"
+            fi
+          done < "$known"
+        fi
         if [ -n "$log" ]; then printf '\nLast lines of the log:\n~~~~text\n%s\n~~~~\n' "$log"; fi
       done <<<"$failed"
       if [ -n "$statuses" ]; then printf '\n### Commit statuses\n%s\n' "$statuses"; fi
     } | head -c "$max_bytes" > "$out"
     echo "CI failures of ${sha}: $(grep -c '^### ' "$out") section(s), $(wc -c < "$out") bytes"
+  # Known failures of a repository's own CI, read by ci-failures.sh: one '<extended regex><TAB><explanation>' per line,
+  # matched (case-insensitive) against the check name and the tail of its log. Key: ci-known--<owner>--<repo>.txt.
+  ci-known--majowka--mesh-manager.txt: |
+    # A PR that changes deployment/ci/Dockerfile.mosquitto-ci builds the image but never pushes it, so the service tag it asks for does not exist
+    mosquitto-ci.*(manifest unknown|not found|pull access denied|failed to resolve)	The mosquitto-ci service image tag of this PR was never pushed (PR builds do not push it; happens when deployment/ci/Dockerfile.mosquitto-ci changes). A maintainer has to push the image or re-run after merge.
+    # real-integration-2 sometimes ends without its JUnit file
+    (junit[^ ]*\.xml.*(not found|no such file|does not exist)|no test report files were found|unable to find.*junit)	The real-integration shard ended without writing its JUnit report (flaky in real-integration-2). Re-run the job.
   # Helpers shared by the requirements scan (CronJob) and the requirements-agent pipeline. Source it; it needs GH_TOKEN and REPO_FULL_NAME.
   requirements-lib.sh: |
     # sha256 of the requirements text: a different value means the issue was edited

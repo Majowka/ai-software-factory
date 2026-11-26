@@ -102,7 +102,7 @@ spec:
         MAX_FIX_ATTEMPTS="${MAX_FIX_ATTEMPTS:-3}"
         SELF_REVIEW_ROUNDS="${SELF_REVIEW_ROUNDS:-1}"
         BUDGET_MINUTES="${VERIFY_BUDGET_MINUTES:-75}"
-        rm -f "$OUT/verify-note.md" "$OUT/verify-failed" "$OUT/self-review.md" "$OUT/regression-check.md" "$OUT/no-auto-merge"
+        rm -f "$OUT/verify-note.md" "$OUT/verify-failed" "$OUT/self-review.md" "$OUT/regression-check.md" "$OUT/no-auto-merge" "$OUT/ci-gates.md"
         # The agent names its regression test here; never committed
         take_regression_file() { if [ -f .agent-regression-test.txt ]; then mv .agent-regression-test.txt "$OUT/regression-test.txt"; fi; }
         take_regression_file
@@ -159,11 +159,19 @@ spec:
         $(cat "$OUT/self-review.md")"
           fi
           last_review_tree="$snapshot"
+          # The CI gates of the verify script (which ran, which were skipped because the change does not touch them)
+          local gates_note=""
+          if [ -s "$OUT/ci-gates.md" ]; then
+            gates_note="The verify script ran these CI gates of the repository (all selected gates passed). Gates marked skipped did not run because the change does not touch their paths; raise one only with a concrete case where the change breaks what a skipped gate or a check listed as not run checks.
+        $(cat "$OUT/ci-gates.md")
+
+        "
+          fi
           rm -f "$OUT/self-review.md"
           echo "=== Self-review round ${round} ($(wc -l < "$diff_file") diff lines) ==="
           REVIEW_PROMPT="You are a senior reviewer. Another engineer made the change below in this repository (the working tree at /workspace/repo has it applied; the diff against the last commit is in ${diff_file}). The build and tests pass: ${cmd}
 
-        Decide whether this change can be merged as it is. A good change gets VERDICT: ok; do not look for something to say. Read the diff, then open the changed code, its callers and its tests; do not run any tests. You have 5 minutes and at most 15 tool calls: write a first version of /workspace/out/self-review.md after your first few reads, then refine it; read whole functions in one go instead of many small slices. Check, in this order:
+        ${gates_note}Decide whether this change can be merged as it is. A good change gets VERDICT: ok; do not look for something to say. Read the diff, then open the changed code, its callers and its tests; do not run any tests. You have 5 minutes and at most 15 tool calls: write a first version of /workspace/out/self-review.md after your first few reads, then refine it; read whole functions in one go instead of many small slices. Check, in this order:
         1. Root cause: does the change fix the cause of the problem described in the task, or only hide a symptom (a retry, a broad try/except, a guard in the wrong layer, an early return)? Follow the failing path through the real code, including other processes or workers that run the same code.
         2. Correctness of the new code: error and rollback paths, transactions and sessions, async/await and threads, None/empty values, existing callers.
         3. Tests: would the new or changed tests fail without the fix? A test that only exercises a mock or a fake of the very thing that broke proves nothing.
@@ -253,7 +261,7 @@ spec:
         while true; do
           echo "=== Verify: ${cmd} (fix attempts used: ${attempt}/${MAX_FIX_ATTEMPTS}) ==="
           build_start=$SECONDS
-          if timeout 20m bash -c "$cmd" > "$LOG" 2>&1; then
+          if timeout "${VERIFY_BUILD_TIMEOUT:-30m}" bash -c "$cmd" > "$LOG" 2>&1; then
             # Section headers and their timings (the verify scripts print them), then the end of the log
             grep -E '^=== ' "$LOG" || true
             echo "=== Build passed in $((SECONDS - build_start))s ==="
