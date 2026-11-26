@@ -149,6 +149,9 @@ data:
     # When an engine's quota is used up (OpenCode Go weekly limit): fallback = run the task on Claude Code until the
     # reset, fail = end the task at once (exit 75). Either way nothing waits for the timeout.
     LLM_QUOTA_ACTION=fallback
+    # Before every OpenCode task, read OpenCode Go's usage windows (5 h, weekly, monthly) from its free usage endpoint
+    # and skip the call when one is used up. false: only the "usage limit reached" message is detected.
+    OPENCODE_USAGE_CHECK=true
   # Runs one agent task with the engine chosen in routing.env: agent-run.sh <task> <timeout> <log file> <prompt>.
   # Returns the engine's exit code (124 on timeout). Credentials come from the environment of the step:
   # OPENCODE_API_KEY (secret opencode-go) and CLAUDE_CODE_OAUTH_TOKEN (secret claude-code-oauth).
@@ -207,7 +210,23 @@ data:
       model="$(pick OPENCODE_MODEL '')"
       variant="$(pick OPENCODE_VARIANT '')"
       used="opencode${model:+ ${model}}"
-      if until="$(llm_engine_blocked opencode)"; then
+      # Free usage endpoint of OpenCode Go (no model call): a window with status other than "ok" (e.g. the weekly one
+      # "rate-limited") blocks the engine until its resetsAt; all windows "ok" means go, even if a Lease says used up.
+      # When the endpoint does not answer, the Lease written by an earlier task decides.
+      local usage st=""
+      if [ "${OPENCODE_USAGE_CHECK:-true}" = true ] && [ -n "${OPENCODE_API_KEY:-}" ] \
+         && usage="$(curl -sf --max-time 10 -H "Authorization: Bearer ${OPENCODE_API_KEY}" "${OPENCODE_USAGE_URL:-https://opencode.ai/zen/go/v1/usage}")"; then
+        st="$(printf '%s' "$usage" | jq -r '[.usage | to_entries[] | select(.value.status != "ok")]
+          | if length == 0 then "ok" else "blocked " + (map(.value.resetsAt | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) | max | tostring)
+            + " " + (map(.key + " " + (.value.percent | tostring) + "%") | join(", ")) end' 2>/dev/null)"
+      fi
+      if [ "${st%% *}" = blocked ]; then
+        until="$(printf '%s' "$st" | cut -d' ' -f2)"
+        echo "OpenCode usage limit used up (${st#blocked * }) until $(date -u -d "@${until}" '+%F %H:%M UTC'): not calling it" | tee -a "$log"
+        llm_engine_block opencode "$until" "usage endpoint: ${st#blocked * }"
+        rc=75; oc_quota=1; return
+      fi
+      if [ "$st" != ok ] && until="$(llm_engine_blocked opencode)"; then
         echo "OpenCode usage limit used up until $(date -u -d "@${until}" '+%F %H:%M UTC'): not calling it" | tee -a "$log"
         rc=75; oc_quota=1; return
       fi
@@ -322,9 +341,11 @@ data:
 
     # _llm_k <method> <path below .../leases> [json body]: prints the HTTP code, the body goes to $_llm_out
     _llm_k() {
-      curl -sS -o "$_llm_out" -w '%{http_code}' -X "$1" --max-time 20 --cacert "$_llm_sa/ca.crt" \
+      local code
+      code="$(curl -sS -o "$_llm_out" -w '%{http_code}' -X "$1" --max-time 20 --cacert "$_llm_sa/ca.crt" \
         -H "Authorization: Bearer $(cat "$_llm_sa/token")" -H 'Content-Type: application/json' \
-        ${3:+--data "$3"} "${_llm_api}/apis/coordination.k8s.io/v1/namespaces/${_llm_ns}/leases$2" 2>/dev/null || echo 000
+        ${3:+--data "$3"} "${_llm_api}/apis/coordination.k8s.io/v1/namespaces/${_llm_ns}/leases$2" 2>/dev/null)"
+      echo "${code:-000}"
     }
 
     # _llm_lease <name> <label key> <engine>: JSON of a new lease held by this process
