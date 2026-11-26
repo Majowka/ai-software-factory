@@ -252,6 +252,16 @@ spec:
           return 0
         }
 
+        # The CI gates table of the verify script (ci-gates.md), for the verify note (PR description and comment)
+        gates_details() {
+          if [ -s "$OUT/ci-gates.md" ]; then
+            printf '\n<details><summary>CI gates (%s)</summary>\n\n' \
+              "$(grep -cE '\| :white_check_mark:' "$OUT/ci-gates.md") passed, $(grep -cE '\| :x:' "$OUT/ci-gates.md") failed, $(grep -cE '\| :warning:' "$OUT/ci-gates.md") repository problem"
+            cat "$OUT/ci-gates.md"
+            printf '\n</details>\n'
+          fi
+        }
+
         deadline=$(( $(date +%s) + BUDGET_MINUTES * 60 ))
         regression_fixes=0
         regression_ok=true
@@ -317,6 +327,7 @@ spec:
               suffix="${suffix}; self-review: ${review_round} round(s), ${review_fixes} fix round(s)"
             fi
             printf ':white_check_mark: Build verification passed (`%s`)%s.\n' "$cmd" "$suffix" > "$OUT/verify-note.md"
+            gates_details >> "$OUT/verify-note.md"
             if [ "$verdict" -ne 0 ] && [ -s "$OUT/self-review.md" ]; then
               {
                 printf '\n:warning: **The last self-review still asks for changes.** Review the code before merging.\n\n'
@@ -371,5 +382,6 @@ spec:
           printf '<details><summary>Last lines of the build log</summary>\n\n```\n'
           tail -n 40 "$LOG"
           printf '```\n\n</details>\n'
+          gates_details
         } > "$OUT/verify-note.md"
         cp "$OUT/verify-note.md" "$OUT/verify-failed"

@@ -82,8 +82,9 @@ data:
       else
         printf 'Build verification did not run (no verify command for this repository).\n'
       fi
-      if [ -s "$out/ci-gates.md" ]; then
-        printf '\n### CI gates (verify)\n\nChecks of the repository CI that the factory ran before opening this PR; skipped gates do not touch the changed paths.\n\n'
+      # The verify note carries the CI gates table (verify-build); older notes without it get it here
+      if [ -s "$out/ci-gates.md" ] && ! grep -q '<summary>CI gates' "$out/verify-note.md" 2>/dev/null; then
+        printf '\n### CI gates (verify)\n\n'
         cap 6000 < "$out/ci-gates.md"; printf '\n'
       fi
       if [ -s "$out/self-review.md" ] && ! grep -q '<summary>Self-review</summary>' "$out/verify-note.md" 2>/dev/null; then
