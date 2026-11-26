@@ -41,6 +41,16 @@ spec:
               value: "6"
             - name: POLL_SECONDS
               value: "10"
+            # Global quota gate: every USAGE_POLL_SECONDS read OpenCode Go's free usage endpoint (no model call) and keep
+            # the Lease llm-block-opencode (annotation ai-factory/until) that agent-run.sh reads before every OpenCode task.
+            - name: USAGE_POLL_SECONDS
+              value: "300"
+            - name: OPENCODE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: opencode-go
+                  key: api-key
+                  optional: true
             - name: HOME
               value: /tmp
             - name: NAMESPACE
@@ -62,10 +72,46 @@ spec:
                 -H "Authorization: Bearer $(cat "$sa/token")" -o "$out" -w '%{http_code}' -X "$method" \
                 "https://kubernetes.default.svc${path}" "$@" 2>/dev/null || echo 000
             }
+            leases_path="/apis/coordination.k8s.io/v1/namespaces/${NAMESPACE}/leases"
+            # Writes the quota gate of an engine: until = epoch (0 = free), reason = text for the logs
+            set_gate() {
+              local name="llm-block-$1" until="$2" reason="$3" code now
+              now="$(date -u +%Y-%m-%dT%H:%M:%S.%6NZ)"
+              code="$(api GET "${leases_path}/${name}" /tmp/gate.json)"
+              if [ "$code" = 404 ]; then
+                [ "$until" = 0 ] && return 0
+                jq -cn --arg n "$name" --arg u "$until" --arg r "$reason" --arg t "$now" \
+                  '{apiVersion:"coordination.k8s.io/v1",kind:"Lease",metadata:{name:$n,annotations:{"ai-factory/until":$u,"ai-factory/reason":$r}},
+                    spec:{holderIdentity:"run-dispatcher",acquireTime:$t,renewTime:$t}}' > /tmp/gate-new.json
+                code="$(api POST "$leases_path" /tmp/gate-out.json -H 'Content-Type: application/json' --data @/tmp/gate-new.json)"
+              elif [ "$code" = 200 ]; then
+                [ "$(jq -r '.metadata.annotations["ai-factory/until"] // ""' /tmp/gate.json)" = "$until" ] && return 0
+                jq -c --arg u "$until" --arg r "$reason" --arg t "$now" '.metadata.annotations["ai-factory/until"] = $u
+                  | .metadata.annotations["ai-factory/reason"] = $r | .spec.renewTime = $t' /tmp/gate.json > /tmp/gate-new.json
+                code="$(api PUT "${leases_path}/${name}" /tmp/gate-out.json -H 'Content-Type: application/json' --data @/tmp/gate-new.json)"
+              fi
+              case "$code" in
+                200|201) if [ "$until" = 0 ]; then echo "$(date -u +%FT%TZ) $1 quota gate open (${reason})"
+                         else echo "$(date -u +%FT%TZ) $1 quota gate closed until $(date -u -d "@${until}" '+%F %H:%M UTC') (${reason})"; fi ;;
+                *) echo "could not write the $1 quota gate (HTTP ${code})" >&2 ;;
+              esac
+            }
+            check_opencode_usage() {
+              local st
+              [ -n "${OPENCODE_API_KEY:-}" ] || return 0
+              curl -sf --max-time 15 -H "Authorization: Bearer ${OPENCODE_API_KEY}" -o /tmp/usage.json \
+                "${OPENCODE_USAGE_URL:-https://opencode.ai/zen/go/v1/usage}" || { echo "OpenCode usage endpoint did not answer" >&2; return 0; }
+              # Every window "ok": gate open; otherwise closed until the latest resetsAt of the used-up windows
+              st="$(jq -r '[.usage | to_entries[] | select(.value.status != "ok")]
+                | if length == 0 then "0 ok" else (map(.value.resetsAt | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) | max | tostring)
+                  + " " + (map(.key + " " + (.value.percent | tostring) + "% " + .value.status) | join(", ")) end' /tmp/usage.json 2>/dev/null)" || return 0
+              [ -n "$st" ] && set_gate opencode "${st%% *}" "usage endpoint: ${st#* }"
+            }
             echo "run-dispatcher: at most ${MAX_ACTIVE} active runs, FIFO"
-            last=""
+            last=""; usage_at=0
             while :; do
               sleep "$POLL_SECONDS"
+              if [ $(( $(date +%s) - usage_at )) -ge "$USAGE_POLL_SECONDS" ]; then usage_at="$(date +%s)"; check_opencode_usage; fi
               # Only what is needed from each run (a run carries its whole pipeline spec), read in pages
               : > /tmp/runs.jsonl; cont=""; ok=1
               while :; do

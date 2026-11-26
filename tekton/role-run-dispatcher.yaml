@@ -12,3 +12,12 @@ rules:
       - list
       - patch
       - delete
+  # Quota gate Leases (llm-block-<engine>) read by agent-run.sh
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - get
+      - create
+      - update

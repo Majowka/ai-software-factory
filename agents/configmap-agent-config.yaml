@@ -146,6 +146,9 @@ data:
     # On HTTP 429 / overload from the provider: how many times a task runs again, and the first wait in seconds (doubles)
     LLM_RATE_RETRIES=4
     LLM_RATE_BACKOFF=30
+    # When an engine's quota is used up (OpenCode Go weekly limit): fallback = run the task on Claude Code until the
+    # reset, fail = end the task at once (exit 75). Either way nothing waits for the timeout.
+    LLM_QUOTA_ACTION=fallback
   # Runs one agent task with the engine chosen in routing.env: agent-run.sh <task> <timeout> <log file> <prompt>.
   # Returns the engine's exit code (124 on timeout). Credentials come from the environment of the step:
   # OPENCODE_API_KEY (secret opencode-go) and CLAUDE_CODE_OAUTH_TOKEN (secret claude-code-oauth).
@@ -177,25 +180,70 @@ data:
     # At most LLM_SLOTS_<ENGINE> tasks talk to one engine at a time; the rest wait in a FIFO queue (llm-slot.sh).
     # Waiting in the queue does not count against the task's timeout.
     llm_slot_acquire() { :; }; llm_slot_release() { :; }
-    [ -f /config/llm-slot.sh ] && source /config/llm-slot.sh
     # Seconds of a timeout(1) duration: 90, 90s, 15m, 3h, 1d
     secs() { local n="${1%[smhd]}"; case "$1" in *m) echo $((n * 60));; *h) echo $((n * 3600));; *d) echo $((n * 86400));; *) echo "$n";; esac; }
     # Provider rate limit / overload in the engine's output: the task waits and runs again (LLM_RATE_RETRIES times,
     # backoff LLM_RATE_BACKOFF seconds doubled each time, plus jitter), within the task's own time limit.
     rate_re='(HTTP|status|error|code)[^0-9]{0,20}429|too many requests|rate[ _-]?limit|overloaded|(HTTP|status|error|code)[^0-9]{0,20}529'
+    # Used-up provider quota (OpenCode Go: "usage limit reached (weekly, resets in 3d 15h)"), unlike a rate limit, does
+    # not pass by waiting: opencode writes it only to its own log and then sits idle until the timeout. A watcher ends
+    # the task at once, the engine is marked used up until the reset for all runs (Lease llm-block-<engine>, llm-slot.sh)
+    # and, with LLM_QUOTA_ACTION=fallback, the task runs on Claude Code instead; with =fail it ends with exit 75.
+    quota_re='usage limit reached|turn on extra usage|upgrade to go plus|insufficient (balance|credits?)|quota (exceeded|exhausted)'
+    llm_engine_blocked() { return 1; }; llm_engine_block() { :; }
+    [ -f /config/llm-slot.sh ] && source /config/llm-slot.sh
+    # Seconds until the reset named in a quota message ("resets in 3d 15h", "resets in 45m"), default 1 h
+    reset_secs() {
+      local part n total=0
+      for part in $(printf '%s' "$1" | grep -oiE 'resets? in( [0-9]+ ?[dhms])+' | grep -oE '[0-9]+ ?[dhms]' | tr -d ' '); do
+        n="${part%[dhms]}"
+        case "$part" in *d) total=$((total + n * 86400));; *h) total=$((total + n * 3600));; *m) total=$((total + n * 60));; *s) total=$((total + n));; esac
+      done
+      [ "$total" -gt 0 ] && echo "$total" || echo 3600
+    }
+    oc_quota=""; claude_tried=""
     run_opencode() { # $1: note for the header
-      local model variant attempt=0 out deadline left wait
+      local model variant attempt=0 out deadline left wait until marker wpid msg ocl
       model="$(pick OPENCODE_MODEL '')"
       variant="$(pick OPENCODE_VARIANT '')"
+      used="opencode${model:+ ${model}}"
+      # Quota gate kept by run-dispatcher from OpenCode Go's usage endpoint (and by earlier tasks that hit the limit)
+      if until="$(llm_engine_blocked opencode)"; then
+        echo "OpenCode usage limit used up until $(date -u -d "@${until}" '+%F %H:%M UTC'): not calling it" | tee -a "$log"
+        rc=75; oc_quota=1; return
+      fi
       llm_slot_acquire opencode "$log"
       deadline=$(( $(date +%s) + $(secs "$limit") ))
+      ocl="${XDG_DATA_HOME:-$HOME/.local/share}/opencode/log"
       while :; do
         echo "=== ${task}: opencode ${model}${variant:+ (variant ${variant})}${1:+ $1}$([ "$attempt" -gt 0 ] && echo " (retry ${attempt})") ===" | tee -a "$log"
         left=$(( deadline - $(date +%s) )); [ "$left" -gt 0 ] || left=1
-        out="$(mktemp)"
+        out="$(mktemp)"; marker="$(mktemp)"
+        # Watch opencode's own log (written only by this run: files newer than the marker) for a used-up quota
+        ( while sleep 10; do
+            msg="$(find "$ocl" -type f -newer "$marker" -exec grep -hiE "$quota_re" {} + 2>/dev/null | tail -n1)"
+            if [ -n "$msg" ]; then
+              printf '%s\n' "$msg" > "${marker}.quota"
+              # The `timeout` around opencode passes the TERM on (no pkill needed: procps may be missing)
+              for pid in /proc/[0-9]*; do
+                tr '\0' ' ' < "$pid/cmdline" 2>/dev/null | grep -qE '^timeout [0-9]+ opencode run' && kill -TERM "${pid#/proc/}" 2>/dev/null
+              done
+              break
+            fi
+          done ) & wpid=$!
         OPENCODE_CONFIG=/config/opencode.json timeout "$left" opencode run ${model:+-m "$model"} ${variant:+--variant "$variant"} \
           "$prompt" 2>&1 | tee -a "$log" "$out"
         rc=${PIPESTATUS[0]}
+        kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
+        msg="$(cat "${marker}.quota" 2>/dev/null)"
+        [ -n "$msg" ] || msg="$(grep -iE "$quota_re" "$out" | tail -n1)"
+        rm -f "$marker" "${marker}.quota"
+        if [ -n "$msg" ]; then
+          until=$(( $(date +%s) + $(reset_secs "$msg") ))
+          echo "OpenCode usage limit reached (${msg##*AI_APICallError: }): marked used up until $(date -u -d "@${until}" '+%F %H:%M UTC')" | tee -a "$log"
+          llm_engine_block opencode "$until" "$msg"
+          rc=75; oc_quota=1; rm -f "$out"; break
+        fi
         if [ "$rc" -ne 124 ] && { [ "$rc" -ne 0 ] || [ "$(wc -c < "$out")" -lt 500 ]; } && grep -qiE "$rate_re" "$out" \
            && [ "$attempt" -lt "${LLM_RATE_RETRIES:-4}" ]; then
           attempt=$((attempt + 1))
@@ -208,7 +256,27 @@ data:
         rm -f "$out"; break
       done
       llm_slot_release
-      used="opencode${model:+ ${model}}"
+    }
+    run_claude() { # $1: note for the header
+      local model out
+      model="$(pick CLAUDE_MODEL sonnet)"
+      claude_tried=1
+      llm_slot_acquire claude "$log"
+      echo "=== ${task}: claude ${model}${bug:+ (bug)}${1:+ $1} ===" | tee -a "$log"
+      out="$(mktemp)"
+      timeout "$limit" claude -p "$prompt" --model "$model" --settings /config/claude-settings.json \
+        --output-format text 2>&1 | tee -a "$log" "$out"
+      rc=${PIPESTATUS[0]}
+      llm_slot_release
+      used="claude ${model}"
+      # Usage / rate limit of the subscription, overloaded API, refused token: the run goes on with OpenCode
+      # (unless this already is the fallback from OpenCode).
+      limit_re='usage limit|rate[ _-]?limit|limit reached|hit your limit|limit will reset|API Error: (401|403|429|529)|overloaded|authentication_error|invalid (api key|bearer token)|OAuth token (has )?(expired|revoked)|credit balance'
+      if [ -z "$1" ] && [ "$rc" -ne 124 ] && { [ "$rc" -ne 0 ] || [ "$(wc -c < "$out")" -lt 500 ]; } && grep -qiE "$limit_re" "$out"; then
+        echo "Claude Code hit a usage/rate limit or was refused (exit ${rc}): falling back to OpenCode" | tee -a "$log"
+        run_opencode "(fallback from claude)"
+      fi
+      rm -f "$out"
     }
     case "$engine" in
       opencode)
@@ -218,26 +286,16 @@ data:
           echo "No CLAUDE_CODE_OAUTH_TOKEN (secret claude-code-oauth): falling back to OpenCode" | tee -a "$log"
           run_opencode "(fallback from claude: no token)"
         else
-          model="$(pick CLAUDE_MODEL sonnet)"
-          llm_slot_acquire claude "$log"
-          echo "=== ${task}: claude ${model}${bug:+ (bug)} ===" | tee -a "$log"
-          out="$(mktemp)"
-          timeout "$limit" claude -p "$prompt" --model "$model" --settings /config/claude-settings.json \
-            --output-format text 2>&1 | tee -a "$log" "$out"
-          rc=${PIPESTATUS[0]}
-          llm_slot_release
-          used="claude ${model}"
-          # Usage / rate limit of the subscription, overloaded API, refused token: the run goes on with OpenCode.
-          limit_re='usage limit|rate[ _-]?limit|limit reached|hit your limit|limit will reset|API Error: (401|403|429|529)|overloaded|authentication_error|invalid (api key|bearer token)|OAuth token (has )?(expired|revoked)|credit balance'
-          if [ "$rc" -ne 124 ] && { [ "$rc" -ne 0 ] || [ "$(wc -c < "$out")" -lt 500 ]; } && grep -qiE "$limit_re" "$out"; then
-            echo "Claude Code hit a usage/rate limit or was refused (exit ${rc}): falling back to OpenCode" | tee -a "$log"
-            run_opencode "(fallback from claude)"
-          fi
-          rm -f "$out"
+          run_claude ""
         fi ;;
       *)
         echo "Unknown engine '${engine}' for task ${task} (routing.env)" | tee -a "$log"; rc=2 ;;
     esac
+    if [ -n "$oc_quota" ] && [ -z "${claude_tried:-}" ] && [ "${LLM_QUOTA_ACTION:-fallback}" = fallback ] && [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] \
+       && [ "${used%% *}" = opencode ]; then
+      echo "OpenCode quota used up: running ${task} on Claude Code" | tee -a "$log"
+      run_claude "(fallback from opencode: usage limit)"
+    fi
     [ "$rc" -eq 0 ] || echo "${engine} exited with ${rc} (timeout or error)" | tee -a "$log"
     # Engine that actually ran each task (after a fallback too), for the pull request description
     if [ -n "${used:-}" ] && [ -d /workspace/out ]; then
@@ -265,9 +323,11 @@ data:
 
     # _llm_k <method> <path below .../leases> [json body]: prints the HTTP code, the body goes to $_llm_out
     _llm_k() {
-      curl -sS -o "$_llm_out" -w '%{http_code}' -X "$1" --max-time 20 --cacert "$_llm_sa/ca.crt" \
+      local code
+      code="$(curl -sS -o "$_llm_out" -w '%{http_code}' -X "$1" --max-time 20 --cacert "$_llm_sa/ca.crt" \
         -H "Authorization: Bearer $(cat "$_llm_sa/token")" -H 'Content-Type: application/json' \
-        ${3:+--data "$3"} "${_llm_api}/apis/coordination.k8s.io/v1/namespaces/${_llm_ns}/leases$2" 2>/dev/null || echo 000
+        ${3:+--data "$3"} "${_llm_api}/apis/coordination.k8s.io/v1/namespaces/${_llm_ns}/leases$2" 2>/dev/null)"
+      echo "${code:-000}"
     }
 
     # _llm_lease <name> <label key> <engine>: JSON of a new lease held by this process
@@ -370,6 +430,35 @@ data:
       done
     }
 
+    # Used-up quota of an engine, shared by all runs: Lease llm-block-<engine> with annotation ai-factory/until (epoch).
+    _llm_init() {
+      [ -r "$_llm_sa/token" ] && command -v jq >/dev/null || return 1
+      _llm_ns="$(cat "$_llm_sa/namespace")"; _llm_id="${_llm_id:-${HOSTNAME:-$(hostname)}-$$}"
+      _llm_out="${_llm_out:-$(mktemp)}"
+    }
+    # llm_engine_blocked <engine>: prints the epoch until which the engine is used up and returns 0, else returns 1
+    llm_engine_blocked() {
+      local until
+      _llm_init || return 1
+      [ "$(_llm_k GET "/llm-block-$1")" = 200 ] || return 1
+      until="$(jq -r '.metadata.annotations["ai-factory/until"] // "0"' "$_llm_out")"
+      [ "$until" -gt "$(date +%s)" ] 2>/dev/null || return 1
+      echo "$until"
+    }
+    # llm_engine_block <engine> <until epoch> <reason>
+    llm_engine_block() {
+      local name="llm-block-$1" body code
+      _llm_init || return 0
+      body="$(jq -cn --arg n "$name" --arg u "$2" --arg r "${3:0:250}" --arg id "$_llm_id" --arg t "$(_llm_now)" \
+        '{apiVersion:"coordination.k8s.io/v1",kind:"Lease",metadata:{name:$n,annotations:{"ai-factory/until":$u,"ai-factory/reason":$r}},
+          spec:{holderIdentity:$id,acquireTime:$t,renewTime:$t}}')"
+      code="$(_llm_k POST "" "$body")"
+      if [ "$code" = 409 ] && [ "$(_llm_k GET "/$name")" = 200 ]; then
+        _llm_k PUT "/$name" "$(jq -c --arg u "$2" --arg r "${3:0:250}" \
+          '.metadata.annotations["ai-factory/until"] = $u | .metadata.annotations["ai-factory/reason"] = $r' "$_llm_out")" >/dev/null
+      fi
+      return 0
+    }
     llm_slot_release() {
       local name
       [ -n "$_llm_hb_pid" ] && { kill "$_llm_hb_pid" 2>/dev/null; wait "$_llm_hb_pid" 2>/dev/null; _llm_hb_pid=""; }

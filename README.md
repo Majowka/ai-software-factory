@@ -750,6 +750,15 @@ busy runs spend half their time waiting. When OpenCode still exits on the provid
 the task again up to `LLM_RATE_RETRIES` (4) times, waiting `LLM_RATE_BACKOFF` (30) seconds, doubled every time, plus
 jitter, as long as the task's time limit allows. All these values are in `routing.env`.
 
+A used-up quota is different: OpenCode Go answers "usage limit reached (weekly, resets in 3d 15h)", writes it only
+to its own log and then sits idle until the task's timeout. `agent-run.sh` watches that log, ends the task at once and
+marks the engine used up until the reset for every run (Lease `llm-block-opencode`, annotation `ai-factory/until`;
+delete the Lease to try again earlier). The same Lease is the global quota gate: `run-dispatcher`
+reads OpenCode Go's free usage endpoint every `USAGE_POLL_SECONDS` (300; `GET https://opencode.ai/zen/go/v1/usage`, no
+model call) and closes the gate until the latest `resetsAt` when a 5 h, weekly or monthly window is not `ok`, or opens it
+when all are `ok`, so tasks only read the Lease and nobody has to hit the limit first. With `LLM_QUOTA_ACTION=fallback` the task, and every OpenCode task until the
+reset, runs on Claude Code instead; with `fail` it ends with exit 75.
+
 ## 7. Connect GitHub to the cluster
 
 The public URL of the listener is the host of the Ingress (k3s) or the Route (OpenShift):
