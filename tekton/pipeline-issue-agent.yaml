@@ -213,7 +213,7 @@ spec:
               GH_TOKEN="$(bash /config/gh-app-token.sh)"
               export GH_TOKEN
               gh auth setup-git
-              # Labels of the issue / PR: engine:<opencode|claude> or engine-<task>:<engine> override routing.env (agent-run.sh)
+              # Labels of the issue / PR: engine:<opencode|claude|gemini> or engine-<task>:<engine> override routing.env (agent-run.sh)
               gh issue view "$ISSUE_NUMBER" --repo "$REPO_FULL_NAME" --json labels -q '.labels[].name' > /workspace/agent-labels || true
               # Short-lived token (1h) handed to the plan step; the GitHub App key stays in this step
               ( umask 077; printf '%s' "$GH_TOKEN" > /workspace/gh-token )
@@ -262,6 +262,12 @@ spec:
                     name: claude-code-oauth
                     key: token
                     optional: true
+              - name: GEMINI_OAUTH_CREDS
+                valueFrom:
+                  secretKeyRef:
+                    name: gemini-oauth
+                    key: oauth_creds.json
+                    optional: true
             script: |
               #!/usr/bin/env bash
               set -euo pipefail
@@ -297,7 +303,7 @@ spec:
               git reset -q --hard
               git clean -qfd
 
-          # Agent run. No GitHub credentials in this step; committing, pushing and gh are denied in opencode.json and claude-settings.json.
+          # Agent run. No GitHub credentials in this step; committing, pushing and gh are denied in opencode.json, claude-settings.json and gemini-policy.toml.
           - name: agent
             image: ghcr.io/majowka/factory-agent:latest
             workingDir: /workspace
@@ -326,6 +332,12 @@ spec:
                   secretKeyRef:
                     name: claude-code-oauth
                     key: token
+                    optional: true
+              - name: GEMINI_OAUTH_CREDS
+                valueFrom:
+                  secretKeyRef:
+                    name: gemini-oauth
+                    key: oauth_creds.json
                     optional: true
             script: |
               #!/usr/bin/env bash

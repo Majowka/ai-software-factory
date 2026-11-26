@@ -1,4 +1,4 @@
-# Agent image for the pipelines: OpenCode and Claude Code, gh, JDK, Maven, Python 3.13 + uv, Go, language servers,
+# Agent image for the pipelines: OpenCode, Claude Code and Gemini CLI, gh, JDK, Maven, Python 3.13 + uv, Go, language servers,
 # skaffold and kubectl.
 # One image for every repository the factory works on (Java/Maven, Python, Go, Node).
 # Built and pushed to ghcr.io/majowka/factory-agent by .github/workflows/agent-image.yml.
@@ -18,8 +18,11 @@ USER 0
 RUN dnf install -y git jq tar gzip gcc glibc-devel \
     && dnf clean all
 
-# Both agent engines; agent-run.sh (ConfigMap agent-config) picks one per task
-RUN npm install -g opencode-ai @anthropic-ai/claude-code
+# The agent engines; agent-run.sh (ConfigMap agent-config) picks one per task.
+# Gemini CLI is pinned: agent-run.sh reads its quota messages and run-dispatcher its OAuth client.
+ARG GEMINI_CLI_VERSION=0.71.1
+RUN npm install -g opencode-ai @anthropic-ai/claude-code "@google/gemini-cli@${GEMINI_CLI_VERSION}" \
+    && gemini --version
 
 # GitHub CLI z oficjalnego archiwum
 ARG GH_VERSION=2.83.2

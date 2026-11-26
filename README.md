@@ -265,6 +265,7 @@ kubectl create secret generic github-app -n agents \
 kubectl create secret generic github-webhook-secret -n agents --from-literal=secret=<WEBHOOK_SECRET>
 kubectl create secret generic opencode-go -n agents --from-literal=api-key=<OPENCODE_GO_API_KEY>
 kubectl create secret generic claude-code-oauth -n agents --from-literal=token=<CLAUDE_CODE_OAUTH_TOKEN>
+kubectl create secret generic gemini-oauth -n agents --from-file=oauth_creds.json=<path to ~/.gemini/oauth_creds.json>
 ```
 
 Create the model secret of every engine you route tasks to; the keys are optional in the pods, so an
@@ -277,6 +278,12 @@ engine without its secret only fails when a task is actually sent to it.
   Enterprise); it is not stored anywhere else. The token shares the usage limits of that subscription,
   so parallel agent runs count against your own Claude usage. For heavy use an API key
   (`ANTHROPIC_API_KEY`) is the alternative. Put a reminder in your calendar before the token expires.
+- **Gemini CLI login**: run `npx @google/gemini-cli` once on your own machine, choose *Sign in with Google* with the
+  account that has the Google AI Pro (or Ultra) subscription and send one prompt. The login is then in
+  `~/.gemini/oauth_creds.json` (Windows: `%USERPROFILE%\.gemini\oauth_creds.json`); that file is the secret. It holds a
+  refresh token, so it stays valid until you sign out, change the password or revoke access in the Google account.
+  Every run copies it to its own `$HOME` and Gemini CLI refreshes the access token there. The runs share the account's
+  daily Gemini CLI quota with your own use of Gemini CLI and Gemini Code Assist.
 
 **Private images.** If the agent image or the skills artifact is private, create a pull secret and
 attach it to the `pipeline` service account:
@@ -294,7 +301,7 @@ kubectl patch serviceaccount pipeline -n agents -p '{"imagePullSecrets":[{"name"
 The pipelines use `ghcr.io/majowka/factory-agent:latest`, built from [`agents/Dockerfile`](agents/Dockerfile)
 by the `agent-image` GitHub Actions workflow. Every build is tagged with its commit SHA; `latest` is
 only pushed from `master`. The image runs in the `prepare`, `plan`, `agent`, `verify` and `publish`
-steps and contains both agent engines (OpenCode and Claude Code), the GitHub CLI, a JDK, Maven,
+steps and contains the agent engines (OpenCode, Claude Code and Gemini CLI), the GitHub CLI, a JDK, Maven,
 `skaffold` and `kubectl`.
 
 To test a branch before it is merged, point the pipelines at the SHA tag of its build:
@@ -358,11 +365,12 @@ mounted at `/config`:
 
 | Key | Purpose |
 |---|---|
-| `routing.env` | Which engine (`opencode` or `claude`) runs which task, and the model of each engine. |
+| `routing.env` | Which engine (`opencode`, `claude` or `gemini`) runs which task, the model of each engine and the fallback chains. |
 | `agent-run.sh` | Runs one task with the chosen engine: `agent-run.sh <task> <timeout> <log> <prompt>`. Every agent call in the pipelines goes through it. |
-| `agent-home.sh` | Installs the fetched skills for both engines. |
+| `agent-home.sh` | Installs the fetched skills for all engines. |
 | `opencode.json` | OpenCode permissions and the OpenCode Go provider (key from `OPENCODE_API_KEY`). |
 | `claude-settings.json` | Claude Code permissions, the same rules as `opencode.json`. |
+| `gemini-settings.json`, `gemini-policy.toml` | Gemini CLI settings (Google account login) and its policy, the same rules as `opencode.json`. |
 | `gh-app-token.sh` | Mints a GitHub App installation token (valid 1h). |
 | `ci-failures.sh` | Failed checks of a commit with their log tails, as Markdown (section 6.10). |
 | `requirements-lib.sh` | Helpers of the requirements scan and the requirements agent. |
@@ -372,26 +380,37 @@ mounted at `/config`:
 | Task | Where | Default engine |
 |---|---|---|
 | `PLAN` | `plan` step of the three event pipelines | `claude` (`opus`) |
-| `IMPLEMENT` | `agent` step of the three event pipelines | `opencode`; `claude` (`sonnet`) for bug issues |
-| `FIX` | build-fix attempts and self-review fixes in `verify-build` | `opencode` |
-| `CI_FIX` | `agent` step of `pr-comment-agent` started by a failed CI check (section 6.10) | `opencode` |
-| `REQUIREMENTS` | `analyze` step of the requirements agent | `opencode` |
+| `IMPLEMENT` | `agent` step of the three event pipelines | `gemini`; `claude` (`sonnet`) for bug issues |
+| `FIX` | build-fix attempts and self-review fixes in `verify-build` | `gemini` |
+| `CI_FIX` | `agent` step of `pr-comment-agent` started by a failed CI check (section 6.10) | `gemini` |
+| `REQUIREMENTS` | `analyze` step of the requirements agent | `gemini` |
 | `REVIEW` | `pr-review-agent` and the self-review in `verify-build` | `opencode` |
 
 ```bash
-AGENT_ENGINE_DEFAULT=opencode
+AGENT_ENGINE_DEFAULT=gemini
 AGENT_ENGINE_PLAN=claude
-AGENT_ENGINE_IMPLEMENT=opencode
+AGENT_ENGINE_IMPLEMENT=gemini
 AGENT_ENGINE_IMPLEMENT_BUG=claude       # bug issues (labels as in regression-test.sh): <VAR>_<TASK>_BUG first
+AGENT_ENGINE_REVIEW=opencode            # not the engine that wrote the code
+LLM_FALLBACK_GEMINI="opencode claude"   # next engines when one cannot take the task
+LLM_FALLBACK_OPENCODE="gemini claude"
+LLM_FALLBACK_CLAUDE="gemini opencode"
 OPENCODE_MODEL=opencode-go/deepseek-v4.1-flash # per task: OPENCODE_MODEL_<TASK>
 CLAUDE_MODEL=sonnet                     # per task: CLAUDE_MODEL_<TASK>
 CLAUDE_MODEL_PLAN=opus
+GEMINI_MODEL=                           # empty = Gemini CLI's auto (Pro or Flash per request); per task: GEMINI_MODEL_<TASK>
+GEMINI_MODEL_PLAN=pro
 ```
 
-**Fallback.** A task routed to `claude` runs on OpenCode instead when the `claude-code-oauth` secret is missing, or
-when Claude Code fails on the subscription's usage or rate limit, an overloaded API or a refused token (several runs
-share one subscription). The log then shows `falling back to OpenCode` and a second header
-`=== IMPLEMENT: opencode ... (fallback from claude) ===`. A timeout or any other error does not fall back.
+Gemini goes first for most tasks because its quota is daily and lost when unused, while OpenCode Go's is weekly:
+Gemini takes the work until its daily quota runs out, then OpenCode, then Claude.
+
+**Fallback.** A task goes on with the next engine of `LLM_FALLBACK_<ENGINE>` when its engine has no secret in the
+step, its quota is used up (OpenCode Go weekly limit, Gemini daily quota; also when the quota gate below is closed),
+Claude Code fails on the subscription's usage or rate limit, an overloaded API or a refused token, or Gemini CLI
+refuses the Google login (exit 41). Engines already tried for the task are skipped. The log then shows
+`Going on with opencode after gemini` and a second header `=== IMPLEMENT: opencode ... (fallback from gemini) ===`.
+A timeout or any other error does not fall back.
 
 To move a task to the other engine, change its line and `kubectl apply -k agents`; the next run uses it.
 
@@ -738,12 +757,13 @@ requests and ci-fix runs are never folded. Without the dispatcher, new runs
 stay pending; to start one by hand: `kubectl patch pipelinerun <name> -n <namespace> --type merge -p '{"spec":{"status":null}}'`.
 
 **LLM calls.** Every agent task goes through `agent-run.sh`, which first takes a slot of its engine (`llm-slot.sh`):
-at most `LLM_SLOTS_OPENCODE` (8) tasks talk to OpenCode and `LLM_SLOTS_CLAUDE` (3) to Claude Code at the same time,
+at most `LLM_SLOTS_OPENCODE` (8) tasks talk to OpenCode, `LLM_SLOTS_CLAUDE` (3) to Claude Code and
+`LLM_SLOTS_GEMINI` (4) to Gemini CLI at the same time,
 across all runs. The others wait in arrival order (FIFO) and say so in their log every minute. Slots and the queue
 are `Lease` objects in the namespace (`llm-slot-<engine>-<i>`, `llm-q-<engine>-...`, Role `llm-slots` for the
 `pipeline` service account); a step renews its lease every 20 s, so a slot of a pod that died comes free after 90 s.
 Waiting does not count against the task's own time limit. When the API cannot be used, the task runs without a slot.
-A Claude task that falls back to OpenCode gives its Claude slot back and queues for an OpenCode one.
+A task that falls back to another engine gives its slot back and queues for one of the next engine.
 
 OpenCode retries a 429 by itself (it shows only in `$HOME/.local/share/opencode/log/`), which made tasks of
 busy runs spend half their time waiting. When OpenCode still exits on the provider's rate limit (HTTP 429, too many requests, overloaded), `agent-run.sh` runs
@@ -757,7 +777,12 @@ delete the Lease to try again earlier). The same Lease is the global quota gate:
 reads OpenCode Go's free usage endpoint every `USAGE_POLL_SECONDS` (300; `GET https://opencode.ai/zen/go/v1/usage`, no
 model call) and closes the gate until the latest `resetsAt` when a 5 h, weekly or monthly window is not `ok`, or opens it
 when all are `ok`, so tasks only read the Lease and nobody has to hit the limit first. With `LLM_QUOTA_ACTION=fallback` the task, and every OpenCode task until the
-reset, runs on Claude Code instead; with `fail` it ends with exit 75.
+reset, runs on the next engine of `LLM_FALLBACK_OPENCODE` instead; with `fail` it ends with exit 75.
+
+Gemini CLI ends at once on a used-up daily quota ("You have exhausted your capacity on this model. Your quota will
+reset after 7h12m3s."); `agent-run.sh` closes the Lease `llm-block-gemini` until that reset (without a time: the next
+midnight Pacific time, when Google resets the daily quota) and the task goes on with `LLM_FALLBACK_GEMINI`. A short 429
+or "no capacity available" (Google's servers, not the quota) is retried like OpenCode's rate limit.
 
 ## 7. Connect GitHub to the cluster
 
