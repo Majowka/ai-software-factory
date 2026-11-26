@@ -753,9 +753,10 @@ jitter, as long as the task's time limit allows. All these values are in `routin
 A used-up quota is different: OpenCode Go answers "usage limit reached (weekly, resets in 3d 15h)", writes it only
 to its own log and then sits idle until the task's timeout. `agent-run.sh` watches that log, ends the task at once and
 marks the engine used up until the reset for every run (Lease `llm-block-opencode`, annotation `ai-factory/until`;
-delete the Lease to try again earlier). Before that happens, every OpenCode task first reads OpenCode Go's free usage
-endpoint (`GET https://opencode.ai/zen/go/v1/usage`, no model call): a 5 h, weekly or monthly window that is not `ok`
-blocks the engine until its `resetsAt` (`OPENCODE_USAGE_CHECK=false` turns this off). With `LLM_QUOTA_ACTION=fallback` the task, and every OpenCode task until the
+delete the Lease to try again earlier). The same Lease is the global quota gate: `run-dispatcher`
+reads OpenCode Go's free usage endpoint every `USAGE_POLL_SECONDS` (300; `GET https://opencode.ai/zen/go/v1/usage`, no
+model call) and closes the gate until the latest `resetsAt` when a 5 h, weekly or monthly window is not `ok`, or opens it
+when all are `ok`, so tasks only read the Lease and nobody has to hit the limit first. With `LLM_QUOTA_ACTION=fallback` the task, and every OpenCode task until the
 reset, runs on Claude Code instead; with `fail` it ends with exit 75.
 
 ## 7. Connect GitHub to the cluster
