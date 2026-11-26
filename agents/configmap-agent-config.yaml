@@ -690,7 +690,16 @@ data:
       # No CI markers and no database URL: conftest.py then uses SQLite instead of the CI Postgres service
       unset CI GITHUB_ACTIONS POSTGRES_AVAILABLE DATABASE_URL DATABASE_URL_SYNC
       export TESTING=1 SKIP_ENV_VALIDATION=1 BCRYPT_ROUNDS=4
-      local rc=0
+      local rc=0 deselect=() t nb
+      # A base branch that is already forked (several Alembic heads) fails test_alembic_single_head for every change: not
+      # this change's fault, so that one test is left out (the base-sync gate checks that the change adds no head)
+      t="$(mktemp -d)"
+      git -C "$ROOT" archive "$( [ "$base_ref" = "$upstream" ] && echo HEAD || echo "$base_ref")" backend/alembic/versions | tar -x -C "$t"
+      nb="$(alembic_heads "$t/backend/alembic/versions" | grep -c .)"; rm -rf "$t"
+      if [ "$nb" -gt 1 ]; then
+        echo "warning: ${base_ref} has ${nb} Alembic heads (repository problem); test_alembic_single_head left out"
+        deselect=(--deselect tests/unit/test_alembic_single_head.py::test_alembic_has_single_head)
+      fi
       echo "--- API contract (frontend paths vs backend spec) ---"
       SECRET_KEY="$SECRET_KEY_CI" DATABASE_URL="sqlite+aiosqlite:///:memory:" ENVIRONMENT=ci PYTHONPATH=. \
         "$backend_venv/bin/python" ../scripts/ci/check-api-contract.py || rc=1
@@ -698,7 +707,7 @@ data:
         echo "--- ${1} ---"; shift
         rm -f test*.db
         local r=0 s=$SECONDS
-        "$backend_venv/bin/python" -m pytest -q --no-header -p no:cacheprovider --timeout=120 --maxfail=5 "$@" || r=$?
+        "$backend_venv/bin/python" -m pytest -q --no-header -p no:cacheprovider --timeout=120 --maxfail=5 ${deselect[@]+"${deselect[@]}"} "$@" || r=$?
         echo "--- shard done in $((SECONDS - s))s (exit ${r}) ---"
         # 5 = no tests collected: a branch older than these test paths, not a failure of the change
         [ "$r" -eq 5 ] && r=0
@@ -720,6 +729,7 @@ data:
       # Its own run: together with the other shards, tests/unit/bridge shadows the repository's bridge package
       shard unit-bridge tests/unit/bridge/ tests/unit/test_issue_6052_bridge_logs_and_tasks.py tests/unit/test_mirror_helper.py || rc=1
       rm -f test*.db
+      if [ "$rc" -eq 0 ] && [ "${#deselect[@]}" -gt 0 ]; then return 3; fi
       return "$rc"
     }
 
