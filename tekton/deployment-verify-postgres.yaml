@@ -1,0 +1,86 @@
+# Throwaway PostgreSQL + TimescaleDB for the verify step: the `alembic` gate of verify--majowka--mesh-manager.sh creates
+# its own database here (verify_<time>_<pid>), runs `alembic upgrade head` and `alembic check` (model/migration parity,
+# ci.yml alembic-check in Majowka/mesh-manager) and drops it. One shared instance instead of a sidecar in every verify
+# pod: no image pull and no extra requests per run, and nothing to start for repositories that do not need it.
+# Same image as their CI (keep the pin in step with ci.yml when Renovate bumps it there). No persistent storage: the
+# data lives in an emptyDir and is lost on restart, which is what a test database wants. The password is the one their
+# CI uses; the instance holds only throwaway schemas and is reachable inside the cluster only.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: verify-postgres
+  namespace: agents
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: verify-postgres
+  template:
+    metadata:
+      labels:
+        app: verify-postgres
+    spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: postgres
+          image: mirror.gcr.io/timescale/timescaledb-ha:pg17.12-ts2.32.1@sha256:c72b4cb8aaa0a52c0870c2b0a48173c595ee9bef0f3d8f92c3f546c69fef3567
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: mesh_user
+            - name: POSTGRES_PASSWORD
+              value: mesh_test_pass_secure_2024
+            - name: POSTGRES_DB
+              value: postgres
+            - name: POSTGRES_INITDB_ARGS
+              value: --encoding=UTF-8 --lc-collate=C --lc-ctype=C
+            - name: PGDATA
+              value: /home/postgres/pgdata/data
+            # Small: a few test databases at a time, nothing to tune for (the image sizes itself to the node otherwise)
+            - name: TS_TUNE_MEMORY
+              value: 512MB
+            - name: TS_TUNE_NUM_CPUS
+              value: "1"
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "mesh_user", "-d", "postgres"]
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+          volumeMounts:
+            - name: data
+              mountPath: /home/postgres/pgdata
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: data
+          emptyDir:
+            sizeLimit: 4Gi
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: verify-postgres
+  namespace: agents
+spec:
+  selector:
+    app: verify-postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres

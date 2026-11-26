@@ -14,7 +14,8 @@ FROM registry.access.redhat.com/ubi9/nodejs-22
 
 USER 0
 
-RUN dnf install -y git jq tar gzip \
+# gcc and glibc-devel: cgo for `go test -race` (verify of Majowka/mesh-manager bridge-go)
+RUN dnf install -y git jq tar gzip gcc glibc-devel \
     && dnf clean all
 
 # Both agent engines; agent-run.sh (ConfigMap agent-config) picks one per task
@@ -63,6 +64,13 @@ ENV PATH="${JAVA_HOME}/bin:${MAVEN_HOME}/bin:${PATH}"
 COPY --from=go /usr/local/go /usr/local/go
 ENV GOTOOLCHAIN=auto
 ENV PATH="/usr/local/go/bin:${PATH}"
+
+# golangci-lint, the version Majowka/mesh-manager pins in .github/workflows/bridge-go.yml (verify gate `go`)
+ARG GOLANGCI_LINT_VERSION=2.15.0
+RUN curl -fsSL \
+    "https://github.com/golangci/golangci-lint/releases/download/v${GOLANGCI_LINT_VERSION}/golangci-lint-${GOLANGCI_LINT_VERSION}-linux-amd64.tar.gz" \
+    | tar -xz -C /usr/local/bin --strip-components=1 "golangci-lint-${GOLANGCI_LINT_VERSION}-linux-amd64/golangci-lint" \
+    && golangci-lint version
 
 # uv and Python 3.13 (python-build-standalone). python, python3 and python3.13 in /usr/local/bin point to it;
 # dnf keeps using the system /usr/bin/python3. Caches (uv, pip, Go) go to $HOME, which the tasks set to the workspace.

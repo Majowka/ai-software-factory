@@ -604,6 +604,16 @@ With hosted models this also caps how much of your subscription limits parallel 
    the change (must pass) and on the base commit with only the new test files copied in (must fail), with the verify script's Python virtualenv (`~/.cache/verify-venv/<repo>`) first on `PATH`. Otherwise the
    agent gets up to two rounds to fix the test; a bug fix without a valid regression test is opened as a draft.
    `pr-comment-agent` turns the check off (`regression-test: off`).
+   **CI gates** (`verify--majowka--mesh-manager.sh`): the verify script of Majowka/mesh-manager is a small copy of its CI.
+   Each gate runs only when the change touches its paths: `base-sync` (a new migration: the change moves onto the
+   newest base branch and the Alembic heads are counted, so a `down_revision` fork shows up here), `guards` (always:
+   shard coverage guard, root guard tests with the generated-docs drift check), `go` (`bridge-go/`: go vet, golangci-lint,
+   `go test -race` and the openwrt tag), `bridge` (`bridge/`: flake8, Bandit, bridge unit tests), `alembic`
+   (migrations or models: `upgrade head` + `alembic check` on the shared `verify-postgres` TimescaleDB) and `backend`
+   (`backend/`: API contract and the four unit shards). The table of results (`/workspace/out/ci-gates.md`) goes to
+   the self-review prompt and to the pull request description. Integration shards, MQTT, QEMU, image builds and smoke
+   stay in their CI. Known failures of their CI that a change cannot fix (`ci-known--<owner>--<repo>.txt`) are marked
+   as such in the CI failure report.
 7. **`publish`** (its own task): mints a fresh token, commits and pushes. The issue pipelines also open a
    pull request and enable auto-merge; `pr-comment-agent` pushes to the existing PR branch. The agent's
    summary is then posted as a comment, preceded by the verification result. If the build stays
