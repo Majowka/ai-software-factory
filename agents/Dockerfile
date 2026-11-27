@@ -24,6 +24,18 @@ ARG GEMINI_CLI_VERSION=0.71.1
 RUN npm install -g opencode-ai @anthropic-ai/claude-code "@google/gemini-cli@${GEMINI_CLI_VERSION}" \
     && gemini --version
 
+# Antigravity CLI (agy): Google's successor of Gemini CLI for Google AI Pro accounts. Installed to /usr/local/bin.
+# The second RUN prints what agy needs for a headless login (env variables, keyring / credential files) to the build log.
+RUN curl -fsSL https://antigravity.google/cli/install.sh -o /tmp/agy-install.sh \
+    && HOME=/tmp/agy-home bash /tmp/agy-install.sh \
+    && install -m 0755 "$(ls /tmp/agy-home/.local/bin/agy 2>/dev/null || command -v agy)" /usr/local/bin/agy \
+    && rm -rf /tmp/agy-install.sh /tmp/agy-home \
+    && agy --version
+RUN set -x; agy --help 2>&1 | head -80; agy auth --help 2>&1 | head -40; agy login --help 2>&1 | head -40; \
+    grep -aoE '(ANTIGRAVITY|AGY|GEMINI|GOOGLE)_[A-Z0-9_]{3,40}' /usr/local/bin/agy | sort -u | head -150; \
+    grep -aoiE '[a-z_./-]{0,40}(keyring|credentials?|oauth_creds|token)[a-z_./-]{0,40}\.(json|db|enc|bin)' /usr/local/bin/agy | sort -u | head -60; \
+    grep -aoiE 'keyring[a-zA-Z: _-]{0,60}(file|fallback|secret service|dbus)[a-zA-Z _-]{0,40}' /usr/local/bin/agy | sort -u | head -40; true
+
 # GitHub CLI z oficjalnego archiwum
 ARG GH_VERSION=2.83.2
 RUN curl -fsSL \
