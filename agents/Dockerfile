@@ -1,4 +1,4 @@
-# Agent image for the pipelines: OpenCode and Claude Code, gh, JDK, Maven, Python 3.13 + uv, Go, language servers,
+# Agent image for the pipelines: OpenCode, Claude Code and Antigravity CLI (agy), gh, JDK, Maven, Python 3.13 + uv, Go, language servers,
 # skaffold and kubectl.
 # One image for every repository the factory works on (Java/Maven, Python, Go, Node).
 # Built and pushed to ghcr.io/majowka/factory-agent by .github/workflows/agent-image.yml.
@@ -18,8 +18,16 @@ USER 0
 RUN dnf install -y git jq tar gzip gcc glibc-devel \
     && dnf clean all
 
-# Both agent engines; agent-run.sh (ConfigMap agent-config) picks one per task
+# The agent engines; agent-run.sh (ConfigMap agent-config) picks one per task
 RUN npm install -g opencode-ai @anthropic-ai/claude-code
+
+# Antigravity CLI (agy), Google's agent for Google AI Pro accounts (successor of Gemini CLI for them), in /usr/local/bin.
+# agy keeps its login in a file in a pod (no keyring there); agent-run.sh unpacks it from the secret antigravity-auth.
+RUN curl -fsSL https://antigravity.google/cli/install.sh -o /tmp/agy-install.sh \
+    && HOME=/tmp/agy-home bash /tmp/agy-install.sh \
+    && install -m 0755 /tmp/agy-home/.local/bin/agy /usr/local/bin/agy \
+    && rm -rf /tmp/agy-install.sh /tmp/agy-home \
+    && agy --version
 
 # GitHub CLI z oficjalnego archiwum
 ARG GH_VERSION=2.83.2

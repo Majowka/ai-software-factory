@@ -85,6 +85,12 @@ spec:
               name: claude-code-oauth
               key: token
               optional: true
+        - name: AGY_AUTH
+          valueFrom:
+            secretKeyRef:
+              name: antigravity-auth
+              key: auth.tgz.b64
+              optional: true
       # Build and test the working tree after the agent step. When the build fails, the agent gets the log and fixes it
       # (up to MAX_FIX_ATTEMPTS times, within VERIFY_BUDGET_MINUTES). A green build goes to a self-review; remarks that
       # need a change go back to the agent and the build runs again (up to SELF_REVIEW_ROUNDS times). It never fails the

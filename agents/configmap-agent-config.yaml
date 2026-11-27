@@ -109,11 +109,11 @@ data:
   # Tasks: PLAN (plan steps of all three event pipelines), IMPLEMENT (agent steps), FIX (build-fix attempts in
   # verify-build), CI_FIX (pr-comment-agent started by a red CI check), REQUIREMENTS (requirements-agent analysis),
   # REVIEW (pr-review-agent, `@ai review`; best on another engine than IMPLEMENT, so the author does not review itself).
-  # Values: opencode | claude. Label for one task: engine-<task>:<engine>, e.g. engine-ci-fix:opencode.
+  # Values: opencode | claude | agy. Label for one task: engine-<task>:<engine>, e.g. engine-ci-fix:opencode.
   routing.env: |
     AGENT_ENGINE_DEFAULT=opencode
     # Claude Code (subscription) where DeepSeek flash was inaccurate: the plan of every run and the code of bug fixes.
-    # Everything else stays on OpenCode; Claude falls back to OpenCode on the subscription's limits (agent-run.sh).
+    # Everything else stays on OpenCode.
     AGENT_ENGINE_PLAN=claude
     AGENT_ENGINE_IMPLEMENT=opencode
     AGENT_ENGINE_IMPLEMENT_BUG=claude
@@ -121,6 +121,12 @@ data:
     AGENT_ENGINE_CI_FIX=opencode
     AGENT_ENGINE_REQUIREMENTS=opencode
     AGENT_ENGINE_REVIEW=opencode
+    # Where a task goes when its engine has no credentials, a used-up quota or refuses the login (agent-run.sh), in order.
+    # Engines already tried for the task are skipped; empty = no fallback. agy (Antigravity CLI, Kamil's Google AI Pro
+    # account, shared with his own Antigravity use) is the last resort, one task at a time (LLM_SLOTS_AGY).
+    LLM_FALLBACK_OPENCODE="claude agy"
+    LLM_FALLBACK_CLAUDE="opencode agy"
+    LLM_FALLBACK_AGY="opencode claude"
     # Models per engine. OpenCode: provider/model (OpenCode Go: opencode-go/<model-id>, list with
     # curl -H "Authorization: Bearer $OPENCODE_API_KEY" https://opencode.ai/inference/go/v1/models).
     # Claude Code: an alias (sonnet, opus, haiku) or a full model id. Per-task overrides: OPENCODE_MODEL_<TASK>, CLAUDE_MODEL_<TASK>
@@ -136,6 +142,8 @@ data:
     OPENCODE_VARIANT_CI_FIX=high
     CLAUDE_MODEL=sonnet
     CLAUDE_MODEL_PLAN=opus
+    # Antigravity CLI: empty = agy's default model, or a name from `agy models`. Per task: AGY_MODEL_<TASK>.
+    AGY_MODEL=
     # How many agent tasks may talk to one engine at the same time (all runs together); the rest wait in a FIFO queue
     # (llm-slot.sh). 0 = no limit. More parallel calls than the provider allows end in HTTP 429: OpenCode Go
     # (deepseek-v4.1-flash) took 9-11 parallel tasks without 429 and answered "Rate limit exceeded" from 13 on
@@ -143,18 +151,22 @@ data:
     LLM_SLOTS_OPENCODE=8
     # Claude Max 5x: the limit is usage per 5 h window, not parallel calls; Claude falls back to OpenCode when it hits it.
     LLM_SLOTS_CLAUDE=3
+    # agy runs on a personal Google AI Pro account: one task at a time, so the factory stays an individual's use
+    LLM_SLOTS_AGY=1
     # On HTTP 429 / overload from the provider: how many times a task runs again, and the first wait in seconds (doubles)
     LLM_RATE_RETRIES=4
     LLM_RATE_BACKOFF=30
-    # When an engine's quota is used up (OpenCode Go weekly limit): fallback = run the task on Claude Code until the
-    # reset, fail = end the task at once (exit 75). Either way nothing waits for the timeout.
+    # When an engine's quota is used up (OpenCode Go weekly limit, Antigravity's 5 h / weekly quota): fallback = run the task on the
+    # next engine of LLM_FALLBACK_<ENGINE> until the reset, fail = end the task at once (exit 75). Either way nothing waits
+    # for the timeout.
     LLM_QUOTA_ACTION=fallback
   # Runs one agent task with the engine chosen in routing.env: agent-run.sh <task> <timeout> <log file> <prompt>.
   # Returns the engine's exit code (124 on timeout). Credentials come from the environment of the step:
-  # OPENCODE_API_KEY (secret opencode-go) and CLAUDE_CODE_OAUTH_TOKEN (secret claude-code-oauth).
+  # OPENCODE_API_KEY (secret opencode-go), CLAUDE_CODE_OAUTH_TOKEN (secret claude-code-oauth) and AGY_AUTH
+  # (secret antigravity-auth, key auth.tgz.b64: base64 of a tar.gz of agy's file token store, see README).
   # Bug issues (is_bug in regression-test.sh) look up <VAR>_<TASK>_BUG before <VAR>_<TASK>, e.g. AGENT_ENGINE_IMPLEMENT_BUG.
-  # Claude falls back to OpenCode when there is no token, or when Claude Code fails on the subscription's usage or rate
-  # limit, an overloaded API or a refused token (many runs share one subscription); a timeout or another error does not.
+  # An engine without credentials, with a used-up quota or usage limit, or that refuses its login hands the task to the
+  # next engine of LLM_FALLBACK_<ENGINE>; a timeout or another error does not.
   agent-run.sh: |
     #!/usr/bin/env bash
     set -uo pipefail
@@ -172,8 +184,8 @@ data:
     # engine-<task>:<engine> for one task (e.g. engine-implement:opencode), engine:<engine> for all tasks.
     if [ -s /workspace/agent-labels ]; then
       t="$(printf '%s' "$task" | tr '[:upper:]_' '[:lower:]-')"
-      label="$(grep -xE "engine-${t}:(opencode|claude)" /workspace/agent-labels | head -n1 || true)"
-      [ -n "$label" ] || label="$(grep -xE 'engine:(opencode|claude)' /workspace/agent-labels | head -n1 || true)"
+      label="$(grep -xE "engine-${t}:(opencode|claude|agy)" /workspace/agent-labels | head -n1 || true)"
+      [ -n "$label" ] || label="$(grep -xE 'engine:(opencode|claude|agy)' /workspace/agent-labels | head -n1 || true)"
       if [ -n "$label" ]; then engine="${label#*:}"; echo "Engine from label ${label}" | tee -a "$log"; fi
     fi
     mkdir -p "$(dirname "$log")"
@@ -188,7 +200,8 @@ data:
     # Used-up provider quota (OpenCode Go: "usage limit reached (weekly, resets in 3d 15h)"), unlike a rate limit, does
     # not pass by waiting: opencode writes it only to its own log and then sits idle until the timeout. A watcher ends
     # the task at once, the engine is marked used up until the reset for all runs (Lease llm-block-<engine>, llm-slot.sh)
-    # and, with LLM_QUOTA_ACTION=fallback, the task runs on Claude Code instead; with =fail it ends with exit 75.
+    # and, with LLM_QUOTA_ACTION=fallback, the task runs on the next engine of LLM_FALLBACK_<ENGINE>; with =fail it ends
+    # with exit 75.
     quota_re='usage limit reached|turn on extra usage|upgrade to go plus|insufficient (balance|credits?)|quota (exceeded|exhausted)'
     llm_engine_blocked() { return 1; }; llm_engine_block() { :; }
     [ -f /config/llm-slot.sh ] && source /config/llm-slot.sh
@@ -201,7 +214,18 @@ data:
       done
       [ "$total" -gt 0 ] && echo "$total" || echo 3600
     }
-    oc_quota=""; claude_tried=""
+    # Antigravity CLI (agy): a used-up quota of the Google AI Pro plan ("You have exhausted your quota on this model.",
+    # "model X is out of quota until <time>", "individual quota reached") is reported at once, not retried.
+    agy_quota_re='exhausted your quota|out of quota|individual quota reached|quota exceeded|RESOURCE_EXHAUSTED|AI credits'
+    # Seconds until agy's reset: "until <time>" / "resets at <time>" when date(1) reads it, else 1 h (5 h windows)
+    agy_reset_secs() {
+      local t s
+      t="$(printf '%s' "$1" | grep -oiE '(until|resets? at) [^.;)]+' | head -n1 | sed -E 's/^(until|resets? at) //I')"
+      if [ -n "$t" ] && s="$(date -d "$t" +%s 2>/dev/null)" && [ "$s" -gt "$(date +%s)" ]; then echo $(( s - $(date +%s) )); else echo 3600; fi
+    }
+    # Set by an engine when the task should go on with the next engine of the chain: used-up quota, usage limit,
+    # refused credentials. Engines already tried for this task are skipped.
+    next=""; tried=" "
     run_opencode() { # $1: note for the header
       local model variant attempt=0 out deadline left wait until marker wpid msg ocl
       model="$(pick OPENCODE_MODEL '')"
@@ -210,7 +234,7 @@ data:
       # Quota gate kept by run-dispatcher from OpenCode Go's usage endpoint (and by earlier tasks that hit the limit)
       if until="$(llm_engine_blocked opencode)"; then
         echo "OpenCode usage limit used up until $(date -u -d "@${until}" '+%F %H:%M UTC'): not calling it" | tee -a "$log"
-        rc=75; oc_quota=1; return
+        rc=75; next=1; return
       fi
       llm_slot_acquire opencode "$log"
       deadline=$(( $(date +%s) + $(secs "$limit") ))
@@ -242,7 +266,7 @@ data:
           until=$(( $(date +%s) + $(reset_secs "$msg") ))
           echo "OpenCode usage limit reached (${msg##*AI_APICallError: }): marked used up until $(date -u -d "@${until}" '+%F %H:%M UTC')" | tee -a "$log"
           llm_engine_block opencode "$until" "$msg"
-          rc=75; oc_quota=1; rm -f "$out"; break
+          rc=75; next=1; rm -f "$out"; break
         fi
         if [ "$rc" -ne 124 ] && { [ "$rc" -ne 0 ] || [ "$(wc -c < "$out")" -lt 500 ]; } && grep -qiE "$rate_re" "$out" \
            && [ "$attempt" -lt "${LLM_RATE_RETRIES:-4}" ]; then
@@ -260,7 +284,6 @@ data:
     run_claude() { # $1: note for the header
       local model out
       model="$(pick CLAUDE_MODEL sonnet)"
-      claude_tried=1
       llm_slot_acquire claude "$log"
       echo "=== ${task}: claude ${model}${bug:+ (bug)}${1:+ $1} ===" | tee -a "$log"
       out="$(mktemp)"
@@ -269,34 +292,89 @@ data:
       rc=${PIPESTATUS[0]}
       llm_slot_release
       used="claude ${model}"
-      # Usage / rate limit of the subscription, overloaded API, refused token: the run goes on with OpenCode
-      # (unless this already is the fallback from OpenCode).
+      # Usage / rate limit of the subscription, overloaded API, refused token: the run goes on with the next engine
       limit_re='usage limit|rate[ _-]?limit|limit reached|hit your limit|limit will reset|API Error: (401|403|429|529)|overloaded|authentication_error|invalid (api key|bearer token)|OAuth token (has )?(expired|revoked)|credit balance'
-      if [ -z "$1" ] && [ "$rc" -ne 124 ] && { [ "$rc" -ne 0 ] || [ "$(wc -c < "$out")" -lt 500 ]; } && grep -qiE "$limit_re" "$out"; then
-        echo "Claude Code hit a usage/rate limit or was refused (exit ${rc}): falling back to OpenCode" | tee -a "$log"
-        run_opencode "(fallback from claude)"
+      if [ "$rc" -ne 124 ] && { [ "$rc" -ne 0 ] || [ "$(wc -c < "$out")" -lt 500 ]; } && grep -qiE "$limit_re" "$out"; then
+        echo "Claude Code hit a usage/rate limit or was refused (exit ${rc})" | tee -a "$log"
+        next=1
       fi
       rm -f "$out"
     }
-    case "$engine" in
-      opencode)
-        run_opencode "" ;;
-      claude)
-        if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
-          echo "No CLAUDE_CODE_OAUTH_TOKEN (secret claude-code-oauth): falling back to OpenCode" | tee -a "$log"
-          run_opencode "(fallback from claude: no token)"
-        else
-          run_claude ""
-        fi ;;
-      *)
-        echo "Unknown engine '${engine}' for task ${task} (routing.env)" | tee -a "$log"; rc=2 ;;
+    run_agy() { # $1: note for the header
+      local model out json until msg resp
+      model="$(pick AGY_MODEL '')"
+      used="agy${model:+ ${model}}"
+      if until="$(llm_engine_blocked agy)"; then
+        echo "Antigravity quota used up until $(date -u -d "@${until}" '+%F %H:%M UTC'): not calling it" | tee -a "$log"
+        rc=75; next=1; return
+      fi
+      # Google account login: agy's file token store (no keyring in a pod) from the secret antigravity-auth, unpacked
+      # into the step's own HOME, where agy refreshes the token.
+      mkdir -p "$HOME"
+      if ! printf '%s' "$AGY_AUTH" | base64 -d 2>/dev/null | tar -xz -C "$HOME" 2>/dev/null; then
+        echo "Secret antigravity-auth is not a base64 tar.gz of agy's login: skipping agy" | tee -a "$log"
+        rc=2; next=1; return
+      fi
+      llm_slot_acquire agy "$log"
+      echo "=== ${task}: agy ${model:-default}${bug:+ (bug)}${1:+ $1} ===" | tee -a "$log"
+      out="$(mktemp)"; json="$(mktemp)"
+      # agy-settings.json allows tools and denies commit, push, gh and the web, like the other engines (no prompts in -p)
+      AGY_CLI_FORCE_FILE_TOKEN_STORAGE=true AGY_CLI_DISABLE_AUTO_UPDATE=true timeout "$limit" agy -p "$prompt" ${model:+--model "$model"} \
+        --mode auto --settings /config/agy-settings.json --output-format json > "$json" 2> "$out"
+      rc=$?
+      llm_slot_release
+      # The answer and a one-line account of the turn (status, turns, time, usage) go to the log: that is how we measure
+      # what the plan gives.
+      resp="$(jq -r '.response // empty' "$json" 2>/dev/null)"
+      [ -n "$resp" ] && printf '%s\n' "$resp" | tee -a "$log"
+      jq -r '"agy: status \(.status // "?"), \(.num_turns // "?") turns, \(.duration_seconds // "?") s, usage \(.usage // {} | tostring)\(if .error then ", error: " + (.error | tostring) else "" end)"' \
+        "$json" 2>/dev/null | tee -a "$log"
+      [ -s "$out" ] && tail -n 20 "$out" >> "$log"
+      [ "$rc" -eq 0 ] && [ "$(jq -r '.status // "SUCCESS"' "$json" 2>/dev/null)" != SUCCESS ] && rc=1
+      msg="$(cat "$out" "$json" 2>/dev/null | grep -oiE "[^\"]{0,120}(${agy_quota_re})[^\"]{0,120}" | tail -n1)"
+      if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && [ -n "$msg" ]; then
+        until=$(( $(date +%s) + $(agy_reset_secs "$msg") ))
+        echo "Antigravity quota used up (${msg:0:200}): marked used up until $(date -u -d "@${until}" '+%F %H:%M UTC')" | tee -a "$log"
+        llm_engine_block agy "$until" "$msg"
+        rc=75; next=1
+      elif [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && grep -qiE 'authentication required|not logged in|log ?in again|sign in again' "$out" "$json" 2>/dev/null; then
+        echo "agy refused the Google login: log in again and update the secret antigravity-auth" | tee -a "$log"
+        next=1
+      fi
+      rm -f "$out" "$json"
+    }
+    # Credentials of an engine in the step's environment
+    has_creds() {
+      case "$1" in
+        opencode) [ -n "${OPENCODE_API_KEY:-}" ] ;;
+        claude) [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] ;;
+        agy) [ -n "${AGY_AUTH:-}" ] ;;
+        *) return 1 ;;
+      esac
+    }
+    # The chosen engine, then its fallback chain LLM_FALLBACK_<ENGINE> (routing.env). The next engine runs when one has no
+    # credentials, its quota is used up or it refused the credentials; a timeout or another error ends the task.
+    # LLM_QUOTA_ACTION=fail: no fallback, the task ends with exit 75.
+    case "$engine" in opencode|claude|agy) ;; *)
+      echo "Unknown engine '${engine}' for task ${task} (routing.env)" | tee -a "$log"; exit 2 ;;
     esac
-    if [ -n "$oc_quota" ] && [ -z "${claude_tried:-}" ] && [ "${LLM_QUOTA_ACTION:-fallback}" = fallback ] && [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] \
-       && [ "${used%% *}" = opencode ]; then
-      echo "OpenCode quota used up: running ${task} on Claude Code" | tee -a "$log"
-      run_claude "(fallback from opencode: usage limit)"
-    fi
-    [ "$rc" -eq 0 ] || echo "${engine} exited with ${rc} (timeout or error)" | tee -a "$log"
+    fb="LLM_FALLBACK_$(printf '%s' "$engine" | tr '[:lower:]' '[:upper:]')"
+    chain="$engine ${!fb-}"
+    [ "${LLM_QUOTA_ACTION:-fallback}" = fallback ] || chain="$engine"
+    rc=2; from=""
+    for e in $chain; do
+      case "$tried" in *" $e "*) continue ;; esac
+      tried="${tried}${e} "
+      if ! has_creds "$e"; then
+        echo "No credentials for ${e} in this step: skipping it" | tee -a "$log"; rc=2; continue
+      fi
+      [ -n "$from" ] && echo "Going on with ${e} after ${from}" | tee -a "$log"
+      next=""
+      "run_${e}" "${from:+(fallback from ${from})}"
+      [ -n "$next" ] || break
+      from="${used%% *}"
+    done
+    [ "$rc" -eq 0 ] || echo "${used%% *} exited with ${rc} (timeout or error)" | tee -a "$log"
     # Engine that actually ran each task (after a fallback too), for the pull request description
     if [ -n "${used:-}" ] && [ -d /workspace/out ]; then
       printf '%s %s\n' "$(printf '%s' "$task" | tr '[:upper:]_' '[:lower:]-')" "$used" >> /workspace/out/engines.txt 2>/dev/null || true
@@ -475,16 +553,17 @@ data:
       _llm_held=""; [ -n "$_llm_cur" ] && : > "$_llm_cur"
       return 0
     }
-  # Puts skills and subagents (fetched by fetch-skills, OpenCode layout) where both engines look for them: agent-home.sh [skills dir]
+  # Puts skills and subagents (fetched by fetch-skills, OpenCode layout) where the engines look for them: agent-home.sh [skills dir]
   agent-home.sh: |
     #!/usr/bin/env bash
     set -euo pipefail
     src="${1:-/skills/opencode}"
-    mkdir -p "$HOME/.config/opencode" "$HOME/.claude/skills" /workspace/out
+    mkdir -p "$HOME/.config/opencode" "$HOME/.claude/skills" "$HOME/.gemini/config/skills" /workspace/out
     if [ -d "$src" ]; then
       cp -R "$src/." "$HOME/.config/opencode/"
-      # Claude Code reads the same SKILL.md format. OpenCode subagents (agents/*.md) use another frontmatter and are not copied.
-      if [ -d "$src/skills" ]; then cp -R "$src/skills/." "$HOME/.claude/skills/"; fi
+      # Claude Code and agy (~/.gemini/config/skills) read the same SKILL.md format. OpenCode subagents (agents/*.md) use another frontmatter
+      # and are not copied.
+      if [ -d "$src/skills" ]; then cp -R "$src/skills/." "$HOME/.claude/skills/"; cp -R "$src/skills/." "$HOME/.gemini/config/skills/"; fi
     fi
   # OpenCode permissions for every agent task: no commit, no push, no gh, no web. The model comes from routing.env.
   opencode.json: |
@@ -533,6 +612,15 @@ data:
       "env": {
         "DISABLE_AUTOUPDATER": "1",
         "DISABLE_TELEMETRY": "1"
+      }
+    }
+  # agy (Antigravity CLI) settings for every agent task (--settings, this session only): tools run without prompts,
+  # except the same rules as opencode.json and claude-settings.json: no commit, no push, no gh, no web.
+  agy-settings.json: |
+    {
+      "permissions": {
+        "allow": ["command(*)", "read_file(*)", "write_file(*)"],
+        "deny": ["command(git commit)", "command(git push)", "command(gh)", "url(*)", "browser(*)", "mcp(*)"]
       }
     }
   # Bug issues need a regression test: a new test that fails on the base commit and passes after the change.

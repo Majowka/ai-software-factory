@@ -265,6 +265,7 @@ kubectl create secret generic github-app -n agents \
 kubectl create secret generic github-webhook-secret -n agents --from-literal=secret=<WEBHOOK_SECRET>
 kubectl create secret generic opencode-go -n agents --from-literal=api-key=<OPENCODE_GO_API_KEY>
 kubectl create secret generic claude-code-oauth -n agents --from-literal=token=<CLAUDE_CODE_OAUTH_TOKEN>
+kubectl create secret generic antigravity-auth -n agents --from-literal=auth.tgz.b64="$(tar czf - -C ~ --exclude=conversations --exclude=brain --exclude=log --exclude=cache --exclude=annotations .gemini/antigravity-cli | base64 -w0)"
 ```
 
 Create the model secret of every engine you route tasks to; the keys are optional in the pods, so an
@@ -277,6 +278,15 @@ engine without its secret only fails when a task is actually sent to it.
   Enterprise); it is not stored anywhere else. The token shares the usage limits of that subscription,
   so parallel agent runs count against your own Claude usage. For heavy use an API key
   (`ANTHROPIC_API_KEY`) is the alternative. Put a reminder in your calendar before the token expires.
+- **Antigravity CLI (agy) login**: Google ended Gemini CLI for Google AI Pro accounts ("This client is no longer
+  supported for Gemini Code Assist for individuals"); agy is its successor. On Linux (WSL works), install it with
+  `curl -fsSL https://antigravity.google/cli/install.sh | bash`, run `AGY_CLI_FORCE_FILE_TOKEN_STORAGE=true agy`, sign
+  in with the Google account and send one prompt. The login is then a file under `~/.gemini/antigravity-cli` instead of
+  the system keyring; the secret is that directory as a base64 tar.gz (command above). Every run unpacks it into its own
+  `$HOME` and agy refreshes the token there. agy uses the account's Antigravity quota (refreshed every 5 h within a
+  weekly limit, shared with your own Antigravity use), so the factory sends it one task at a time and only as the last
+  fallback. Google's terms allow agy for an individual's own use; a factory run on a cluster is close to that line, so
+  keep `LLM_SLOTS_AGY=1`.
 
 **Private images.** If the agent image or the skills artifact is private, create a pull secret and
 attach it to the `pipeline` service account:
@@ -294,7 +304,7 @@ kubectl patch serviceaccount pipeline -n agents -p '{"imagePullSecrets":[{"name"
 The pipelines use `ghcr.io/majowka/factory-agent:latest`, built from [`agents/Dockerfile`](agents/Dockerfile)
 by the `agent-image` GitHub Actions workflow. Every build is tagged with its commit SHA; `latest` is
 only pushed from `master`. The image runs in the `prepare`, `plan`, `agent`, `verify` and `publish`
-steps and contains both agent engines (OpenCode and Claude Code), the GitHub CLI, a JDK, Maven,
+steps and contains the agent engines (OpenCode, Claude Code and Antigravity CLI `agy`), the GitHub CLI, a JDK, Maven,
 `skaffold` and `kubectl`.
 
 To test a branch before it is merged, point the pipelines at the SHA tag of its build:
@@ -358,11 +368,12 @@ mounted at `/config`:
 
 | Key | Purpose |
 |---|---|
-| `routing.env` | Which engine (`opencode` or `claude`) runs which task, and the model of each engine. |
+| `routing.env` | Which engine (`opencode`, `claude` or `agy`) runs which task, the model of each engine and the fallback chains. |
 | `agent-run.sh` | Runs one task with the chosen engine: `agent-run.sh <task> <timeout> <log> <prompt>`. Every agent call in the pipelines goes through it. |
-| `agent-home.sh` | Installs the fetched skills for both engines. |
+| `agent-home.sh` | Installs the fetched skills for all engines. |
 | `opencode.json` | OpenCode permissions and the OpenCode Go provider (key from `OPENCODE_API_KEY`). |
 | `claude-settings.json` | Claude Code permissions, the same rules as `opencode.json`. |
+| `agy-settings.json` | agy permissions (`--settings`), the same rules as `opencode.json`. |
 | `gh-app-token.sh` | Mints a GitHub App installation token (valid 1h). |
 | `ci-failures.sh` | Failed checks of a commit with their log tails, as Markdown (section 6.10). |
 | `requirements-lib.sh` | Helpers of the requirements scan and the requirements agent. |
@@ -383,15 +394,24 @@ AGENT_ENGINE_DEFAULT=opencode
 AGENT_ENGINE_PLAN=claude
 AGENT_ENGINE_IMPLEMENT=opencode
 AGENT_ENGINE_IMPLEMENT_BUG=claude       # bug issues (labels as in regression-test.sh): <VAR>_<TASK>_BUG first
+LLM_FALLBACK_OPENCODE="claude agy"      # next engines when one cannot take the task
+LLM_FALLBACK_CLAUDE="opencode agy"
+LLM_FALLBACK_AGY="opencode claude"
 OPENCODE_MODEL=opencode-go/deepseek-v4.1-flash # per task: OPENCODE_MODEL_<TASK>
 CLAUDE_MODEL=sonnet                     # per task: CLAUDE_MODEL_<TASK>
 CLAUDE_MODEL_PLAN=opus
+AGY_MODEL=                              # empty = agy's default; per task: AGY_MODEL_<TASK>
 ```
 
-**Fallback.** A task routed to `claude` runs on OpenCode instead when the `claude-code-oauth` secret is missing, or
-when Claude Code fails on the subscription's usage or rate limit, an overloaded API or a refused token (several runs
-share one subscription). The log then shows `falling back to OpenCode` and a second header
-`=== IMPLEMENT: opencode ... (fallback from claude) ===`. A timeout or any other error does not fall back.
+agy (Antigravity CLI on a Google AI Pro account) is the last fallback: it takes a task only when OpenCode and Claude
+cannot.
+
+**Fallback.** A task goes on with the next engine of `LLM_FALLBACK_<ENGINE>` when its engine has no secret in the
+step, its quota is used up (OpenCode Go weekly limit, Antigravity quota; also when the quota gate below is closed),
+Claude Code fails on the subscription's usage or rate limit, an overloaded API or a refused token, or agy
+refuses the Google login. Engines already tried for the task are skipped. The log then shows
+`Going on with claude after opencode` and a second header `=== IMPLEMENT: claude ... (fallback from opencode) ===`.
+A timeout or any other error does not fall back.
 
 To move a task to the other engine, change its line and `kubectl apply -k agents`; the next run uses it.
 
@@ -738,12 +758,13 @@ requests and ci-fix runs are never folded. Without the dispatcher, new runs
 stay pending; to start one by hand: `kubectl patch pipelinerun <name> -n <namespace> --type merge -p '{"spec":{"status":null}}'`.
 
 **LLM calls.** Every agent task goes through `agent-run.sh`, which first takes a slot of its engine (`llm-slot.sh`):
-at most `LLM_SLOTS_OPENCODE` (8) tasks talk to OpenCode and `LLM_SLOTS_CLAUDE` (3) to Claude Code at the same time,
+at most `LLM_SLOTS_OPENCODE` (8) tasks talk to OpenCode, `LLM_SLOTS_CLAUDE` (3) to Claude Code and
+`LLM_SLOTS_AGY` (1) to agy at the same time,
 across all runs. The others wait in arrival order (FIFO) and say so in their log every minute. Slots and the queue
 are `Lease` objects in the namespace (`llm-slot-<engine>-<i>`, `llm-q-<engine>-...`, Role `llm-slots` for the
 `pipeline` service account); a step renews its lease every 20 s, so a slot of a pod that died comes free after 90 s.
 Waiting does not count against the task's own time limit. When the API cannot be used, the task runs without a slot.
-A Claude task that falls back to OpenCode gives its Claude slot back and queues for an OpenCode one.
+A task that falls back to another engine gives its slot back and queues for one of the next engine.
 
 OpenCode retries a 429 by itself (it shows only in `$HOME/.local/share/opencode/log/`), which made tasks of
 busy runs spend half their time waiting. When OpenCode still exits on the provider's rate limit (HTTP 429, too many requests, overloaded), `agent-run.sh` runs
@@ -757,7 +778,12 @@ delete the Lease to try again earlier). The same Lease is the global quota gate:
 reads OpenCode Go's free usage endpoint every `USAGE_POLL_SECONDS` (300; `GET https://opencode.ai/zen/go/v1/usage`, no
 model call) and closes the gate until the latest `resetsAt` when a 5 h, weekly or monthly window is not `ok`, or opens it
 when all are `ok`, so tasks only read the Lease and nobody has to hit the limit first. With `LLM_QUOTA_ACTION=fallback` the task, and every OpenCode task until the
-reset, runs on Claude Code instead; with `fail` it ends with exit 75.
+reset, runs on the next engine of `LLM_FALLBACK_OPENCODE` instead; with `fail` it ends with exit 75.
+
+agy reports a used-up quota of the plan at once ("You have exhausted your quota on this model.", "model X is out of
+quota until <time>"); `agent-run.sh` closes the Lease `llm-block-agy` until that time (1 h when agy names none) and the
+task goes on with `LLM_FALLBACK_AGY`. agy runs with `--output-format json`; the log shows its answer and one line
+`agy: status SUCCESS, 7 turns, 42 s, usage {...}` per task, which is how to measure what the plan gives.
 
 ## 7. Connect GitHub to the cluster
 
