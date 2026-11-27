@@ -31,10 +31,12 @@ RUN curl -fsSL https://antigravity.google/cli/install.sh -o /tmp/agy-install.sh 
     && install -m 0755 "$(ls /tmp/agy-home/.local/bin/agy 2>/dev/null || command -v agy)" /usr/local/bin/agy \
     && rm -rf /tmp/agy-install.sh /tmp/agy-home \
     && agy --version
-RUN set -x; agy --help 2>&1 | head -80; agy auth --help 2>&1 | head -40; agy login --help 2>&1 | head -40; \
-    grep -aoE '(ANTIGRAVITY|AGY|GEMINI|GOOGLE)_[A-Z0-9_]{3,40}' /usr/local/bin/agy | sort -u | head -150; \
-    grep -aoiE '[a-z_./-]{0,40}(keyring|credentials?|oauth_creds|token)[a-z_./-]{0,40}\.(json|db|enc|bin)' /usr/local/bin/agy | sort -u | head -60; \
-    grep -aoiE 'keyring[a-zA-Z: _-]{0,60}(file|fallback|secret service|dbus)[a-zA-Z _-]{0,40}' /usr/local/bin/agy | sort -u | head -40; true
+RUN B=/usr/local/bin/agy; g() { grep -aoE "$1" "$B" | sort -u | head -n "${2:-60}"; }; \
+    echo "== files"; g '[A-Za-z0-9_.-]{0,30}(token|credential|cred|auth|account)[A-Za-z0-9_-]{0,30}\.(json|db|bin|enc|dat)' 80; \
+    echo "== keyring"; g '[A-Za-z0-9 _:%.-]{0,60}(file token storage|token file|FORCE_FILE_TOKEN|keyring_fallback|marker file)[A-Za-z0-9 _:%./-]{0,80}' 40; \
+    echo "== perms"; g '(command|read_file|write_file|edit|browser|url|mcp|tool)\([a-z*_ :./-]{0,30}\)' 60; \
+    echo "== quota"; g '[A-Za-z ,.:%-]{0,80}(quota|usage limit|rate limit|exhausted|resets? (in|at|after))[A-Za-z0-9 ,.:%{}-]{0,80}' 120; \
+    agy help print 2>&1 | head -40; agy models --help 2>&1 | head -20; true
 
 # GitHub CLI z oficjalnego archiwum
 ARG GH_VERSION=2.83.2
