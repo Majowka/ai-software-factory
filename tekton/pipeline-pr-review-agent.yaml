@@ -133,7 +133,7 @@ spec:
               export GH_TOKEN
               # Seen: eyes on the trigger comment
               gh api -X POST "repos/${REPO_FULL_NAME}/issues/comments/${COMMENT_ID}/reactions" -f content=eyes >/dev/null || true
-              # Labels of the PR: engine:<opencode|claude|gemini> or engine-review:<engine> override routing.env (agent-run.sh)
+              # Labels of the PR: engine:<opencode|claude|agy> or engine-review:<engine> override routing.env (agent-run.sh)
               gh pr view "$PR_NUMBER" --repo "$REPO_FULL_NAME" --json labels -q '.labels[].name' > /workspace/agent-labels || true
 
               PR="$(gh pr view "$PR_NUMBER" --repo "$REPO_FULL_NAME" \
@@ -193,7 +193,7 @@ spec:
               cat /workspace/review-context.md
               cat /workspace/pr-files.txt
 
-          # Agent run. No GitHub credentials in this step; commit, push and gh are denied in opencode.json, claude-settings.json and gemini-policy.toml.
+          # Agent run. No GitHub credentials in this step; commit, push and gh are denied in opencode.json, claude-settings.json and agy-settings.json.
           - name: review
             image: ghcr.io/majowka/factory-agent:latest
             workingDir: /workspace
@@ -223,11 +223,11 @@ spec:
                     name: claude-code-oauth
                     key: token
                     optional: true
-              - name: GEMINI_OAUTH_CREDS
+              - name: AGY_AUTH
                 valueFrom:
                   secretKeyRef:
-                    name: gemini-oauth
-                    key: oauth_creds.json
+                    name: antigravity-auth
+                    key: auth.tgz.b64
                     optional: true
             script: |
               #!/usr/bin/env bash

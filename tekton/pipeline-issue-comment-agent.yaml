@@ -222,7 +222,7 @@ spec:
 
               GH_TOKEN="$(bash /config/gh-app-token.sh)"
               export GH_TOKEN
-              # Labels of the issue / PR: engine:<opencode|claude|gemini> or engine-<task>:<engine> override routing.env (agent-run.sh)
+              # Labels of the issue / PR: engine:<opencode|claude|agy> or engine-<task>:<engine> override routing.env (agent-run.sh)
               gh issue view "$ISSUE_NUMBER" --repo "$REPO_FULL_NAME" --json labels -q '.labels[].name' > /workspace/agent-labels || true
               gh auth setup-git
 
@@ -300,11 +300,11 @@ spec:
                     name: claude-code-oauth
                     key: token
                     optional: true
-              - name: GEMINI_OAUTH_CREDS
+              - name: AGY_AUTH
                 valueFrom:
                   secretKeyRef:
-                    name: gemini-oauth
-                    key: oauth_creds.json
+                    name: antigravity-auth
+                    key: auth.tgz.b64
                     optional: true
             script: |
               #!/usr/bin/env bash
@@ -354,7 +354,7 @@ spec:
               git reset -q --hard
               git clean -qfd
 
-          # Agent run. No GitHub credentials in this step; committing, pushing and gh are denied in opencode.json, claude-settings.json and gemini-policy.toml.
+          # Agent run. No GitHub credentials in this step; committing, pushing and gh are denied in opencode.json, claude-settings.json and agy-settings.json.
           - name: agent
             image: ghcr.io/majowka/factory-agent:latest
             workingDir: /workspace
@@ -392,11 +392,11 @@ spec:
                     name: claude-code-oauth
                     key: token
                     optional: true
-              - name: GEMINI_OAUTH_CREDS
+              - name: AGY_AUTH
                 valueFrom:
                   secretKeyRef:
-                    name: gemini-oauth
-                    key: oauth_creds.json
+                    name: antigravity-auth
+                    key: auth.tgz.b64
                     optional: true
             script: |
               #!/usr/bin/env bash

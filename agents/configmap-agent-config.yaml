@@ -109,25 +109,24 @@ data:
   # Tasks: PLAN (plan steps of all three event pipelines), IMPLEMENT (agent steps), FIX (build-fix attempts in
   # verify-build), CI_FIX (pr-comment-agent started by a red CI check), REQUIREMENTS (requirements-agent analysis),
   # REVIEW (pr-review-agent, `@ai review`; best on another engine than IMPLEMENT, so the author does not review itself).
-  # Values: opencode | claude | gemini. Label for one task: engine-<task>:<engine>, e.g. engine-ci-fix:opencode.
+  # Values: opencode | claude | agy. Label for one task: engine-<task>:<engine>, e.g. engine-ci-fix:opencode.
   routing.env: |
-    AGENT_ENGINE_DEFAULT=gemini
+    AGENT_ENGINE_DEFAULT=opencode
     # Claude Code (subscription) where DeepSeek flash was inaccurate: the plan of every run and the code of bug fixes.
+    # Everything else stays on OpenCode.
     AGENT_ENGINE_PLAN=claude
+    AGENT_ENGINE_IMPLEMENT=opencode
     AGENT_ENGINE_IMPLEMENT_BUG=claude
-    # Gemini CLI (Google AI Pro) first for the rest: its quota is daily and is lost when unused, while OpenCode Go's is
-    # weekly, so Gemini takes the work until its daily quota runs out and OpenCode takes the rest (fallback chains below).
-    AGENT_ENGINE_IMPLEMENT=gemini
-    AGENT_ENGINE_FIX=gemini
-    AGENT_ENGINE_CI_FIX=gemini
-    AGENT_ENGINE_REQUIREMENTS=gemini
-    # Review on another engine than the code (IMPLEMENT), so the author does not review itself
+    AGENT_ENGINE_FIX=opencode
+    AGENT_ENGINE_CI_FIX=opencode
+    AGENT_ENGINE_REQUIREMENTS=opencode
     AGENT_ENGINE_REVIEW=opencode
     # Where a task goes when its engine has no credentials, a used-up quota or refuses the login (agent-run.sh), in order.
-    # Engines already tried for the task are skipped; empty = no fallback.
-    LLM_FALLBACK_GEMINI="opencode claude"
-    LLM_FALLBACK_OPENCODE="gemini claude"
-    LLM_FALLBACK_CLAUDE="gemini opencode"
+    # Engines already tried for the task are skipped; empty = no fallback. agy (Antigravity CLI, Kamil's Google AI Pro
+    # account, shared with his own Antigravity use) is the last resort, one task at a time (LLM_SLOTS_AGY).
+    LLM_FALLBACK_OPENCODE="claude agy"
+    LLM_FALLBACK_CLAUDE="opencode agy"
+    LLM_FALLBACK_AGY="opencode claude"
     # Models per engine. OpenCode: provider/model (OpenCode Go: opencode-go/<model-id>, list with
     # curl -H "Authorization: Bearer $OPENCODE_API_KEY" https://opencode.ai/inference/go/v1/models).
     # Claude Code: an alias (sonnet, opus, haiku) or a full model id. Per-task overrides: OPENCODE_MODEL_<TASK>, CLAUDE_MODEL_<TASK>
@@ -143,10 +142,8 @@ data:
     OPENCODE_VARIANT_CI_FIX=high
     CLAUDE_MODEL=sonnet
     CLAUDE_MODEL_PLAN=opus
-    # Gemini CLI: empty = the CLI's default (auto: Gemini picks Pro or Flash per request),
-    # or an alias (pro, flash, flash-lite) or a model id. Pro has a smaller daily quota than Flash. Per task: GEMINI_MODEL_<TASK>.
-    GEMINI_MODEL=
-    GEMINI_MODEL_PLAN=pro
+    # Antigravity CLI: empty = agy's default model, or a name from `agy models`. Per task: AGY_MODEL_<TASK>.
+    AGY_MODEL=
     # How many agent tasks may talk to one engine at the same time (all runs together); the rest wait in a FIFO queue
     # (llm-slot.sh). 0 = no limit. More parallel calls than the provider allows end in HTTP 429: OpenCode Go
     # (deepseek-v4.1-flash) took 9-11 parallel tasks without 429 and answered "Rate limit exceeded" from 13 on
@@ -154,20 +151,19 @@ data:
     LLM_SLOTS_OPENCODE=8
     # Claude Max 5x: the limit is usage per 5 h window, not parallel calls; Claude falls back to OpenCode when it hits it.
     LLM_SLOTS_CLAUDE=3
-    # Gemini CLI with a Google account: Google gives a per-minute and a per-day request limit (an agent task makes
-    # dozens of requests); start low and raise it while the logs show no 429 ("gemini hit a rate limit").
-    LLM_SLOTS_GEMINI=4
+    # agy runs on a personal Google AI Pro account: one task at a time, so the factory stays an individual's use
+    LLM_SLOTS_AGY=1
     # On HTTP 429 / overload from the provider: how many times a task runs again, and the first wait in seconds (doubles)
     LLM_RATE_RETRIES=4
     LLM_RATE_BACKOFF=30
-    # When an engine's quota is used up (OpenCode Go weekly limit, Gemini daily quota): fallback = run the task on the
+    # When an engine's quota is used up (OpenCode Go weekly limit, Antigravity's 5 h / weekly quota): fallback = run the task on the
     # next engine of LLM_FALLBACK_<ENGINE> until the reset, fail = end the task at once (exit 75). Either way nothing waits
     # for the timeout.
     LLM_QUOTA_ACTION=fallback
   # Runs one agent task with the engine chosen in routing.env: agent-run.sh <task> <timeout> <log file> <prompt>.
   # Returns the engine's exit code (124 on timeout). Credentials come from the environment of the step:
-  # OPENCODE_API_KEY (secret opencode-go), CLAUDE_CODE_OAUTH_TOKEN (secret claude-code-oauth) and GEMINI_OAUTH_CREDS
-  # (secret gemini-oauth, key oauth_creds.json).
+  # OPENCODE_API_KEY (secret opencode-go), CLAUDE_CODE_OAUTH_TOKEN (secret claude-code-oauth) and AGY_AUTH
+  # (secret antigravity-auth, key auth.tgz.b64: base64 of a tar.gz of agy's file token store, see README).
   # Bug issues (is_bug in regression-test.sh) look up <VAR>_<TASK>_BUG before <VAR>_<TASK>, e.g. AGENT_ENGINE_IMPLEMENT_BUG.
   # An engine without credentials, with a used-up quota or usage limit, or that refuses its login hands the task to the
   # next engine of LLM_FALLBACK_<ENGINE>; a timeout or another error does not.
@@ -188,8 +184,8 @@ data:
     # engine-<task>:<engine> for one task (e.g. engine-implement:opencode), engine:<engine> for all tasks.
     if [ -s /workspace/agent-labels ]; then
       t="$(printf '%s' "$task" | tr '[:upper:]_' '[:lower:]-')"
-      label="$(grep -xE "engine-${t}:(opencode|claude|gemini)" /workspace/agent-labels | head -n1 || true)"
-      [ -n "$label" ] || label="$(grep -xE 'engine:(opencode|claude|gemini)' /workspace/agent-labels | head -n1 || true)"
+      label="$(grep -xE "engine-${t}:(opencode|claude|agy)" /workspace/agent-labels | head -n1 || true)"
+      [ -n "$label" ] || label="$(grep -xE 'engine:(opencode|claude|agy)' /workspace/agent-labels | head -n1 || true)"
       if [ -n "$label" ]; then engine="${label#*:}"; echo "Engine from label ${label}" | tee -a "$log"; fi
     fi
     mkdir -p "$(dirname "$log")"
@@ -218,22 +214,14 @@ data:
       done
       [ "$total" -gt 0 ] && echo "$total" || echo 3600
     }
-    # Gemini CLI (Google account, AI Pro): a used-up daily quota ends gemini at once with "You have exhausted your capacity
-    # on this model. Your quota will reset after 7h12m3s." or "...exhausted your daily quota..." (TerminalQuotaError).
-    # "No capacity available" (Google's servers, not our quota) and short 429s are retried like a rate limit.
-    gemini_quota_re='exhausted your daily quota|quota will reset after|QUOTA_EXHAUSTED|INSUFFICIENT_G1_CREDITS'
-    # Seconds until Gemini's reset: "reset after 7h12m3s"; without one, the next midnight Pacific time (daily quota)
-    gemini_reset_secs() {
-      local d n total=0 mid
-      d="$(printf '%s' "$1" | grep -oiE 'reset after ([0-9]+(\.[0-9]+)?[hms])+' | head -n1 | sed -E 's/^[^0-9]*//')"
-      for part in $(printf '%s' "$d" | grep -oE '[0-9]+(\.[0-9]+)?[hms]'); do
-        n="${part%%[.hms]*}"
-        case "$part" in *h) total=$((total + n * 3600));; *m) total=$((total + n * 60));; *s) total=$((total + n));; esac
-      done
-      if [ "$total" -le 0 ]; then
-        mid="$(TZ=America/Los_Angeles date -d 'tomorrow 00:00' +%s 2>/dev/null)" && total=$(( mid - $(date +%s) ))
-      fi
-      [ "${total:-0}" -gt 0 ] && echo "$total" || echo 3600
+    # Antigravity CLI (agy): a used-up quota of the Google AI Pro plan ("You have exhausted your quota on this model.",
+    # "model X is out of quota until <time>", "individual quota reached") is reported at once, not retried.
+    agy_quota_re='exhausted your quota|out of quota|individual quota reached|quota exceeded|RESOURCE_EXHAUSTED|AI credits'
+    # Seconds until agy's reset: "until <time>" / "resets at <time>" when date(1) reads it, else 1 h (5 h windows)
+    agy_reset_secs() {
+      local t s
+      t="$(printf '%s' "$1" | grep -oiE '(until|resets? at) [^.;)]+' | head -n1 | sed -E 's/^(until|resets? at) //I')"
+      if [ -n "$t" ] && s="$(date -d "$t" +%s 2>/dev/null)" && [ "$s" -gt "$(date +%s)" ]; then echo $(( s - $(date +%s) )); else echo 3600; fi
     }
     # Set by an engine when the task should go on with the next engine of the chain: used-up quota, usage limit,
     # refused credentials. Engines already tried for this task are skipped.
@@ -312,72 +300,62 @@ data:
       fi
       rm -f "$out"
     }
-    run_gemini() { # $1: note for the header
-      local model attempt=0 out deadline left wait until msg gate
-      model="$(pick GEMINI_MODEL '')"
-      used="gemini${model:+ ${model}}"
-      # The quota is per model: a task with a fixed model (GEMINI_MODEL_PLAN=pro) closes only that model's gate
-      # (llm-block-gemini-pro); the default model (auto) closes the engine's gate, which run-dispatcher also keeps from
-      # Gemini's quota endpoint.
-      gate="gemini${model:+-$(printf '%s' "$model" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9.\n-' '-')}"
-      if until="$(llm_engine_blocked gemini)" || until="$(llm_engine_blocked "$gate")"; then
-        echo "Gemini quota${model:+ of ${model}} used up until $(date -u -d "@${until}" '+%F %H:%M UTC'): not calling it" | tee -a "$log"
+    run_agy() { # $1: note for the header
+      local model out json until msg resp
+      model="$(pick AGY_MODEL '')"
+      used="agy${model:+ ${model}}"
+      if until="$(llm_engine_blocked agy)"; then
+        echo "Antigravity quota used up until $(date -u -d "@${until}" '+%F %H:%M UTC'): not calling it" | tee -a "$log"
         rc=75; next=1; return
       fi
-      # Google account login (oauth_creds.json from `gemini` on a workstation, secret gemini-oauth). Gemini CLI refreshes
-      # the access token itself and writes it back, so the file goes to the step's own HOME.
-      mkdir -p "$HOME/.gemini"
-      ( umask 077; printf '%s' "$GEMINI_OAUTH_CREDS" > "$HOME/.gemini/oauth_creds.json" )
-      cp /config/gemini-settings.json "$HOME/.gemini/settings.json"
-      llm_slot_acquire gemini "$log"
-      deadline=$(( $(date +%s) + $(secs "$limit") ))
-      while :; do
-        echo "=== ${task}: gemini ${model:-auto}${bug:+ (bug)}${1:+ $1}$([ "$attempt" -gt 0 ] && echo " (retry ${attempt})") ===" | tee -a "$log"
-        left=$(( deadline - $(date +%s) )); [ "$left" -gt 0 ] || left=1
-        out="$(mktemp)"
-        # yolo: no prompts in a pipeline; gemini-policy.toml denies commit, push, gh and the web like the other engines
-        GOOGLE_GENAI_USE_GCA=true GEMINI_CLI_TRUST_WORKSPACE=true timeout "$left" gemini -p "$prompt" ${model:+-m "$model"} \
-          --approval-mode yolo --skip-trust --policy /config/gemini-policy.toml --output-format text 2>&1 | tee -a "$log" "$out"
-        rc=${PIPESTATUS[0]}
-        msg="$(grep -iE "$gemini_quota_re" "$out" | tail -n1)"
-        if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && [ -n "$msg" ]; then
-          until=$(( $(date +%s) + $(gemini_reset_secs "$msg") ))
-          echo "Gemini quota used up (${msg:0:200}): marked used up until $(date -u -d "@${until}" '+%F %H:%M UTC')" | tee -a "$log"
-          llm_engine_block "$gate" "$until" "$msg"
-          rc=75; next=1; rm -f "$out"; break
-        fi
-        # 41 = FATAL_AUTHENTICATION_ERROR: the Google login was revoked or expired (log in again, update the secret)
-        if [ "$rc" -eq 41 ]; then
-          echo "Gemini CLI refused the Google login (exit 41): update the secret gemini-oauth" | tee -a "$log"
-          next=1; rm -f "$out"; break
-        fi
-        if [ "$rc" -ne 124 ] && { [ "$rc" -ne 0 ] || [ "$(wc -c < "$out")" -lt 500 ]; } \
-           && grep -qiE "${rate_re}|no capacity available|exhausted your capacity|RESOURCE_EXHAUSTED" "$out" \
-           && [ "$attempt" -lt "${LLM_RATE_RETRIES:-4}" ]; then
-          attempt=$((attempt + 1))
-          wait=$(( ${LLM_RATE_BACKOFF:-30} * (1 << (attempt - 1)) + RANDOM % 15 ))
-          if [ $(( $(date +%s) + wait + 60 )) -lt "$deadline" ]; then
-            echo "gemini hit a rate limit or Google's capacity limit (exit ${rc}): retry ${attempt} in ${wait}s" | tee -a "$log"
-            rm -f "$out"; sleep "$wait"; continue
-          fi
-        fi
-        rm -f "$out"; break
-      done
+      # Google account login: agy's file token store (no keyring in a pod) from the secret antigravity-auth, unpacked
+      # into the step's own HOME, where agy refreshes the token.
+      mkdir -p "$HOME"
+      if ! printf '%s' "$AGY_AUTH" | base64 -d 2>/dev/null | tar -xz -C "$HOME" 2>/dev/null; then
+        echo "Secret antigravity-auth is not a base64 tar.gz of agy's login: skipping agy" | tee -a "$log"
+        rc=2; next=1; return
+      fi
+      llm_slot_acquire agy "$log"
+      echo "=== ${task}: agy ${model:-default}${bug:+ (bug)}${1:+ $1} ===" | tee -a "$log"
+      out="$(mktemp)"; json="$(mktemp)"
+      # agy-settings.json allows tools and denies commit, push, gh and the web, like the other engines (no prompts in -p)
+      AGY_CLI_FORCE_FILE_TOKEN_STORAGE=true AGY_CLI_DISABLE_AUTO_UPDATE=true timeout "$limit" agy -p "$prompt" ${model:+--model "$model"} \
+        --mode auto --settings /config/agy-settings.json --output-format json > "$json" 2> "$out"
+      rc=$?
       llm_slot_release
+      # The answer and a one-line account of the turn (status, turns, time, usage) go to the log: that is how we measure
+      # what the plan gives.
+      resp="$(jq -r '.response // empty' "$json" 2>/dev/null)"
+      [ -n "$resp" ] && printf '%s\n' "$resp" | tee -a "$log"
+      jq -r '"agy: status \(.status // "?"), \(.num_turns // "?") turns, \(.duration_seconds // "?") s, usage \(.usage // {} | tostring)\(if .error then ", error: " + (.error | tostring) else "" end)"' \
+        "$json" 2>/dev/null | tee -a "$log"
+      [ -s "$out" ] && tail -n 20 "$out" >> "$log"
+      [ "$rc" -eq 0 ] && [ "$(jq -r '.status // "SUCCESS"' "$json" 2>/dev/null)" != SUCCESS ] && rc=1
+      msg="$(cat "$out" "$json" 2>/dev/null | grep -oiE "[^\"]{0,120}(${agy_quota_re})[^\"]{0,120}" | tail -n1)"
+      if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && [ -n "$msg" ]; then
+        until=$(( $(date +%s) + $(agy_reset_secs "$msg") ))
+        echo "Antigravity quota used up (${msg:0:200}): marked used up until $(date -u -d "@${until}" '+%F %H:%M UTC')" | tee -a "$log"
+        llm_engine_block agy "$until" "$msg"
+        rc=75; next=1
+      elif [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && grep -qiE 'authentication required|not logged in|log ?in again|sign in again' "$out" "$json" 2>/dev/null; then
+        echo "agy refused the Google login: log in again and update the secret antigravity-auth" | tee -a "$log"
+        next=1
+      fi
+      rm -f "$out" "$json"
     }
     # Credentials of an engine in the step's environment
     has_creds() {
       case "$1" in
         opencode) [ -n "${OPENCODE_API_KEY:-}" ] ;;
         claude) [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] ;;
-        gemini) [ -n "${GEMINI_OAUTH_CREDS:-}" ] ;;
+        agy) [ -n "${AGY_AUTH:-}" ] ;;
         *) return 1 ;;
       esac
     }
     # The chosen engine, then its fallback chain LLM_FALLBACK_<ENGINE> (routing.env). The next engine runs when one has no
     # credentials, its quota is used up or it refused the credentials; a timeout or another error ends the task.
     # LLM_QUOTA_ACTION=fail: no fallback, the task ends with exit 75.
-    case "$engine" in opencode|claude|gemini) ;; *)
+    case "$engine" in opencode|claude|agy) ;; *)
       echo "Unknown engine '${engine}' for task ${task} (routing.env)" | tee -a "$log"; exit 2 ;;
     esac
     fb="LLM_FALLBACK_$(printf '%s' "$engine" | tr '[:lower:]' '[:upper:]')"
@@ -396,7 +374,7 @@ data:
       [ -n "$next" ] || break
       from="${used%% *}"
     done
-    [ "$rc" -eq 0 ] || echo "${engine} exited with ${rc} (timeout or error)" | tee -a "$log"
+    [ "$rc" -eq 0 ] || echo "${used%% *} exited with ${rc} (timeout or error)" | tee -a "$log"
     # Engine that actually ran each task (after a fallback too), for the pull request description
     if [ -n "${used:-}" ] && [ -d /workspace/out ]; then
       printf '%s %s\n' "$(printf '%s' "$task" | tr '[:upper:]_' '[:lower:]-')" "$used" >> /workspace/out/engines.txt 2>/dev/null || true
@@ -580,12 +558,12 @@ data:
     #!/usr/bin/env bash
     set -euo pipefail
     src="${1:-/skills/opencode}"
-    mkdir -p "$HOME/.config/opencode" "$HOME/.claude/skills" "$HOME/.gemini/skills" /workspace/out
+    mkdir -p "$HOME/.config/opencode" "$HOME/.claude/skills" "$HOME/.gemini/config/skills" /workspace/out
     if [ -d "$src" ]; then
       cp -R "$src/." "$HOME/.config/opencode/"
-      # Claude Code and Gemini CLI read the same SKILL.md format. OpenCode subagents (agents/*.md) use another frontmatter
+      # Claude Code and agy (~/.gemini/config/skills) read the same SKILL.md format. OpenCode subagents (agents/*.md) use another frontmatter
       # and are not copied.
-      if [ -d "$src/skills" ]; then cp -R "$src/skills/." "$HOME/.claude/skills/"; cp -R "$src/skills/." "$HOME/.gemini/skills/"; fi
+      if [ -d "$src/skills" ]; then cp -R "$src/skills/." "$HOME/.claude/skills/"; cp -R "$src/skills/." "$HOME/.gemini/config/skills/"; fi
     fi
   # OpenCode permissions for every agent task: no commit, no push, no gh, no web. The model comes from routing.env.
   opencode.json: |
@@ -636,30 +614,15 @@ data:
         "DISABLE_TELEMETRY": "1"
       }
     }
-  # Gemini CLI settings, copied to $HOME/.gemini/settings.json by agent-run.sh: Google account login, no auto-update or
-  # usage statistics, and the same context files as the other engines (AGENTS.md, CLAUDE.md) next to GEMINI.md.
-  gemini-settings.json: |
+  # agy (Antigravity CLI) settings for every agent task (--settings, this session only): tools run without prompts,
+  # except the same rules as opencode.json and claude-settings.json: no commit, no push, no gh, no web.
+  agy-settings.json: |
     {
-      "general": { "enableAutoUpdate": false, "enableAutoUpdateNotification": false },
-      "privacy": { "usageStatisticsEnabled": false },
-      "security": { "auth": { "selectedType": "oauth-personal" } },
-      "context": { "fileName": ["GEMINI.md", "AGENTS.md", "CLAUDE.md"] }
+      "permissions": {
+        "allow": ["command(*)", "read_file(*)", "write_file(*)"],
+        "deny": ["command(git commit)", "command(git push)", "command(gh)", "url(*)", "browser(*)", "mcp(*)"]
+      }
     }
-  # Gemini CLI policy (--policy, user tier, above yolo's allow-all): the same rules as opencode.json and
-  # claude-settings.json. No commit, no push, no gh, no web.
-  gemini-policy.toml: |
-    [[rule]]
-    toolName = "run_shell_command"
-    commandPrefix = ["git commit", "git push", "gh "]
-    decision = "deny"
-    priority = 900
-    denyMessage = "The pipeline commits, pushes and talks to GitHub itself."
-
-    [[rule]]
-    toolName = ["web_fetch", "google_web_search"]
-    decision = "deny"
-    priority = 900
-    denyMessage = "No web access in factory runs."
   # Bug issues need a regression test: a new test that fails on the base commit and passes after the change.
   # Source it: is_bug tells from the labels in /workspace/agent-labels whether the issue is a bug; REGRESSION_TEST_RULES
   # is the paragraph for the agent prompt; is_test_path tells a test file from its path. verify-build checks the test.

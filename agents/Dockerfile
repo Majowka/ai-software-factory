@@ -1,4 +1,4 @@
-# Agent image for the pipelines: OpenCode, Claude Code and Gemini CLI, gh, JDK, Maven, Python 3.13 + uv, Go, language servers,
+# Agent image for the pipelines: OpenCode, Claude Code and Antigravity CLI (agy), gh, JDK, Maven, Python 3.13 + uv, Go, language servers,
 # skaffold and kubectl.
 # One image for every repository the factory works on (Java/Maven, Python, Go, Node).
 # Built and pushed to ghcr.io/majowka/factory-agent by .github/workflows/agent-image.yml.
@@ -18,25 +18,16 @@ USER 0
 RUN dnf install -y git jq tar gzip gcc glibc-devel \
     && dnf clean all
 
-# The agent engines; agent-run.sh (ConfigMap agent-config) picks one per task.
-# Gemini CLI is pinned: agent-run.sh reads its quota messages and run-dispatcher its OAuth client.
-ARG GEMINI_CLI_VERSION=0.71.1
-RUN npm install -g opencode-ai @anthropic-ai/claude-code "@google/gemini-cli@${GEMINI_CLI_VERSION}" \
-    && gemini --version
+# The agent engines; agent-run.sh (ConfigMap agent-config) picks one per task
+RUN npm install -g opencode-ai @anthropic-ai/claude-code
 
-# Antigravity CLI (agy): Google's successor of Gemini CLI for Google AI Pro accounts. Installed to /usr/local/bin.
-# The second RUN prints what agy needs for a headless login (env variables, keyring / credential files) to the build log.
+# Antigravity CLI (agy), Google's agent for Google AI Pro accounts (successor of Gemini CLI for them), in /usr/local/bin.
+# agy keeps its login in a file in a pod (no keyring there); agent-run.sh unpacks it from the secret antigravity-auth.
 RUN curl -fsSL https://antigravity.google/cli/install.sh -o /tmp/agy-install.sh \
     && HOME=/tmp/agy-home bash /tmp/agy-install.sh \
-    && install -m 0755 "$(ls /tmp/agy-home/.local/bin/agy 2>/dev/null || command -v agy)" /usr/local/bin/agy \
+    && install -m 0755 /tmp/agy-home/.local/bin/agy /usr/local/bin/agy \
     && rm -rf /tmp/agy-install.sh /tmp/agy-home \
     && agy --version
-RUN B=/usr/local/bin/agy; g() { grep -aoE "$1" "$B" | sort -u | head -n "${2:-60}"; }; \
-    echo "== files"; g '[A-Za-z0-9_.-]{0,30}(token|credential|cred|auth|account)[A-Za-z0-9_-]{0,30}\.(json|db|bin|enc|dat)' 80; \
-    echo "== keyring"; g '[A-Za-z0-9 _:%.-]{0,60}(file token storage|token file|FORCE_FILE_TOKEN|keyring_fallback|marker file)[A-Za-z0-9 _:%./-]{0,80}' 40; \
-    echo "== perms"; g '(command|read_file|write_file|edit|browser|url|mcp|tool)\([a-z*_ :./-]{0,30}\)' 60; \
-    echo "== quota"; g '[A-Za-z ,.:%-]{0,80}(quota|usage limit|rate limit|exhausted|resets? (in|at|after))[A-Za-z0-9 ,.:%{}-]{0,80}' 120; \
-    agy help print 2>&1 | head -40; agy models --help 2>&1 | head -20; true
 
 # GitHub CLI z oficjalnego archiwum
 ARG GH_VERSION=2.83.2
